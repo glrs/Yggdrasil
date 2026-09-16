@@ -653,7 +653,7 @@ class TestNonCallableReferences(PreflightTestCase):
         self.assertIn("s2", message)
         # The earlier step must not have run before this was discovered.
         self.assertFalse(self.marker.exists())
-        self.assertFalse((self.work_root / "classify_plan").exists())
+        self.assertFalse((self.work_root / plan.plan_id).exists())
 
     def test_non_callable_without_step_metadata_is_also_rejected(self):
         plan = self.plan(
