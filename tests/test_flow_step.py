@@ -4,6 +4,11 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
+from yggdrasil.flow.errors import (
+    OrchestrationError,
+    PermanentStepError,
+    TransientStepError,
+)
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
 from yggdrasil.flow.step import StepContext, step
@@ -1066,6 +1071,195 @@ class TestStepDecorator(unittest.TestCase):
         # Should create empty StepResult
         self.assertIsInstance(result, StepResult)
         self.assertEqual(len(result.artifacts), 0)
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Collect every exception reachable via __cause__/__context__.
+
+    Deliberately follows both links rather than assuming a particular nesting
+    depth: when a failure-report publication fails, the original step error ends
+    up several hops down the chain, not as the immediate __context__.
+
+    Args:
+        exc: The exception to walk from.
+
+    Returns:
+        list[BaseException]: exc and every exception chained behind it.
+    """
+    collected: list[BaseException] = []
+    visited: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        collected.append(current)
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return collected
+
+
+class TestStepWrapperOrchestrationOrdering(unittest.TestCase):
+    """The @step wrapper must not report through a broken reporting channel.
+
+    Its except clauses are ordered so OrchestrationError is caught first. Without
+    that, a failed step.succeeded emit would fall into the generic handler, which
+    would then emit step.failed on the same broken emitter - replacing the
+    original error with a confusing chained one.
+    """
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.workdir = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _ctx(self, fail_on: set[str]) -> StepContext:
+        """Build a context whose emitter fails on the given event types."""
+        emitted: list[str] = []
+
+        def emit(event):
+            emitted.append(event["type"])
+            if event["type"] in fail_on:
+                raise OSError(f"spool unavailable for {event['type']}")
+
+        emitter = Mock(spec=EventEmitter)
+        emitter.emit.side_effect = emit
+        ctx = StepContext(
+            realm="test",
+            scope={"kind": "project", "id": "P1"},
+            plan_id="plan_1",
+            step_id="s1",
+            step_name="n1",
+            workdir=self.workdir,
+            scope_dir=self.workdir,
+            emitter=emitter,
+        )
+        ctx.emitted = emitted  # type: ignore[attr-defined]
+        return ctx
+
+    def test_emitter_failure_surfaces_as_orchestration_error(self):
+        @step
+        def any_step(ctx: StepContext, **kwargs) -> StepResult:
+            return StepResult()
+
+        ctx = self._ctx({"step.started"})
+
+        with self.assertRaises(OrchestrationError) as cm:
+            any_step(ctx)
+
+        self.assertIn("Event publication failed", str(cm.exception))
+
+    def test_failing_success_emit_is_not_reported_as_a_step_failure(self):
+        @step
+        def any_step(ctx: StepContext, **kwargs) -> StepResult:
+            return StepResult()
+
+        ctx = self._ctx({"step.succeeded"})
+
+        with self.assertRaises(OrchestrationError):
+            any_step(ctx)
+
+        self.assertNotIn("step.failed", ctx.emitted)
+
+    def test_orchestration_error_from_the_step_body_is_not_reclassified(self):
+        """ctx.progress()/ctx.record_artifact() publication inside a body."""
+
+        @step
+        def progressing_step(ctx: StepContext, **kwargs) -> StepResult:
+            ctx.progress(50, "halfway")
+            return StepResult()
+
+        ctx = self._ctx({"step.progress"})
+
+        with self.assertRaises(OrchestrationError):
+            progressing_step(ctx)
+
+        self.assertNotIn("step.failed", ctx.emitted)
+
+    def test_failing_failure_emit_preserves_both_causes(self):
+        """PRD: preserve both causes; do not hide the original error."""
+
+        @step
+        def failing_step(ctx: StepContext, **kwargs) -> StepResult:
+            raise PermanentStepError("the realm's own work failed")
+
+        ctx = self._ctx({"step.failed"})
+
+        with self.assertRaises(OrchestrationError) as cm:
+            failing_step(ctx)
+
+        raised = cm.exception
+        # The original error survives in the message, so it is not lost even to
+        # a caller that only logs str(exc).
+        self.assertIn("the realm's own work failed", str(raised))
+        self.assertIn("PermanentStepError", str(raised))
+
+        # ...and both exception objects remain reachable through the chain,
+        # wherever in it they happen to sit.
+        chain = _exception_chain(raised)
+        self.assertTrue(
+            any(
+                isinstance(e, PermanentStepError)
+                and "the realm's own work failed" in str(e)
+                for e in chain
+            ),
+            f"original step error missing from chain: {chain}",
+        )
+        self.assertTrue(
+            any(
+                isinstance(e, OSError) and "spool unavailable" in str(e) for e in chain
+            ),
+            f"publication failure missing from chain: {chain}",
+        )
+
+    def test_transient_failure_emit_failure_also_preserves_both_causes(self):
+        @step
+        def flaky_step(ctx: StepContext, **kwargs) -> StepResult:
+            raise TransientStepError("temporary glitch")
+
+        ctx = self._ctx({"step.failed"})
+
+        with self.assertRaises(OrchestrationError) as cm:
+            flaky_step(ctx)
+
+        chain = _exception_chain(cm.exception)
+        self.assertTrue(
+            any(isinstance(e, TransientStepError) for e in chain),
+            f"original step error missing from chain: {chain}",
+        )
+
+    def test_unexpected_error_failure_emit_failure_preserves_both_causes(self):
+        @step
+        def broken_step(ctx: StepContext, **kwargs) -> StepResult:
+            raise RuntimeError("unexpected")
+
+        ctx = self._ctx({"step.failed"})
+
+        with self.assertRaises(OrchestrationError) as cm:
+            broken_step(ctx)
+
+        chain = _exception_chain(cm.exception)
+        self.assertTrue(
+            any(isinstance(e, RuntimeError) and "unexpected" in str(e) for e in chain),
+            f"original step error missing from chain: {chain}",
+        )
+
+    def test_step_failure_still_propagates_when_publication_works(self):
+        """The ordinary path is unchanged."""
+
+        @step
+        def failing_step(ctx: StepContext, **kwargs) -> StepResult:
+            raise PermanentStepError("boom")
+
+        ctx = self._ctx(set())
+
+        with self.assertRaises(PermanentStepError):
+            failing_step(ctx)
+
+        self.assertIn("step.failed", ctx.emitted)
 
 
 if __name__ == "__main__":

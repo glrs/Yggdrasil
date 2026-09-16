@@ -11,7 +11,11 @@ if TYPE_CHECKING:
     from yggdrasil.flow.data_access import DataAccess
 
 from yggdrasil.flow.artifacts import ArtifactRefProtocol, ensure_artifact_ref
-from yggdrasil.flow.errors import PermanentStepError, TransientStepError
+from yggdrasil.flow.errors import (
+    OrchestrationError,
+    PermanentStepError,
+    TransientStepError,
+)
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
 from yggdrasil.flow.utils.hash import dirhash_stats, sha256_file
@@ -110,6 +114,15 @@ class StepContext:
         return list(self._artifacts)
 
     def emit(self, type_: str, **payload: Any) -> None:
+        """Publish one step lifecycle event.
+
+        Args:
+            type_: Event type, e.g. "step.started".
+            **payload: Additional event fields merged into the envelope.
+
+        Raises:
+            OrchestrationError: If the injected emitter fails to publish.
+        """
         seq = self._next_seq()
         event = {
             "type": type_,
@@ -131,7 +144,17 @@ class StepContext:
             "run_id": self.run_id,
             "filename": f"{seq:04d}_{type_.replace('.', '_')}.json",
         }
-        self.emitter.emit(event)
+        try:
+            self.emitter.emit(event)
+        except Exception as exc:
+            # Event publication is Yggdrasil's own reporting infrastructure, not
+            # author code: a realm never calls EventEmitter.emit directly. If it
+            # fails we can no longer observe this attempt, so it must abort
+            # rather than be contained as this step's ordinary failure.
+            raise OrchestrationError(
+                f"Event publication failed for {type_!r} on step "
+                f"{self.step_id!r} (plan {self.plan_id!r}): {exc}"
+            ) from exc
 
     # NOTE: REPLACES add_artifact_ref
     def record_artifact(
@@ -178,6 +201,31 @@ class StepContext:
         self.emit("step.progress", progress=max(0, min(100, pct)), message=message)
 
 
+def _emit_step_failed(
+    ctx: StepContext, original: BaseException, **payload: Any
+) -> None:
+    """Publish a step's failure, preserving both causes if publication fails.
+
+    Args:
+        ctx: The step context whose emitter publishes the event.
+        original: The step failure being reported.
+        **payload: The step.failed event fields.
+
+    Raises:
+        OrchestrationError: If publishing the failure also fails. The original
+            step error is named in the message so it survives str()-only
+            logging, and both exception objects stay reachable through the
+            cause/context chain.
+    """
+    try:
+        ctx.emit("step.failed", **payload)
+    except OrchestrationError as publish_error:
+        raise OrchestrationError(
+            f"Failed to publish step.failed for step {ctx.step_id!r}; the "
+            f"original {type(original).__name__} is preserved: {original}"
+        ) from publish_error
+
+
 # def step(name: str | None = None, *, input_keys: tuple[str, ...] = ()):
 def step(_fn=None, *, name: str | None = None):
     """
@@ -214,9 +262,18 @@ def step(_fn=None, *, name: str | None = None):
                     extra=result.extra,
                 )
                 return result
+            except OrchestrationError:
+                # Reporting infrastructure is already broken (this includes a
+                # failed step.succeeded emit above, and any ctx.emit/ctx.progress
+                # /ctx.record_artifact publication inside the step body). Do not
+                # report through the same broken channel, and do not misclassify
+                # infrastructure failure as this step's ordinary failure.
+                raise
+
             except PermanentStepError as e:
-                ctx.emit(
-                    "step.failed",
+                _emit_step_failed(
+                    ctx,
+                    e,
                     kind="permanent",
                     error=str(e),
                     code=e.code,
@@ -225,8 +282,9 @@ def step(_fn=None, *, name: str | None = None):
                 raise  # engine decides whether to stop dependents
 
             except TransientStepError as e:
-                ctx.emit(
-                    "step.failed",
+                _emit_step_failed(
+                    ctx,
+                    e,
                     kind="transient",
                     error=str(e),
                     code=e.code,
@@ -236,7 +294,7 @@ def step(_fn=None, *, name: str | None = None):
 
             except Exception as e:
                 # Unknown -> treat as permanent by default (TODO: Not sure whether to treat as 'transient' once?)
-                ctx.emit("step.failed", kind="permanent", error=str(e))
+                _emit_step_failed(ctx, e, kind="permanent", error=str(e))
                 raise
 
         # Step metadata (for builder/engine)
