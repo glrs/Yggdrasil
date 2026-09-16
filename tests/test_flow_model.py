@@ -1,7 +1,14 @@
 import unittest
 from dataclasses import fields
 
-from yggdrasil.flow.model import Artifact, Plan, StepResult, StepSpec
+from yggdrasil.flow.model import (
+    VALID_FAILURE_POLICIES,
+    Artifact,
+    Plan,
+    StepResult,
+    StepSpec,
+    validate_failure_policy,
+)
 
 
 class TestStepSpec(unittest.TestCase):
@@ -957,6 +964,78 @@ class TestModelIntegration(unittest.TestCase):
         digests = [a.digest for a in result.artifacts]
         self.assertTrue(any(d.startswith("sha256:") for d in digests))  # type: ignore
         self.assertTrue(any(d.startswith("dirhash:") for d in digests))  # type: ignore
+
+
+class TestFailurePolicyValidation(unittest.TestCase):
+    """validate_failure_policy() is the single source of the policy vocabulary."""
+
+    def test_vocabulary_is_exactly_the_two_documented_values(self):
+        self.assertEqual(
+            set(VALID_FAILURE_POLICIES), {"fail_fast", "continue_independent"}
+        )
+
+    def test_known_policies_are_accepted(self):
+        for policy in ("fail_fast", "continue_independent"):
+            with self.subTest(policy=policy):
+                validate_failure_policy(policy)  # must not raise
+
+    def test_unknown_policy_is_rejected_not_downgraded(self):
+        """A requested continuation plan must never silently become fail-fast."""
+        with self.assertRaises(ValueError) as cm:
+            validate_failure_policy("continue")
+
+        message = str(cm.exception)
+        self.assertIn("Invalid failure_policy", message)
+        self.assertIn("continue", message)
+        self.assertIn("fail_fast", message)
+
+    def test_empty_string_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_failure_policy("")
+
+    def test_none_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_failure_policy(None)  # type: ignore[arg-type]
+
+    def test_validation_is_case_sensitive(self):
+        with self.assertRaises(ValueError):
+            validate_failure_policy("FAIL_FAST")
+
+
+class TestStepSpecOutputsField(unittest.TestCase):
+    """StepSpec.outputs mirrors inputs: same type, same default."""
+
+    def test_outputs_is_a_field_with_an_empty_default(self):
+        names = {f.name for f in fields(StepSpec)}
+        self.assertIn("outputs", names)
+        self.assertEqual(
+            StepSpec(step_id="s", name="n", fn_ref="m:f", params={}).outputs, {}
+        )
+
+    def test_default_factory_gives_each_instance_its_own_mapping(self):
+        first = StepSpec(step_id="s1", name="n", fn_ref="m:f", params={})
+        second = StepSpec(step_id="s2", name="n", fn_ref="m:f", params={})
+
+        first.outputs["k"] = "/p"
+
+        self.assertEqual(second.outputs, {})
+        self.assertIsNot(first.outputs, second.outputs)
+
+
+class TestPlanFailurePolicyField(unittest.TestCase):
+    """Plan.failure_policy is a plan-level field with a safe default."""
+
+    def test_failure_policy_defaults_to_fail_fast(self):
+        self.assertEqual(
+            Plan(plan_id="p", realm="r", scope={}).failure_policy, "fail_fast"
+        )
+
+    def test_positional_construction_is_unaffected(self):
+        """The new field must not break existing positional call sites."""
+        plan = Plan("p1", "tenx", {"kind": "project"}, [])
+
+        self.assertEqual(plan.plan_id, "p1")
+        self.assertEqual(plan.failure_policy, "fail_fast")
 
 
 if __name__ == "__main__":

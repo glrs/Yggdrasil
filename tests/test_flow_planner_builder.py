@@ -1092,5 +1092,64 @@ class TestPlanBuilderEdgeCases(unittest.TestCase):
         self.assertIn("nested", spec.params["dict"])
 
 
+class TestBuilderOutputsAreNotYetPreserved(unittest.TestCase):
+    """Documents a known gap so its later fix has a clear before/after.
+
+    PlanBuilder already computes each step's output map and uses it to wire
+    dependencies, but drops it before constructing the StepSpec. StepSpec.outputs
+    now exists; preserving the builder's map into it belongs with the reuse
+    gating that reads the field, since until then the declaration would have no
+    effect. When that lands, this test flips to assert preservation.
+    """
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.base = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_add_step_still_drops_the_computed_output_map(self):
+        builder = PlanBuilder(
+            plan_id="p1", realm="test", scope={"kind": "project"}, base=self.base
+        )
+
+        spec = builder._add_step(
+            step_id="producer",
+            name="producer",
+            fn_ref="m:produce",
+            params={},
+            outputs={"report": str(self.base / "report.csv")},
+        )
+
+        # The map was computed and used...
+        self.assertEqual(builder._artifact_provider["report"], "producer")
+        # ...but it does not reach the spec yet.
+        self.assertEqual(spec.outputs, {})
+
+    def test_dropped_outputs_still_wire_dependencies(self):
+        """The gap is only the declaration; dependency inference is unaffected."""
+        builder = PlanBuilder(
+            plan_id="p1", realm="test", scope={"kind": "project"}, base=self.base
+        )
+        builder._add_step(
+            step_id="producer",
+            name="producer",
+            fn_ref="m:produce",
+            params={},
+            outputs={"report": str(self.base / "report.csv")},
+        )
+
+        consumer = builder._add_step(
+            step_id="consumer",
+            name="consumer",
+            fn_ref="m:consume",
+            params={},
+            inputs={"report": str(self.base / "report.csv")},
+        )
+
+        self.assertEqual(consumer.deps, ["producer"])
+
+
 if __name__ == "__main__":
     unittest.main()

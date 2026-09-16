@@ -332,5 +332,133 @@ class TestPlanSerialization(unittest.TestCase):
         self.assertEqual(restored_step.inputs, original_step.inputs)
 
 
+class TestFailurePolicySerialization(unittest.TestCase):
+    """The plan-level failure policy round-trips, and defaults for legacy docs."""
+
+    def test_to_dict_includes_the_policy(self):
+        plan = Plan(
+            plan_id="p1",
+            realm="tenx",
+            scope={},
+            failure_policy="continue_independent",
+        )
+
+        self.assertEqual(plan.to_dict()["failure_policy"], "continue_independent")
+
+    def test_default_policy_is_fail_fast(self):
+        plan = Plan(plan_id="p1", realm="tenx", scope={})
+
+        self.assertEqual(plan.failure_policy, "fail_fast")
+        self.assertEqual(plan.to_dict()["failure_policy"], "fail_fast")
+
+    def test_absent_policy_deserializes_as_fail_fast(self):
+        """Every already-persisted document lacks this key.
+
+        Omitted must be indistinguishable from an explicit "fail_fast", or
+        legacy plans would change behavior the moment the field was added.
+        """
+        legacy_document = {
+            "plan_id": "p1",
+            "realm": "tenx",
+            "scope": {"kind": "project", "id": "P123"},
+            "steps": [
+                {
+                    "step_id": "s1",
+                    "name": "n1",
+                    "fn_ref": "m:f",
+                    "params": {},
+                }
+            ],
+        }
+
+        restored = Plan.from_dict(legacy_document)
+
+        self.assertEqual(restored.failure_policy, "fail_fast")
+        explicit = Plan.from_dict({**legacy_document, "failure_policy": "fail_fast"})
+        self.assertEqual(restored, explicit)
+
+    def test_policy_survives_a_full_roundtrip(self):
+        for policy in ("fail_fast", "continue_independent"):
+            with self.subTest(policy=policy):
+                original = Plan(
+                    plan_id="p1",
+                    realm="tenx",
+                    scope={"kind": "project", "id": "P123"},
+                    steps=[
+                        StepSpec(step_id="s1", name="n1", fn_ref="m:f", params={"a": 1})
+                    ],
+                    failure_policy=policy,
+                )
+
+                restored = Plan.from_dict(original.to_dict())
+
+                self.assertEqual(restored, original)
+                self.assertEqual(restored.failure_policy, policy)
+
+    def test_an_unknown_policy_still_roundtrips_for_diagnosis(self):
+        """Serialization records what was written; preflight is what rejects it."""
+        plan = Plan(plan_id="p1", realm="tenx", scope={}, failure_policy="bogus")
+
+        self.assertEqual(Plan.from_dict(plan.to_dict()).failure_policy, "bogus")
+
+
+class TestStepOutputsSerialization(unittest.TestCase):
+    """StepSpec.outputs round-trips exactly the way inputs already does."""
+
+    def test_outputs_default_to_an_empty_mapping(self):
+        spec = StepSpec(step_id="s1", name="n1", fn_ref="m:f", params={})
+
+        self.assertEqual(spec.outputs, {})
+
+    def test_outputs_survive_a_full_roundtrip(self):
+        original = Plan(
+            plan_id="p1",
+            realm="tenx",
+            scope={},
+            steps=[
+                StepSpec(
+                    step_id="s1",
+                    name="n1",
+                    fn_ref="m:f",
+                    params={},
+                    inputs={"src": "/in/a.txt"},
+                    outputs={"report": "/out/report.csv", "bam": "/out/x.bam"},
+                )
+            ],
+        )
+
+        restored = Plan.from_dict(original.to_dict())
+
+        self.assertEqual(restored, original)
+        self.assertEqual(
+            restored.steps[0].outputs,
+            {"report": "/out/report.csv", "bam": "/out/x.bam"},
+        )
+
+    def test_absent_outputs_deserialize_as_empty(self):
+        legacy_step = {
+            "step_id": "s1",
+            "name": "n1",
+            "fn_ref": "m:f",
+            "params": {},
+            "inputs": {"src": "/in/a.txt"},
+        }
+
+        restored = Plan.from_dict(
+            {"plan_id": "p1", "realm": "r", "scope": {}, "steps": [legacy_step]}
+        )
+
+        self.assertEqual(restored.steps[0].outputs, {})
+        self.assertEqual(restored.steps[0].inputs, {"src": "/in/a.txt"})
+
+    def test_outputs_are_independent_between_steps(self):
+        first = StepSpec(step_id="s1", name="n1", fn_ref="m:f", params={})
+        second = StepSpec(step_id="s2", name="n2", fn_ref="m:f", params={})
+
+        first.outputs["report"] = "/out/report.csv"
+
+        self.assertEqual(second.outputs, {})
+
+
 if __name__ == "__main__":
     unittest.main()
