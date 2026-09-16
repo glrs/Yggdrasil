@@ -326,7 +326,7 @@ class TestAttemptReportSerialization(unittest.TestCase):
             StepFailure(step_id="a", error="boom", kind="transient", code="E1")
         )
         report.record_blocked("b", ["a"])
-        report.failed_ancestors["b"] = ["a"]
+        report.record_failed_ancestors("b", ["a"])
         report.finish(TerminationReason.COMPLETED)
 
         payload = json.loads(json.dumps(report.to_dict()))
@@ -352,6 +352,148 @@ class TestAttemptReportSerialization(unittest.TestCase):
         self.assertIsNone(payload["outcome"])
         self.assertIsNone(payload["termination_reason"])
         self.assertIsNone(payload["ended_at"])
+
+
+class TestAttemptReportConsistencyGuards(unittest.TestCase):
+    """A report must not be able to contradict itself.
+
+    The derived overall outcome is only trustworthy if the recorded outcomes it
+    derives from are. These guards close the writes that would let a report say
+    one thing in its outcome and another in its diagnostics.
+    """
+
+    def test_conflicting_terminal_outcomes_are_rejected(self):
+        """A failed step cannot be re-recorded as succeeded."""
+        report = _report("s")
+        report.record_failure(StepFailure(step_id="s", error="failed work"))
+
+        with self.assertRaises(OrchestrationError) as cm:
+            report.record_outcome("s", StepOutcome.SUCCEEDED)
+
+        message = str(cm.exception)
+        self.assertIn("Conflicting outcome", message)
+        self.assertIn("failed", message)
+        self.assertIn("succeeded", message)
+        # The original record stands.
+        self.assertEqual(report.step_outcomes["s"], StepOutcome.FAILED)
+
+    def test_blocking_a_step_that_already_succeeded_is_rejected(self):
+        report = _report("s")
+        report.record_outcome("s", StepOutcome.SUCCEEDED)
+
+        with self.assertRaises(OrchestrationError):
+            report.record_blocked("s", ["other"])
+
+    def test_failing_a_step_that_already_succeeded_is_rejected(self):
+        report = _report("s")
+        report.record_outcome("s", StepOutcome.SUCCEEDED)
+
+        with self.assertRaises(OrchestrationError):
+            report.record_failure(StepFailure(step_id="s", error="boom"))
+
+    def test_re_recording_the_same_outcome_is_allowed(self):
+        """Only contradiction is rejected, not a harmless repeat."""
+        report = _report("s")
+        report.record_outcome("s", StepOutcome.SUCCEEDED)
+
+        report.record_outcome("s", StepOutcome.SUCCEEDED)
+
+        self.assertEqual(report.step_outcomes["s"], StepOutcome.SUCCEEDED)
+
+    def test_unknown_step_ids_are_rejected_by_every_mutator(self):
+        """Otherwise the breakdown would exceed the planned inventory."""
+        report = _report("known")
+
+        with self.assertRaises(OrchestrationError) as cm:
+            report.record_outcome("ghost", StepOutcome.SUCCEEDED)
+        self.assertIn("not in plan", str(cm.exception))
+
+        with self.assertRaises(OrchestrationError):
+            report.record_failure(StepFailure(step_id="ghost", error="boom"))
+
+        with self.assertRaises(OrchestrationError):
+            report.record_blocked("ghost", ["known"])
+
+        with self.assertRaises(OrchestrationError):
+            report.record_failed_ancestors("ghost", ["known"])
+
+        self.assertEqual(report.step_outcomes, {})
+
+    def test_counts_cannot_exceed_the_planned_inventory(self):
+        report = _report("a")
+        report.record_outcome("a", StepOutcome.SUCCEEDED)
+
+        with self.assertRaises(OrchestrationError):
+            report.record_outcome("ghost", StepOutcome.SUCCEEDED)
+
+        self.assertEqual(sum(report.counts.values()), len(report.step_ids))
+
+    def test_failed_ancestors_require_a_blocked_step(self):
+        """They explain blocking; attaching them elsewhere is a contradiction."""
+        report = _report("a", "b")
+        report.record_outcome("a", StepOutcome.SUCCEEDED)
+
+        with self.assertRaises(OrchestrationError) as cm:
+            report.record_failed_ancestors("a", ["x"])
+        self.assertIn("not blocked", str(cm.exception))
+
+        with self.assertRaises(OrchestrationError):
+            report.record_failed_ancestors("b", ["x"])  # unreached
+
+    def test_failed_ancestors_are_recorded_for_a_blocked_step(self):
+        report = _report("a", "b")
+        report.record_failure(StepFailure(step_id="a", error="boom"))
+        report.record_blocked("b", ["a"])
+
+        report.record_failed_ancestors("b", ["a"])
+
+        self.assertEqual(report.failed_ancestors["b"], ["a"])
+
+    def test_failed_ancestors_list_is_copied(self):
+        report = _report("a", "b")
+        report.record_failure(StepFailure(step_id="a", error="boom"))
+        report.record_blocked("b", ["a"])
+        ancestors = ["a"]
+
+        report.record_failed_ancestors("b", ancestors)
+        ancestors.append("mutated")
+
+        self.assertEqual(report.failed_ancestors["b"], ["a"])
+
+    def test_normal_completion_rejects_an_attempt_level_failure(self):
+        """An attempt-level failure means it did not complete normally."""
+        report = _report("a")
+        report.record_outcome("a", StepOutcome.SUCCEEDED)
+        report.record_diagnostic(AttemptDiagnostic(message="event spool unavailable"))
+
+        with self.assertRaises(OrchestrationError) as cm:
+            report.finish(TerminationReason.COMPLETED)
+
+        self.assertIn("attempt-level failure", str(cm.exception))
+        self.assertFalse(report.is_finished)
+        self.assertIsNone(report.outcome)
+
+    def test_an_attempt_level_failure_finishes_under_its_own_reason(self):
+        report = _report("a")
+        report.record_outcome("a", StepOutcome.SUCCEEDED)
+        report.record_diagnostic(AttemptDiagnostic(message="event spool unavailable"))
+
+        report.finish(TerminationReason.ORCHESTRATION_ERROR)
+
+        self.assertEqual(report.outcome, ExecutionOutcome.FAILED)
+        self.assertFalse(report.is_drained)
+
+    def test_normal_completion_rejects_a_failure_contradicting_its_outcome(self):
+        """Closes the same contradiction reached by writing the fields directly."""
+        report = _report("s")
+        report.record_outcome("s", StepOutcome.SUCCEEDED)
+        report.failures["s"] = StepFailure(step_id="s", error="failed work")
+
+        with self.assertRaises(OrchestrationError) as cm:
+            report.finish(TerminationReason.COMPLETED)
+
+        self.assertIn("recorded failure", str(cm.exception))
+        self.assertFalse(report.is_finished)
 
 
 if __name__ == "__main__":

@@ -239,13 +239,53 @@ class AttemptReport:
 
     # ----- recording -----
 
+    def _check_recordable(self, step_id: str, outcome: StepOutcome) -> None:
+        """Reject a write that would make the report contradict itself.
+
+        Two things a report must never be able to say: that a step it never
+        planned reached an outcome, or that one step reached two different
+        terminal outcomes. Both would make the recorded breakdown disagree with
+        the plan or with itself, and a report that disagrees with itself cannot
+        be used to decide whether an execution request is finished.
+
+        Each step is invoked or reused at most once per attempt, so a second,
+        different outcome is a scheduler invariant violation rather than a plan
+        defect. Re-recording the same outcome is harmless and allowed.
+
+        Args:
+            step_id: The step being recorded.
+            outcome: The terminal outcome being recorded for it.
+
+        Raises:
+            OrchestrationError: If step_id is outside the planned inventory, or
+                already carries a different terminal outcome.
+        """
+        if step_id not in self.step_ids:
+            raise OrchestrationError(
+                f"Cannot record an outcome for step '{step_id}' in attempt "
+                f"'{self.execution_id}': it is not in plan '{self.plan_id}'s "
+                f"step inventory {self.step_ids}."
+            )
+        recorded = self.step_outcomes.get(step_id)
+        if recorded is not None and recorded is not outcome:
+            raise OrchestrationError(
+                f"Conflicting outcome for step '{step_id}' in attempt "
+                f"'{self.execution_id}': already recorded as "
+                f"'{recorded.value}', cannot re-record as '{outcome.value}'."
+            )
+
     def record_outcome(self, step_id: str, outcome: StepOutcome) -> None:
         """Record a step's terminal outcome.
 
         Args:
             step_id: The step that reached a terminal state.
             outcome: Its terminal outcome.
+
+        Raises:
+            OrchestrationError: If the step is outside the planned inventory or
+                already carries a different terminal outcome.
         """
+        self._check_recordable(step_id, outcome)
         self.step_outcomes[step_id] = outcome
 
     def record_failure(self, failure: StepFailure) -> None:
@@ -256,7 +296,12 @@ class AttemptReport:
 
         Args:
             failure: The failure detail; its step_id identifies the step.
+
+        Raises:
+            OrchestrationError: If the step is outside the planned inventory or
+                already carries a different terminal outcome.
         """
+        self._check_recordable(failure.step_id, StepOutcome.FAILED)
         self.step_outcomes[failure.step_id] = StepOutcome.FAILED
         self.failures[failure.step_id] = failure
 
@@ -266,9 +311,46 @@ class AttemptReport:
         Args:
             step_id: The step that could not run.
             direct_blockers: The failed or blocked predecessors responsible.
+
+        Raises:
+            OrchestrationError: If the step is outside the planned inventory or
+                already carries a different terminal outcome.
         """
+        self._check_recordable(step_id, StepOutcome.BLOCKED)
         self.step_outcomes[step_id] = StepOutcome.BLOCKED
         self.direct_blockers[step_id] = list(direct_blockers)
+
+    def record_failed_ancestors(self, step_id: str, ancestors: list[str]) -> None:
+        """Record every originating failure upstream of a blocked step.
+
+        Written by the final blocker-diagnostics pass, once every failure in the
+        attempt is known: a join blocked by one failed prerequisite must report
+        every failed ancestor, including ones that failed after it was first
+        marked blocked.
+
+        Args:
+            step_id: The blocked step these ancestors explain.
+            ancestors: Originating failed step IDs upstream of it.
+
+        Raises:
+            OrchestrationError: If the step is outside the planned inventory, or
+                is not recorded as blocked - failed ancestors explain blocking,
+                so attaching them to anything else is a contradiction.
+        """
+        if step_id not in self.step_ids:
+            raise OrchestrationError(
+                f"Cannot record failed ancestors for step '{step_id}' in attempt "
+                f"'{self.execution_id}': it is not in plan '{self.plan_id}'s "
+                f"step inventory {self.step_ids}."
+            )
+        recorded = self.step_outcomes.get(step_id)
+        if recorded is not StepOutcome.BLOCKED:
+            raise OrchestrationError(
+                f"Cannot record failed ancestors for step '{step_id}' in attempt "
+                f"'{self.execution_id}': it is recorded as "
+                f"'{recorded.value if recorded else 'unreached'}', not blocked."
+            )
+        self.failed_ancestors[step_id] = list(ancestors)
 
     def record_diagnostic(self, diagnostic: AttemptDiagnostic) -> None:
         """Record an attempt-level failure.
@@ -294,7 +376,8 @@ class AttemptReport:
 
         Raises:
             OrchestrationError: If reason is COMPLETED while planned steps have
-                no recorded outcome.
+                no recorded outcome, an attempt-level failure was recorded, or a
+                recorded step failure disagrees with that step's outcome.
         """
         if reason is TerminationReason.COMPLETED:
             missing = self.unreached_step_ids
@@ -303,6 +386,26 @@ class AttemptReport:
                     f"Cannot finish attempt '{self.execution_id}' for plan "
                     f"'{self.plan_id}' as COMPLETED: {len(missing)} planned "
                     f"step(s) have no recorded outcome: {missing}"
+                )
+            if self.diagnostic is not None:
+                # An attempt-level failure means the attempt did not complete
+                # normally. Finish with the reason that actually describes it,
+                # rather than letting a failure sit inside a normal completion.
+                raise OrchestrationError(
+                    f"Cannot finish attempt '{self.execution_id}' for plan "
+                    f"'{self.plan_id}' as COMPLETED: an attempt-level failure "
+                    f"was recorded ({self.diagnostic.message!r})."
+                )
+            contradicted = sorted(
+                step_id
+                for step_id in self.failures
+                if self.step_outcomes.get(step_id) is not StepOutcome.FAILED
+            )
+            if contradicted:
+                raise OrchestrationError(
+                    f"Cannot finish attempt '{self.execution_id}' for plan "
+                    f"'{self.plan_id}' as COMPLETED: step(s) {contradicted} "
+                    f"carry a recorded failure but are not recorded as failed."
                 )
         self.termination_reason = reason
         self.ended_at = ended_at or utcnow_iso()
