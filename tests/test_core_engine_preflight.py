@@ -10,7 +10,10 @@ The plans are built so that failure would be visible: step ``s1`` writes a file
 when it runs, and the malformed part is always downstream of it.
 """
 
+import importlib
+import sys
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -492,6 +495,178 @@ class TestValidPlansStillPass(PreflightTestCase):
             self.engine.run(plan)
 
         self.assertEqual(mock_resolve.call_count, 2)
+
+
+class TestRealImportFailureClassification(PreflightTestCase):
+    """Import-time failures of genuinely importable modules.
+
+    These use real modules on sys.path rather than a patched resolver, because
+    the thing under test is exactly what the import machinery raises and what
+    it leaves behind in sys.modules. A mocked resolver cannot reproduce either.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.module_dir = TemporaryDirectory()
+        sys.path.insert(0, self.module_dir.name)
+        self._module_names: list[str] = []
+
+    def tearDown(self):
+        for name in self._module_names:
+            sys.modules.pop(name, None)
+        sys.path.remove(self.module_dir.name)
+        self.module_dir.cleanup()
+        super().tearDown()
+
+    def write_module(self, body: str) -> str:
+        """Create an importable module with a unique name and return it."""
+        name = f"ygg_preflight_probe_{uuid.uuid4().hex[:8]}"
+        Path(self.module_dir.name, f"{name}.py").write_text(body, encoding="utf-8")
+        self._module_names.append(name)
+        # Without this the finder's cached directory listing hides the new file.
+        importlib.invalidate_caches()
+        return name
+
+    def plan_with(self, fn_ref: str) -> Plan:
+        """A plan whose first step writes the marker and whose second is fn_ref."""
+        return self.plan(
+            self.side_effect_spec(),
+            StepSpec(step_id="s2", name="n2", fn_ref=fn_ref, params={}),
+        )
+
+    def assert_nonterminal(self, fn_ref: str) -> OrchestrationError:
+        """Assert the reference aborts the attempt without retiring the request."""
+        with self.assertRaises(OrchestrationError) as cm:
+            self.engine.run(self.plan_with(fn_ref))
+
+        # Nonterminal: a later phase must not read this as a definitive
+        # rejection and consume the execution request.
+        self.assertNotIsInstance(cm.exception, PreflightValidationError)
+        self.assertNotIsInstance(cm.exception, ValueError)
+        self.assertFalse(self.marker.exists())
+        return cm.exception
+
+    def test_import_raising_value_error_is_not_a_plan_defect(self):
+        """A ValueError from a module body is not malformed reference syntax."""
+        name = self.write_module("raise ValueError('invalid environment setting')")
+
+        error = self.assert_nonterminal(f"{name}:some_fn")
+
+        self.assertIn("invalid environment setting", str(error))
+
+    def test_import_raising_attribute_error_is_not_a_plan_defect(self):
+        """An AttributeError from a module body is not a missing attribute."""
+        name = self.write_module("raise AttributeError('broken import initialization')")
+
+        error = self.assert_nonterminal(f"{name}:some_fn")
+
+        self.assertIn("broken import initialization", str(error))
+
+    def test_import_raising_runtime_error_is_not_a_plan_defect(self):
+        name = self.write_module("raise RuntimeError('database unavailable')")
+
+        error = self.assert_nonterminal(f"{name}:some_fn")
+
+        self.assertIn("database unavailable", str(error))
+
+    def test_module_with_a_missing_dependency_is_not_a_plan_defect(self):
+        name = self.write_module("import ygg_definitely_absent_dependency")
+
+        error = self.assert_nonterminal(f"{name}:some_fn")
+
+        self.assertIn("ygg_definitely_absent_dependency", str(error))
+
+    def test_missing_target_module_is_a_plan_defect(self):
+        """The reference's own module is absent: that the plan can be blamed for."""
+        plan = self.plan_with("ygg_no_such_module_at_all:some_fn")
+
+        self.assert_rejected_without_side_effects(
+            plan, "Unresolvable fn_ref", "ygg_no_such_module_at_all"
+        )
+
+    def test_missing_attribute_after_a_successful_import_is_a_plan_defect(self):
+        name = self.write_module("VALUE = 1\n")
+
+        plan = self.plan_with(f"{name}:some_fn")
+
+        self.assert_rejected_without_side_effects(
+            plan, "does not define", "some_fn", name
+        )
+
+    def test_dotted_reference_resolves_the_module_the_importer_would(self):
+        """'pkg.mod.fn' imports 'pkg.mod', not 'pkg.mod.fn'."""
+        name = self.write_module(
+            "from yggdrasil.flow.model import StepResult\n"
+            "from yggdrasil.flow.step import step\n"
+            "\n"
+            "@step\n"
+            "def probe(ctx, **kwargs):\n"
+            "    return StepResult()\n"
+        )
+        plan = self.plan(
+            StepSpec(step_id="s1", name="n1", fn_ref=f"{name}.probe", params={}),
+        )
+
+        resolved = self.engine._preflight(plan)
+
+        self.assertTrue(hasattr(resolved["s1"], "_step_name"))
+
+    def test_dotted_reference_to_a_missing_module_is_a_plan_defect(self):
+        plan = self.plan_with("ygg_no_such_module_at_all.some_fn")
+
+        self.assert_rejected_without_side_effects(
+            plan, "Unresolvable fn_ref", "ygg_no_such_module_at_all"
+        )
+
+    def test_dotted_reference_whose_module_fails_to_import_is_not_a_plan_defect(self):
+        """The dotted form must get the same treatment as the colon form."""
+        name = self.write_module("raise ValueError('invalid environment setting')")
+
+        error = self.assert_nonterminal(f"{name}.some_fn")
+
+        self.assertIn("invalid environment setting", str(error))
+
+
+class TestNonCallableReferences(PreflightTestCase):
+    """Step metadata on an object does not make it executable."""
+
+    def test_non_callable_carrying_step_metadata_is_rejected(self):
+        class NotCallable:
+            """Carries the decorator's marker but cannot be invoked."""
+
+            _step_name = "looks_like_a_step"
+
+        plan = self.plan(
+            self.side_effect_spec(),
+            StepSpec(step_id="s2", name="n2", fn_ref="m:f", params={}),
+        )
+
+        def resolve(fn_ref):
+            return side_effect_step if fn_ref == SIDE_EFFECT_REF else NotCallable()
+
+        with patch("yggdrasil.core.engine.resolve_callable", side_effect=resolve):
+            with self.assertRaises(PreflightValidationError) as cm:
+                self.engine.run(plan)
+
+        message = str(cm.exception)
+        self.assertIn("non-callable", message)
+        self.assertIn("s2", message)
+        # The earlier step must not have run before this was discovered.
+        self.assertFalse(self.marker.exists())
+        self.assertFalse((self.work_root / "classify_plan").exists())
+
+    def test_non_callable_without_step_metadata_is_also_rejected(self):
+        plan = self.plan(
+            StepSpec(step_id="s1", name="n1", fn_ref="m:f", params={}),
+        )
+
+        with patch(
+            "yggdrasil.core.engine.resolve_callable", return_value={"not": "callable"}
+        ):
+            with self.assertRaises(PreflightValidationError) as cm:
+                self.engine.run(plan)
+
+        self.assertIn("non-callable", str(cm.exception))
 
 
 if __name__ == "__main__":

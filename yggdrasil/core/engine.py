@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import sys
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -181,14 +182,53 @@ def _validate_param_binding(spec: StepSpec, fn: Any) -> None:
         ) from exc
 
 
+def _parse_fn_ref(fn_ref: str) -> tuple[str, str] | None:
+    """Split a step reference into (module, attribute) without importing it.
+
+    Mirrors the two syntaxes ``resolve_callable`` accepts, so the module name
+    used for diagnosis is the one that will actually be imported: "pkg.mod:fn"
+    imports "pkg.mod", and "pkg.mod.fn" also imports "pkg.mod".
+
+    Args:
+        fn_ref: The step's function reference.
+
+    Returns:
+        tuple[str, str] | None: (module_name, attribute), or None when fn_ref is
+        not a usable reference at all.
+    """
+    if ":" in fn_ref:
+        module_name, attribute = fn_ref.split(":", 1)
+    elif "." in fn_ref:
+        module_name, attribute = fn_ref.rsplit(".", 1)
+    else:
+        return None
+    if not module_name or not attribute:
+        return None
+    return module_name, attribute
+
+
 def _resolve_step_callable(spec: StepSpec) -> Callable[..., Any]:
     """Resolve one step's callable, distinguishing defects from infrastructure.
 
-    Only *confirmed* defects in the reference itself become preflight
-    rejections. Resolution imports modules, so an import-time runtime or
-    infrastructure failure must not be labelled a definitive malformed-plan
-    rejection: callers treat a preflight rejection as terminal and would
-    wrongly retire an execution request that merely hit a broken environment.
+    Only a *confirmed* defect in the reference becomes a preflight rejection.
+    Resolving a reference imports a module, and importing runs arbitrary code:
+    a module that raises while initializing is a broken environment, not a
+    malformed plan. Getting that wrong is costly rather than merely untidy,
+    because a preflight rejection is definitive and would retire an execution
+    request that a later attempt could have completed.
+
+    The three stages are therefore diagnosed separately, and each needs its own
+    positive evidence:
+
+    1. Reference syntax, checked here before anything is imported.
+    2. Module import - a plan defect only when the missing module is the one
+       the reference names, never when some dependency of a real module is
+       missing.
+    3. Attribute lookup - a plan defect only once the module has actually
+       imported. An exception raised *during* import leaves no module behind in
+       sys.modules, which is what separates the two cases.
+
+    Anything else, and every ambiguous case, stays nonterminal.
 
     Args:
         spec: The step whose fn_ref is resolved.
@@ -197,42 +237,61 @@ def _resolve_step_callable(spec: StepSpec) -> Callable[..., Any]:
         Callable: The resolved step function.
 
     Raises:
-        PreflightValidationError: If fn_ref is malformed, names a module that
-            does not exist, or names an attribute the module does not define.
-        OrchestrationError: If resolution fails for any other reason, such as a
-            real module raising while being imported.
+        PreflightValidationError: If fn_ref is not a usable reference, names a
+            module that does not exist, or names an attribute that an
+            otherwise-importable module does not define.
+        OrchestrationError: If resolution fails for any other reason, including
+            any failure raised while importing a real module.
     """
+    if not isinstance(spec.fn_ref, str):
+        raise PreflightValidationError(
+            f"Malformed fn_ref for step '{spec.step_id}': expected a "
+            f"'module:function' string, got {type(spec.fn_ref).__name__}."
+        )
+
+    parsed = _parse_fn_ref(spec.fn_ref)
+    if parsed is None:
+        raise PreflightValidationError(
+            f"Malformed fn_ref for step '{spec.step_id}': {spec.fn_ref!r} "
+            f"is not a 'module:function' or 'module.function' reference."
+        )
+    module_name, attribute = parsed
+
     try:
         return resolve_callable(spec.fn_ref)
     except ModuleNotFoundError as exc:
-        # Distinguish "the module named in fn_ref does not exist" from "a real
-        # module has a broken dependency". exc.name is the module that could not
-        # be found; for a bad fn_ref it is the requested module or a prefix of it.
-        requested = spec.fn_ref.split(":", 1)[0] if ":" in spec.fn_ref else spec.fn_ref
+        # exc.name is the module that could not be found. It is the reference's
+        # own module (or a package prefix of it) when the reference is wrong,
+        # and some other module when a real module has a broken dependency.
         missing = exc.name or ""
-        if missing and (requested == missing or requested.startswith(f"{missing}.")):
+        if missing and (
+            module_name == missing or module_name.startswith(f"{missing}.")
+        ):
             raise PreflightValidationError(
                 f"Unresolvable fn_ref for step '{spec.step_id}': "
                 f"'{spec.fn_ref}' names module '{missing}', which does not exist."
             ) from exc
+        # Includes a missing exc.name: no evidence, so keep it nonterminal.
         raise OrchestrationError(
             f"Importing the module for step '{spec.step_id}' "
             f"(fn_ref='{spec.fn_ref}') failed: {exc}"
         ) from exc
     except AttributeError as exc:
-        raise PreflightValidationError(
-            f"Unresolvable fn_ref for step '{spec.step_id}': "
-            f"'{spec.fn_ref}' names an attribute that its module does not define."
-        ) from exc
-    except ValueError as exc:
-        raise PreflightValidationError(
-            f"Malformed fn_ref for step '{spec.step_id}': {spec.fn_ref!r} "
-            f"is not a 'module:function' or 'module.function' reference."
+        if module_name in sys.modules:
+            # The module imported, so this came from the attribute lookup.
+            raise PreflightValidationError(
+                f"Unresolvable fn_ref for step '{spec.step_id}': module "
+                f"'{module_name}' does not define '{attribute}'."
+            ) from exc
+        # Raised while the module was initializing: a broken environment.
+        raise OrchestrationError(
+            f"Importing the module for step '{spec.step_id}' "
+            f"(fn_ref='{spec.fn_ref}') failed: {exc!r}"
         ) from exc
     except Exception as exc:
         raise OrchestrationError(
             f"Resolving the callable for step '{spec.step_id}' "
-            f"(fn_ref='{spec.fn_ref}') failed: {exc}"
+            f"(fn_ref='{spec.fn_ref}') failed: {exc!r}"
         ) from exc
 
 
@@ -426,7 +485,7 @@ class Engine:
         Raises:
             PreflightValidationError: If the plan is structurally invalid, its
                 failure policy is unknown, or a step's callable is unresolvable,
-                undecorated, or cannot bind its params.
+                non-callable, undecorated, or cannot bind its params.
             OrchestrationError: If resolving a callable fails for a reason that
                 is not a defect of the plan, such as a real module raising while
                 being imported.
@@ -441,6 +500,12 @@ class Engine:
         resolved: dict[str, Callable[..., Any]] = {}
         for spec in plan.steps:
             fn = _resolve_step_callable(spec)
+            if not callable(fn):
+                raise PreflightValidationError(
+                    f"Step '{spec.step_id}' resolves to a non-callable "
+                    f"{type(fn).__name__} (fn_ref='{spec.fn_ref}'). Carrying step "
+                    f"metadata does not make an object executable."
+                )
             if not hasattr(fn, "_step_name"):
                 raise PreflightValidationError(
                     f"Undecorated step function detected for step '{spec.step_id}' "
