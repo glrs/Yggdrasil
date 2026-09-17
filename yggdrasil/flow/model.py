@@ -18,8 +18,10 @@ class StepSpec:
     outputs: dict[str, str] = field(default_factory=dict)
 
 
-VALID_FAILURE_POLICIES = frozenset({"fail_fast", "continue_independent"})
-DEFAULT_FAILURE_POLICY = "fail_fast"
+FAIL_FAST_POLICY = "fail_fast"
+CONTINUE_INDEPENDENT_POLICY = "continue_independent"
+VALID_FAILURE_POLICIES = frozenset({FAIL_FAST_POLICY, CONTINUE_INDEPENDENT_POLICY})
+DEFAULT_FAILURE_POLICY = FAIL_FAST_POLICY
 
 
 def validate_failure_policy(policy: str) -> None:
