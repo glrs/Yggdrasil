@@ -19,6 +19,7 @@ from yggdrasil.flow.errors import (
 )
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
+from yggdrasil.flow.outputs import MISSING_REQUIRED_OUTPUTS_CODE, find_missing_outputs
 from yggdrasil.flow.utils.hash import dirhash_stats, sha256_file
 
 CTX_PARAM = "ctx"
@@ -103,6 +104,10 @@ class StepContext:
     data: DataAccess | None = (
         None  # realm-scoped read-only data access (injected by Engine)
     )
+    # Outputs this invocation must leave behind, resolved from the step's
+    # declared outputs (injected by Engine). The @step wrapper will not report
+    # success while any of them is missing.
+    required_outputs: dict[str, Path] = field(default_factory=dict)
     _seq: int = 0  # private counter, starts at 0
     _artifacts: list[Artifact] = field(default_factory=list)
 
@@ -227,6 +232,36 @@ def _emit_step_failed(
         ) from publish_error
 
 
+def _require_outputs(ctx: StepContext) -> None:
+    """Fail a step that returned without producing every required output.
+
+    Called by the wrapper after the step body returns and before anything
+    terminal is published, inside the same ``try`` as the body. A missing output
+    therefore surfaces through the wrapper's own PermanentStepError handler,
+    which publishes the step's one ``step.failed`` event; ``step.succeeded`` is
+    never published for it.
+
+    Args:
+        ctx: The context of the step that returned.
+
+    Raises:
+        PermanentStepError: If a required output does not exist.
+        OrchestrationError: If whether an output exists cannot be determined.
+    """
+    missing = find_missing_outputs(ctx.required_outputs, step_id=ctx.step_id)
+    if missing:
+        listed = ", ".join(f"'{key}' at '{path}'" for key, path in missing.items())
+        raise PermanentStepError(
+            f"Step '{ctx.step_id}' returned without producing its required "
+            f"outputs: {listed}",
+            code=MISSING_REQUIRED_OUTPUTS_CODE,
+            advice=(
+                "Make the step write every declared output before returning, "
+                "or correct its output declarations."
+            ),
+        )
+
+
 # def step(name: str | None = None, *, input_keys: tuple[str, ...] = ()):
 def step(_fn=None, *, name: str | None = None):
     """
@@ -235,6 +270,9 @@ def step(_fn=None, *, name: str | None = None):
     The engine handles:
       - fingerprinting & cache checks BEFORE calling the wrapped fn
       - building StepContext and workdir
+    The wrapper publishes the step's lifecycle events, and reports success only
+    once every output in ``ctx.required_outputs`` exists; a step that returns
+    without them fails with a PermanentStepError.
     The wrapped fn should accept (ctx: StepContext, **params) and return StepResult or None.
     """
 
@@ -253,6 +291,9 @@ def step(_fn=None, *, name: str | None = None):
                 # if user skipped returning artifacts, use what the context recorded
                 if not result.artifacts and ctx._artifacts:
                     result.artifacts = list(ctx._artifacts)
+
+                # Required-output validation precedes success publication.
+                _require_outputs(ctx)
 
                 # Emit success with a compact manifest
                 manifest = [a.__dict__ for a in result.artifacts]

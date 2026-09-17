@@ -1,7 +1,8 @@
+import errno
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from yggdrasil.flow.artifacts import SimpleArtifactRef
 from yggdrasil.flow.errors import (
@@ -11,6 +12,7 @@ from yggdrasil.flow.errors import (
 )
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
+from yggdrasil.flow.outputs import MISSING_REQUIRED_OUTPUTS_CODE
 from yggdrasil.flow.step import StepContext, step
 
 
@@ -1260,6 +1262,129 @@ class TestStepWrapperOrchestrationOrdering(unittest.TestCase):
             failing_step(ctx)
 
         self.assertIn("step.failed", ctx.emitted)
+
+
+class TestStepWrapperRequiredOutputs(unittest.TestCase):
+    """A step is reported succeeded only once its required outputs exist.
+
+    Validation lives in the wrapper because the wrapper, not the engine,
+    publishes step.succeeded: by the time the engine regains control, success
+    has already been published.
+    """
+
+    def setUp(self):
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.workdir = Path(temp_dir.name)
+        self.events: list[dict] = []
+        emitter = Mock(spec=EventEmitter)
+        emitter.emit.side_effect = self.events.append
+        self.ctx = StepContext(
+            realm="test",
+            scope={"kind": "project", "id": "P1"},
+            plan_id="plan_1",
+            step_id="materialize_config",
+            step_name="materialize_config",
+            workdir=self.workdir,
+            scope_dir=self.workdir,
+            emitter=emitter,
+            required_outputs={
+                "config": self.workdir / "demux.config",
+                "sheet": self.workdir / "samplesheet.csv",
+            },
+        )
+
+    def types(self) -> list[str]:
+        """Event types published so far, in order."""
+        return [event["type"] for event in self.events]
+
+    def test_required_outputs_default_to_none(self):
+        ctx = StepContext(
+            realm="r",
+            scope={},
+            plan_id="p",
+            step_id="s",
+            step_name="s",
+            workdir=self.workdir,
+            scope_dir=self.workdir,
+            emitter=Mock(spec=EventEmitter),
+        )
+
+        self.assertEqual(ctx.required_outputs, {})
+
+    def test_outputs_written_by_the_body_let_success_be_published(self):
+        @step
+        def materialize(ctx: StepContext) -> StepResult:
+            for path in ctx.required_outputs.values():
+                path.write_text("content", encoding="utf-8")
+            return StepResult()
+
+        materialize(self.ctx)
+
+        self.assertEqual(self.types(), ["step.started", "step.succeeded"])
+
+    def test_missing_output_is_one_failed_event_and_never_a_success(self):
+        @step
+        def forgetful(ctx: StepContext) -> StepResult:
+            ctx.required_outputs["config"].write_text("content", encoding="utf-8")
+            return StepResult()
+
+        with self.assertRaises(PermanentStepError) as cm:
+            forgetful(self.ctx)
+
+        self.assertEqual(self.types(), ["step.started", "step.failed"])
+        failed = self.events[-1]
+        self.assertEqual(failed["kind"], "permanent")
+        self.assertEqual(failed["code"], MISSING_REQUIRED_OUTPUTS_CODE)
+        self.assertEqual(cm.exception.code, MISSING_REQUIRED_OUTPUTS_CODE)
+        # Names what is missing, and only that.
+        self.assertIn("sheet", failed["error"])
+        self.assertIn(str(self.workdir / "samplesheet.csv"), failed["error"])
+        self.assertNotIn("'config'", failed["error"])
+
+    def test_step_without_required_outputs_is_unaffected(self):
+        @step
+        def plain(ctx: StepContext) -> StepResult:
+            return StepResult()
+
+        self.ctx.required_outputs = {}
+
+        with patch.object(Path, "stat", side_effect=AssertionError("stat called")):
+            plain(self.ctx)
+
+        self.assertEqual(self.types(), ["step.started", "step.succeeded"])
+
+    def test_body_failure_is_reported_as_itself_not_as_missing_outputs(self):
+        """Outputs are checked only after the body returns."""
+
+        @step
+        def broken(ctx: StepContext) -> StepResult:
+            raise TransientStepError("cluster busy")
+
+        with self.assertRaises(TransientStepError):
+            broken(self.ctx)
+
+        self.assertEqual(self.types(), ["step.started", "step.failed"])
+        self.assertEqual(self.events[-1]["kind"], "transient")
+        self.assertIsNone(self.events[-1]["code"])
+
+    def test_output_check_that_cannot_complete_is_infrastructure(self):
+        """Not reported as this step's failure, and not as its success."""
+
+        @step
+        def materialize(ctx: StepContext) -> StepResult:
+            for path in ctx.required_outputs.values():
+                path.write_text("content", encoding="utf-8")
+            return StepResult()
+
+        with patch.object(
+            Path, "stat", side_effect=PermissionError(errno.EACCES, "denied")
+        ):
+            with self.assertRaises(OrchestrationError) as cm:
+                materialize(self.ctx)
+
+        self.assertNotIsInstance(cm.exception, PermanentStepError)
+        self.assertEqual(self.types(), ["step.started"])
 
 
 if __name__ == "__main__":
