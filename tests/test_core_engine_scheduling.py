@@ -74,13 +74,16 @@ class RecordingEmitter(EventEmitter):
     def __init__(self) -> None:
         self.events: list[dict] = []
         self.fail_on: set[str] = set()
+        # What a failing emit raises: an ordinary OSError by default, or an
+        # OrchestrationError, as an emitter built on Yggdrasil storage might.
+        self.error_type: type[Exception] = OSError
         self._lock = threading.Lock()
 
     def emit(self, event: dict) -> None:
         with self._lock:
             self.events.append(event)
         if event.get("type") in self.fail_on:
-            raise OSError(f"event spool unavailable for {event.get('type')}")
+            raise self.error_type(f"event spool unavailable for {event.get('type')}")
 
     def types(self) -> list[str]:
         """Event types recorded so far, in emission order."""
@@ -568,6 +571,18 @@ class TestContinueIndependent(SchedulingTestCase):
         self.assertIsInstance(report, AttemptReport)
         self.assert_published_once(report)
 
+    def test_step_raising_attempt_cancelled_error_is_not_a_cancellation(self):
+        """AttemptCancelledError is engine-internal, not an author-facing API."""
+        self.steps.fail("a", AttemptCancelledError("a step pretending to cancel"))
+
+        report = self.engine.run(self.plan(spec("a"), spec("b"), policy=CONTINUE))
+
+        self.assertEqual(self.steps.calls, ["a", "b"])
+        self.assertIs(report.termination_reason, TerminationReason.COMPLETED)
+        self.assertIs(report.step_outcomes["a"], StepOutcome.FAILED)
+        self.assertEqual(report.failures["a"].error_type, "AttemptCancelledError")
+        self.assertIs(report.step_outcomes["b"], StepOutcome.SUCCEEDED)
+
     def test_continuation_result_is_never_none_even_when_everything_succeeds(self):
         report = self.engine.run(self.plan(spec("a"), policy=CONTINUE))
 
@@ -711,9 +726,12 @@ class TestCancellation(SchedulingTestCase):
         )
         self.assertEqual(report.failed_ancestors["lane_2_upload"], ["lane_2"])
         self.assertEqual(report.unreached_step_ids, ["lane_4"])
-        # Distinct from a drained failure, which is what would retire a request.
+        # Distinct from a drained failure, which is what would retire a request:
+        # the report is closed, but the attempt did not drain.
         self.assertIs(report.termination_reason, TerminationReason.CANCELLED)
+        self.assertTrue(report.is_finished)
         self.assertFalse(report.is_drained)
+        self.assertIsNone(report.publication_failure)
         published = self.assert_published_once(report)
         self.assertEqual(published["termination_reason"], "cancelled")
         self.assertEqual(published["unreached_step_ids"], ["lane_4"])
@@ -822,6 +840,14 @@ class TestInfrastructureFailuresAbortTheAttempt(SchedulingTestCase):
             report_published,
             "publication must be skipped exactly when event publication failed",
         )
+        if report_published:
+            self.assertIsNone(report.publication_failure)
+        else:
+            # The caller's report says it was never published, and why.
+            failure = report.publication_failure
+            assert failure is not None
+            self.assertEqual(failure.details, {"publication_skipped": True})
+            self.assertEqual(failure.error_type, "EventPublicationError")
 
     # ----- event publication -----
 
@@ -991,16 +1017,91 @@ class TestAttemptReportPublication(SchedulingTestCase):
         by_id = {p["execution_id"]: p["report"] for p in published}
         self.assertEqual(by_id[second.execution_id]["step_outcomes"], {"a": "reused"})
 
-    def test_failure_to_publish_a_drained_report_is_raised(self):
+    def assert_publication_failure_recorded(
+        self, report: AttemptReport, *, superseded: str | None
+    ) -> None:
+        """Assert the caller's report records that its publication failed.
+
+        Args:
+            report: The report the caller holds.
+            superseded: The termination reason it was closed with and lost, or
+                None if the closing reason was kept.
+        """
+        failure = report.publication_failure
+        assert failure is not None, "the publication failure must be recorded"
+        self.assertEqual(failure.error_type, "EventPublicationError")
+        self.assertIn("plan.attempt_report", failure.message)
+        self.assertEqual(
+            failure.details.get("superseded_termination_reason"), superseded
+        )
+        self.assertFalse(report.is_drained)
+        self.assertIs(report.outcome, ExecutionOutcome.FAILED)
+
+    def test_failed_publication_after_successful_work_is_not_a_completion(self):
         self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
 
         context, exc = self.run_attempt(self.plan(spec("a"), policy=CONTINUE))
 
         self.assertIsInstance(exc, EventPublicationError)
-        self.assertIs(context.report.termination_reason, TerminationReason.COMPLETED)
-        self.assertTrue(context.report.is_drained)
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        self.assert_publication_failure_recorded(report, superseded="completed")
+        # The work itself is preserved exactly as it happened.
+        self.assertEqual(report.step_outcomes, {"a": StepOutcome.SUCCEEDED})
+        self.assertIsNone(report.diagnostic)
 
-    def test_failure_to_publish_keeps_the_fail_fast_step_error_visible(self):
+    def test_failed_publication_after_a_failed_continuation_keeps_its_breakdown(self):
+        self.steps.fail("lane_2", PermanentStepError("lane 2 failed"))
+        self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
+
+        context, exc = self.run_attempt(
+            self.plan(
+                spec("lane_2"),
+                spec("lane_2_upload", "lane_2"),
+                spec("lane_3"),
+                policy=CONTINUE,
+            )
+        )
+
+        self.assertIsInstance(exc, EventPublicationError)
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        self.assert_publication_failure_recorded(report, superseded="completed")
+        self.assertEqual(
+            report.step_outcomes,
+            {
+                "lane_2": StepOutcome.FAILED,
+                "lane_2_upload": StepOutcome.BLOCKED,
+                "lane_3": StepOutcome.SUCCEEDED,
+            },
+        )
+        self.assertEqual(report.failures["lane_2"].error, "lane 2 failed")
+        self.assertEqual(report.failed_ancestors["lane_2_upload"], ["lane_2"])
+
+    def test_failed_publication_after_preflight_rejection_is_not_a_rejection(self):
+        """A caller must not retire the request on a rejection it cannot report."""
+        self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
+
+        context, exc = self.run_attempt(
+            self.plan(spec("a"), spec("a"), policy=CONTINUE)
+        )
+
+        self.assertIsInstance(exc, EventPublicationError)
+        self.assertNotIsInstance(exc, PreflightValidationError)
+        self.assertTrue(
+            any(isinstance(e, PreflightValidationError) for e in exception_chain(exc))
+        )
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        self.assert_publication_failure_recorded(
+            report, superseded="preflight_rejected"
+        )
+        # The rejection stays readable as context.
+        diagnostic = report.diagnostic
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.error_type, "PreflightValidationError")
+
+    def test_failed_publication_keeps_the_fail_fast_step_error_visible(self):
         original = RuntimeError("step broke")
         self.steps.fail("a", original)
         self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
@@ -1011,9 +1112,12 @@ class TestAttemptReportPublication(SchedulingTestCase):
         self.assertIn("RuntimeError", str(exc))
         self.assertIn("step broke", str(exc))
         self.assertTrue(any(e is original for e in exception_chain(exc)))
-        self.assertIs(context.report.termination_reason, TerminationReason.FAILED_FAST)
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        self.assert_publication_failure_recorded(report, superseded="failed_fast")
+        self.assertEqual(report.failures["a"].error, "step broke")
 
-    def test_failure_to_publish_never_replaces_an_interrupt(self):
+    def test_failed_publication_never_replaces_an_interrupt(self):
         self.steps.fail("a", KeyboardInterrupt())
         self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
 
@@ -1022,7 +1126,85 @@ class TestAttemptReportPublication(SchedulingTestCase):
         self.assertIsInstance(exc, KeyboardInterrupt)
         notes = getattr(exc, "__notes__", [])
         self.assertTrue(any("attempt report also failed" in n for n in notes), notes)
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.CANCELLED)
+        self.assert_publication_failure_recorded(report, superseded=None)
+        diagnostic = report.diagnostic
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.error_type, "KeyboardInterrupt")
+
+    def test_failed_publication_never_replaces_a_cooperative_cancellation(self):
+        """The exception the caller receives agrees with the report: cancelled."""
+        plan = self.plan(spec("a"), spec("b"), policy=CONTINUE)
+        context = AttemptContext.for_plan(plan, execution_id="exec_cancel_publish")
+        self.steps.behaviors["a"] = lambda ctx: context.request_cancellation()
+        self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
+
+        with self.assertRaises(AttemptCancelledError) as cm:
+            self.engine._run_attempt(plan, context=context)
+
+        notes = getattr(cm.exception, "__notes__", [])
+        self.assertTrue(any("attempt report also failed" in n for n in notes), notes)
+        report = context.report
+        self.assertIs(report.termination_reason, TerminationReason.CANCELLED)
+        self.assert_publication_failure_recorded(report, superseded=None)
+        self.assertEqual(report.unreached_step_ids, ["b"])
+
+
+class TestEmitterFailuresAreAlwaysPublicationFailures(SchedulingTestCase):
+    """An emitter that raises OrchestrationError has still failed to publish.
+
+    Without this, the engine would not recognize that its reporting channel
+    broke: it would publish again through it, or let the publication error
+    replace an interrupt.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.emitter.error_type = OrchestrationError
+
+    def assert_publication_error(self, exc: BaseException | None) -> None:
+        """Assert a plain OrchestrationError from the emitter was reclassified."""
+        self.assertIsInstance(exc, EventPublicationError)
+        assert exc is not None
+        self.assertIsInstance(exc.__cause__, OrchestrationError)
+        self.assertNotIsInstance(exc.__cause__, EventPublicationError)
+
+    def test_cache_skip_publication_is_not_retried_through_the_broken_emitter(self):
+        plan = self.plan(spec("a"), policy=CONTINUE)
+        self.run_attempt(plan)  # leaves a matching cache marker
+        self.reset_observations()
+        self.emitter.fail_on = {"step.skipped"}
+
+        context, exc = self.run_attempt(plan)
+
+        self.assert_publication_error(exc)
+        self.assertNotIn(ATTEMPT_REPORT_EVENT, self.emitter.types())
+        failure = context.report.publication_failure
+        assert failure is not None
+        self.assertEqual(failure.details, {"publication_skipped": True})
+
+    def test_retry_unimplemented_publication_is_not_retried_either(self):
+        self.steps.fail("a", TransientStepError("cluster busy"))
+        self.emitter.fail_on = {"step.retry_unimplemented"}
+
+        context, exc = self.run_attempt(self.plan(spec("a"), policy=CONTINUE))
+
+        self.assert_publication_error(exc)
+        self.assertNotIn(ATTEMPT_REPORT_EVENT, self.emitter.types())
+        self.assertIsNotNone(context.report.publication_failure)
+
+    def test_report_publication_failure_does_not_replace_an_interrupt(self):
+        self.steps.fail("a", KeyboardInterrupt())
+        self.emitter.fail_on = {ATTEMPT_REPORT_EVENT}
+
+        context, exc = self.run_attempt(self.plan(spec("a"), policy=CONTINUE))
+
+        self.assertIsInstance(exc, KeyboardInterrupt)
         self.assertIs(context.report.termination_reason, TerminationReason.CANCELLED)
+        failure = context.report.publication_failure
+        assert failure is not None
+        self.assertEqual(failure.error_type, "EventPublicationError")
 
 
 class TestAttemptIsolation(SchedulingTestCase):

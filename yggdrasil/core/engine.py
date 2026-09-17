@@ -176,12 +176,16 @@ def _orchestration_boundary(
 
     Raises:
         OrchestrationError: If the wrapped operation fails, as ``error_type``.
-            An OrchestrationError raised within is re-raised unchanged, so
-            nested boundaries do not wrap the same failure twice.
+            An exception that already is ``error_type`` is re-raised unchanged,
+            so nested boundaries do not wrap the same failure twice. Any other
+            exception is wrapped, including a broader OrchestrationError: an
+            emitter that raises a plain OrchestrationError has still failed to
+            publish, and must surface as an EventPublicationError so the engine
+            stops reporting through it.
     """
     try:
         yield
-    except OrchestrationError:
+    except error_type:
         raise
     except Exception as exc:
         raise error_type(f"{description}: {exc}") from exc
@@ -694,15 +698,24 @@ class Engine:
                 was violated (ORCHESTRATION_ERROR); or if ``context`` does not
                 belong to a fresh attempt at ``plan``, in which case the report
                 is left untouched and nothing runs.
-            EventPublicationError: If publishing the report itself failed. When
-                the attempt was already ending with an exception, that original
-                exception is named in the message and kept in the chain.
+            EventPublicationError: If publishing the report itself failed. The
+                report then says ORCHESTRATION_ERROR, with the ending it was
+                closed with kept as context (see
+                :meth:`AttemptReport.record_publication_failure`). When the
+                attempt was already ending with an exception, that exception is
+                named in the message and kept in the chain.
             StepError: Under ``fail_fast``, the first step failure (FAILED_FAST).
                 A TransientStepError surfaces as a PermanentStepError.
             Exception: Under ``fail_fast``, any other first step failure,
                 unchanged (FAILED_FAST).
             BaseException: An interruption such as KeyboardInterrupt, unchanged
                 (CANCELLED).
+
+        A cancelled attempt — cooperatively or by interruption — always
+        propagates its cancellation, even if publishing its report also failed.
+        That failure is then recorded in the report and attached to the
+        exception as a note, and the report stays CANCELLED, so the report and
+        the exception never disagree about how the attempt ended.
         """
         self._check_attempt_context(plan, context)
         report = context.report
@@ -1105,6 +1118,11 @@ class Engine:
         it directly under the plan, named after its unique event ID, so reports
         from different attempts of one plan never overwrite each other.
 
+        Publication is part of the attempt's exit, not an afterthought to it. If
+        it fails, or has to be skipped, the report the caller holds records that
+        through :meth:`AttemptReport.record_publication_failure`, so it cannot
+        claim an ending the caller's exception contradicts.
+
         If the attempt is ending *because* event publication failed, publishing
         again would only fail the same way and bury the original cause under a
         second, identical failure, so publication is skipped.
@@ -1115,13 +1133,23 @@ class Engine:
             cause: The exception ending the attempt, or None if it drained.
 
         Raises:
-            EventPublicationError: If publication fails and the attempt drained
-                or is ending with an Exception. In the latter case the message
-                names that exception and it stays reachable through the chain.
-                An interruption that is not an Exception is never replaced: the
+            EventPublicationError: If publication fails and the attempt was not
+                cancelled. When the attempt was ending with an exception, the
+                message names it and it stays reachable through the chain. A
+                cancelled attempt's own exception is never replaced; the
                 publication failure is attached to it as a note instead.
         """
         if isinstance(cause, EventPublicationError):
+            report.record_publication_failure(
+                AttemptDiagnostic(
+                    message=(
+                        "The attempt report was not published: event publication "
+                        "had already failed during this attempt."
+                    ),
+                    error_type=type(cause).__name__,
+                    details={"publication_skipped": True},
+                )
+            )
             self._logger.error(
                 "Not publishing the report of attempt '%s' for plan '%s': event "
                 "publication already failed during this attempt.",
@@ -1148,9 +1176,12 @@ class Engine:
                 event,
             )
         except EventPublicationError as publish_error:
+            report.record_publication_failure(
+                AttemptDiagnostic.from_exception(publish_error)
+            )
             if cause is None:
                 raise
-            if not isinstance(cause, Exception):
+            if report.termination_reason is TerminationReason.CANCELLED:
                 cause.add_note(
                     f"Publishing the attempt report also failed: {publish_error}"
                 )

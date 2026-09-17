@@ -84,6 +84,12 @@ class AttemptCancelledError(Exception):
     ``ValueError``, because the plan is fine. Above all it must never be read as
     a completed attempt that failed: an interrupted attempt did not finish, so
     its execution request must stay eligible.
+
+    Engine-internal. It is how the engine tells whoever started an attempt that
+    the attempt stopped; it is not a cancellation API for step authors. The
+    engine never reads one raised from inside a step as cancellation — it is
+    that step's ordinary failure. Cancellation is requested only through the
+    attempt's context (``AttemptContext.request_cancellation``).
     """
 
 

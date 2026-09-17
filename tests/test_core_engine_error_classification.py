@@ -16,8 +16,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from yggdrasil.core.engine import Engine
+from yggdrasil.core.engine import Engine, _orchestration_boundary
 from yggdrasil.flow.errors import (
+    EventPublicationError,
     OrchestrationError,
     PermanentStepError,
     TransientStepError,
@@ -276,6 +277,56 @@ class TestRealmDataFailuresStayOrdinary(ClassificationTestCase):
 
         self.assertNotIsInstance(cm.exception, OrchestrationError)
         self.assertIn("step.failed", emitter.types())
+
+
+class TestBoundaryClassificationRule(unittest.TestCase):
+    """Each boundary keeps its own classification and nothing narrower.
+
+    A bookkeeping boundary leaves an OrchestrationError from within as it is. A
+    publication boundary must not: an emitter raising a plain OrchestrationError
+    has still failed to publish, and the engine can only stop reporting through
+    a broken emitter if it recognizes that failure as EventPublicationError.
+    """
+
+    def test_bookkeeping_boundary_wraps_ordinary_failures(self):
+        with self.assertRaises(OrchestrationError) as cm:
+            with _orchestration_boundary("Writing a marker"):
+                raise OSError("disk full")
+
+        self.assertNotIsInstance(cm.exception, EventPublicationError)
+        self.assertIsInstance(cm.exception.__cause__, OSError)
+
+    def test_bookkeeping_boundary_leaves_an_orchestration_error_unchanged(self):
+        inner = OrchestrationError("already classified")
+
+        with self.assertRaises(OrchestrationError) as cm:
+            with _orchestration_boundary("Writing a marker"):
+                raise inner
+
+        self.assertIs(cm.exception, inner)
+
+    def test_publication_boundary_reclassifies_a_plain_orchestration_error(self):
+        inner = OrchestrationError("storage-backed emitter failed")
+
+        with self.assertRaises(EventPublicationError) as cm:
+            with _orchestration_boundary(
+                "Publishing an event", error_type=EventPublicationError
+            ):
+                raise inner
+
+        self.assertIs(cm.exception.__cause__, inner)
+        self.assertIn("storage-backed emitter failed", str(cm.exception))
+
+    def test_publication_boundary_leaves_a_publication_error_unchanged(self):
+        inner = EventPublicationError("already classified")
+
+        with self.assertRaises(EventPublicationError) as cm:
+            with _orchestration_boundary(
+                "Publishing an event", error_type=EventPublicationError
+            ):
+                raise inner
+
+        self.assertIs(cm.exception, inner)
 
 
 if __name__ == "__main__":
