@@ -1295,11 +1295,15 @@ class TestBuilderOutputAgreement(unittest.TestCase):
             with self.subTest(name):
                 self.received.clear()
                 os.chdir(self.root)
+                # The base resolves against the working directory as the OS
+                # reports it, which spells self.root without the symlinks a
+                # temp dir path may contain (macOS /var, a symlinked TMPDIR).
+                planning_root = Path.cwd()
                 builder, spec = self.build(Path("rel_base"), params)
                 os.chdir(self.base)
 
                 self.assert_agreement(
-                    builder, spec, self.root.joinpath("rel_base", *tail)
+                    builder, spec, planning_root.joinpath("rel_base", *tail)
                 )
                 self.assertFalse(self.base.joinpath("rel_base").exists())
 
