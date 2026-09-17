@@ -1145,8 +1145,8 @@ def make_writer(
 class TestBuilderPreservesDeclaredOutputs(unittest.TestCase):
     """The output map reaches the StepSpec, and only as absolute paths.
 
-    Formerly a documented gap: the builder computed the map, used it to wire
-    dependencies, and dropped it before constructing the StepSpec.
+    The builder used to compute this map and use it to wire dependencies, but
+    dropped it before constructing the StepSpec.
     """
 
     def setUp(self):

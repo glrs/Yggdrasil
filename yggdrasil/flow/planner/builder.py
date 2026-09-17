@@ -142,12 +142,13 @@ class PlanBuilder:
 
     Output paths are settled once per step, so the path a step writes, the path
     it declares and the path the registry records agree. Input paths are not
-    wired that way yet (Tech Debt #20): a step's input parameter and its
-    ``StepSpec.inputs`` entry come from its own ``In(...)`` annotation, never
-    from the producer's registry entry or an explicit input override.
-    Dependencies are still inferred correctly from artifact keys, but a consumer
-    can read - and fingerprint - a different file than its producer wrote once
-    that producer's output path is overridden.
+    wired that way yet: a step's input parameter and its ``StepSpec.inputs``
+    entry come from its own ``In(...)`` annotation, never from the producer's
+    registry entry or an explicit input override. Dependencies are still
+    inferred correctly from artifact keys, but a consumer can read - and
+    fingerprint - a different file than its producer wrote once that producer's
+    output path is overridden. The gap is recorded as entry 20 in
+    ``docs/TECH_DEBT_LEDGER.md``.
     """
 
     plan_id: str

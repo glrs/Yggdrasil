@@ -1,9 +1,9 @@
 """Tests for the execution outcome vocabulary and the per-attempt report.
 
-These pin down the contract later phases build on: the four terminal step
-outcomes, the separation of "blocked" from "never reached", attempt-level
-diagnostics that need no invented failed step, and the rules that decide when an
-attempt counts as drained and successful.
+These pin down the contract the engine and its callers build on: the four
+terminal step outcomes, the separation of "blocked" from "never reached",
+attempt-level diagnostics that need no invented failed step, and the rules that
+decide when an attempt counts as drained and successful.
 """
 
 import json
@@ -28,7 +28,12 @@ def _report(*step_ids: str, **kwargs) -> AttemptReport:
 
 
 class TestStepOutcome(unittest.TestCase):
-    """The four terminal step outcomes and their dependency semantics."""
+    """The four terminal step outcomes and their dependency semantics.
+
+    The "table" these tests refer to is the step outcome table in
+    ``docs/design/prds/independent_branch_execution_prd.md``: which outcomes
+    exist, and which of them satisfy a success dependency.
+    """
 
     def test_value_set_matches_the_prd_table_exactly(self):
         """Exactly four terminal outcomes exist - no pending/running."""

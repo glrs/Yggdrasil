@@ -2,8 +2,10 @@
 
 Exception *location* alone cannot classify a failure: the decorated step function
 also publishes events, and author calls such as ``ctx.record_artifact()`` reach
-into infrastructure. These tests inject a failure at each call site the
-classification table names and assert which side of the line it lands on.
+into infrastructure. These tests inject a failure at each kind of call site -
+event publication through the step context, the engine's own event publication,
+engine bookkeeping, and realm-controlled data handling - and assert which side
+of the line it lands on.
 
 The rule being protected: an infrastructure or reporting failure is never
 silently recorded as a branch's ordinary domain failure. It aborts the attempt
@@ -99,7 +101,7 @@ class ClassificationTestCase(unittest.TestCase):
 
 
 class TestStepContextEmitClassification(ClassificationTestCase):
-    """Row: StepContext.emit() - covers every ctx.emit(...) call."""
+    """StepContext.emit(), which every ctx.emit(...) call goes through."""
 
     def test_failing_step_started_emit_aborts_as_orchestration_error(self):
         emitter = RecordingEmitter(fail_on={"step.started"})
@@ -140,7 +142,7 @@ class TestStepContextEmitClassification(ClassificationTestCase):
 
 
 class TestEngineDirectEmitClassification(ClassificationTestCase):
-    """Row: Engine's direct self.emitter.emit() calls, which bypass ctx."""
+    """The engine's direct self.emitter.emit() calls, which bypass ctx."""
 
     def test_failing_step_skipped_emit_aborts_as_orchestration_error(self):
         # First run populates the cache marker so the second run takes the
@@ -176,7 +178,7 @@ class TestEngineDirectEmitClassification(ClassificationTestCase):
 
 
 class TestEngineBookkeepingClassification(ClassificationTestCase):
-    """Row: plan.json write, step-dir creation, cache-marker read and write."""
+    """Engine bookkeeping: plan.json, step directories, cache markers."""
 
     def test_failing_plan_file_write_aborts_as_orchestration_error(self):
         # A work root nested inside a regular file cannot be created.
@@ -228,8 +230,8 @@ class TestEngineBookkeepingClassification(ClassificationTestCase):
                 self.run_plan(ok_step, emitter)
 
         self.assertIn("Writing the cache marker", str(cm.exception))
-        # The documented, accepted inconsistency window: success was published,
-        # then the marker failed and the attempt aborted.
+        # The accepted inconsistency window described in Engine._execute_step:
+        # success was published, then the marker failed and the attempt aborted.
         self.assertIn("step.succeeded", emitter.types())
         step_dir = self.work_root / "classify_plan" / "s1"
         self.assertFalse((step_dir / "success.fingerprint").exists())
@@ -238,7 +240,7 @@ class TestEngineBookkeepingClassification(ClassificationTestCase):
 
 
 class TestRealmDataFailuresStayOrdinary(ClassificationTestCase):
-    """Row: record_artifact()'s hashing of an author-supplied path.
+    """record_artifact()'s hashing of an author-supplied path.
 
     The path is realm-controlled data, so a failure there is that step's
     ordinary failure - not automatically systemic merely because it is an

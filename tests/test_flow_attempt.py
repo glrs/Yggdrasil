@@ -144,7 +144,7 @@ class TestAttemptContextCancellation(unittest.TestCase):
 
 
 class TestAttemptContextSurvivesExceptions(unittest.TestCase):
-    """The phase's key guarantee: outcomes survive an attempt that raises."""
+    """The context's key guarantee: outcomes survive an attempt that raises."""
 
     def test_context_still_exposes_outcomes_and_reason_after_a_raise(self):
         ctx = AttemptContext.for_plan(

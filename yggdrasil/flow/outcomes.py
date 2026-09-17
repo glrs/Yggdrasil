@@ -49,10 +49,8 @@ class StepOutcome(str, Enum):
     def satisfies_dependency(self) -> bool:
         """Whether a successor depending on this step may become runnable.
 
-        Encodes the "Satisfies a success dependency?" column of the PRD's step
-        outcome table: every ``deps`` entry is a success prerequisite, so only
-        a step that actually succeeded or was validly reused releases its
-        dependents.
+        Every ``deps`` entry is a success prerequisite, so only a step that
+        actually succeeded or was validly reused releases its dependents.
 
         Returns:
             bool: True for SUCCEEDED and REUSED, False for FAILED and BLOCKED.
@@ -76,7 +74,7 @@ class TerminationReason(str, Enum):
     """How an execution attempt ended.
 
     This is what distinguishes "finished, with failures" from "stopped before
-    finishing" — a distinction later phases depend on when deciding whether an
+    finishing" — a distinction callers depend on when deciding whether an
     execution request is complete.
 
     Attributes:

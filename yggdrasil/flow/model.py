@@ -13,8 +13,9 @@ class StepSpec:
     deps: list[str] = field(default_factory=list)
     scope: dict[str, Any] = field(default_factory=dict)
     inputs: dict[str, str] = field(default_factory=dict)
-    # Required output artifact paths this step produces, keyed by artifact key.
-    # Inert until reuse gating reads it.
+    # Required output artifact paths this step produces, keyed by artifact key:
+    # absolute, or relative to the step's own work directory. The step is reused
+    # only while all of them exist (see yggdrasil.flow.outputs).
     outputs: dict[str, str] = field(default_factory=dict)
 
 

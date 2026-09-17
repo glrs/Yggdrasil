@@ -254,7 +254,7 @@ class TestFingerprintCompatibility(ReuseTestCase):
 
 
 class TestReuseRequiresDeclaredOutputs(ReuseTestCase):
-    """Criterion #5: valid reuse satisfies dependencies; a deleted output reruns."""
+    """Valid reuse satisfies dependencies; a deleted output reruns its producer."""
 
     def producer_consumer(self, policy: str) -> Plan:
         return self.plan(
@@ -385,7 +385,7 @@ class TestDeclaredOutputPathResolution(ReuseTestCase):
 
 
 class TestMissingRequiredOutputIsAStepFailure(ReuseTestCase):
-    """Criterion #17: one failed terminal event, no success event, no marker."""
+    """A missing output is one failed event, with no success event and no marker."""
 
     def forgetful_plan(self, policy: str) -> Plan:
         self.steps.behaviors["producer"] = lambda ctx: None
@@ -445,7 +445,7 @@ class TestSuccessMarkerLifecycle(ReuseTestCase):
     """Invalidate before re-execution; replace atomically after success."""
 
     def test_failed_rerun_leaves_no_reusable_success_marker(self):
-        """Criterion #5, over outputs the failed rerun partly replaced."""
+        """The rerun partly replaces its output before failing; nothing is reusable."""
         plan = self.plan(spec("producer", outputs={"data": "data.csv"}))
         self.engine.run(plan)
         data = self.step_dir("producer") / "data.csv"
@@ -610,10 +610,10 @@ class TestReplaceMarker(unittest.TestCase):
 
 
 class TestReuseInfrastructureFailuresAbortTheAttempt(ReuseTestCase):
-    """Criterion #17 at the reuse and marker boundaries, under continuation.
+    """Infrastructure faults at the reuse and marker boundaries, under continuation.
 
     Each injects the fault at ``x``, with an independent ``y`` that would
-    otherwise run next.
+    otherwise run next. None of them may drain as an ordinary step failure.
     """
 
     def plan_xy(self) -> Plan:
@@ -678,7 +678,7 @@ class TestReuseInfrastructureFailuresAbortTheAttempt(ReuseTestCase):
 
 
 class TestBlockedDescendantIgnoresItsMarker(ReuseTestCase):
-    """Criterion #4, with every condition for reuse otherwise met."""
+    """A blocked step ignores its old marker, even with reuse otherwise valid."""
 
     def test_matching_marker_and_present_outputs_neither_run_nor_reuse(self):
         def lane(version: int) -> Plan:

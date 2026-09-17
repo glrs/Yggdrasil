@@ -450,8 +450,9 @@ def _replace_marker(marker: Path, fingerprint: str) -> None:
     partial one. On failure the temporary file is removed and the previous state
     is left as it was.
 
-    Nothing is fsynced, so this is not durable across power loss or filesystem
-    failure (PRD §9 does not promise rollback there). The temporary file is
+    Nothing is fsynced, so neither this replacement nor the invalidation that
+    precedes a step's execution is durable across power loss or filesystem
+    failure, and nothing attempts to roll back after one. The temporary file is
     created through ``open`` rather than ``tempfile``, so the marker keeps the
     umask-derived permissions it always had.
 
@@ -964,10 +965,10 @@ class Engine:
                 plan, spec, plan_dir, step_dir, fingerprint, run_id, required_outputs
             )
 
-        # Invalidate before the call, not after it fails: a crash part-way
-        # through must not leave the earlier success reusable over outputs that
-        # are now partly replaced. Done last before the call, so an attempt that
-        # aborts earlier costs no needless re-execution.
+        # The marker is invalidated before the call rather than after a failure,
+        # so a crash part-way through cannot leave the earlier success reusable
+        # over outputs that are now partly replaced. It happens as late as
+        # possible, so an attempt that aborts earlier costs no re-execution.
         with _orchestration_boundary(
             f"Invalidating the cache marker for step '{spec.step_id}'"
         ):
@@ -992,8 +993,10 @@ class Engine:
                 type(result),
             )
 
-        # Success-publication ordering contract (PRD §9), recorded once, with
-        # the owner of each stage:
+        # A step's success is finalized in this order, each stage with one
+        # owner, so that neither a success event nor a reusable marker ever
+        # exists for a step whose required outputs are missing, and no
+        # successor starts before the step is fully finalized:
         #
         #   required-output validation    the @step wrapper, after the body
         #     -> step-success publication  the @step wrapper, same call
@@ -1005,11 +1008,11 @@ class Engine:
         #
         # A step-success event may already have been published when the
         # marker replacement that follows it fails. That failure aborts the
-        # attempt as an OrchestrationError; it is the documented, accepted
-        # inconsistency window, not a bug to design around. A failed marker
-        # write never leaves a reusable success marker behind: the previous one
-        # was invalidated before the call, and a failed replacement installs
-        # nothing.
+        # attempt as an OrchestrationError. The window is accepted: the event
+        # spool and the marker are separate systems, and no transaction spans
+        # them. A failed marker write never leaves a reusable success marker
+        # behind: the previous one was invalidated before the call, and a
+        # failed replacement installs nothing.
         with _orchestration_boundary(
             f"Writing the cache marker for step '{spec.step_id}'"
         ):

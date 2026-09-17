@@ -400,9 +400,9 @@ class TestCallableValidation(PreflightTestCase):
 class TestResolutionFailureClassification(PreflightTestCase):
     """A malformed reference is not the same as a broken environment.
 
-    A preflight rejection is definitive, and later phases retire the execution
-    request on one. An import that blew up for an unrelated reason must not be
-    labelled that way, or a transient environment problem would permanently
+    A preflight rejection is definitive: callers may treat the execution request
+    as finished on one. An import that blew up for an unrelated reason must not
+    be labelled that way, or a transient environment problem would permanently
     retire a perfectly good request.
     """
 
@@ -579,7 +579,7 @@ class TestRealImportFailureClassification(PreflightTestCase):
         with self.assertRaises(OrchestrationError) as cm:
             self.engine.run(self.plan_with(fn_ref))
 
-        # Nonterminal: a later phase must not read this as a definitive
+        # Nonterminal: a caller must not be able to read this as a definitive
         # rejection and consume the execution request.
         self.assertNotIsInstance(cm.exception, PreflightValidationError)
         self.assertNotIsInstance(cm.exception, ValueError)

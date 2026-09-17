@@ -1182,7 +1182,7 @@ class TestStepWrapperOrchestrationOrdering(unittest.TestCase):
         self.assertNotIn("step.failed", ctx.emitted)
 
     def test_failing_failure_emit_preserves_both_causes(self):
-        """PRD: preserve both causes; do not hide the original error."""
+        """Both causes survive; the original error is not hidden."""
 
         @step
         def failing_step(ctx: StepContext, **kwargs) -> StepResult:
