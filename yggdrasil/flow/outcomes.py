@@ -112,6 +112,9 @@ class StepFailure:
         kind: "permanent" or "transient", matching the emitted event's field.
         code: Optional machine-readable code from StepError.
         advice: Optional operator guidance from StepError.
+        error_type: Exception class name, when the failure came from one. The
+            event payload carries only ``str(exc)``, which for many exceptions
+            (``KeyError('x')`` renders as ``'x'``) loses what went wrong.
     """
 
     step_id: str
@@ -119,6 +122,7 @@ class StepFailure:
     kind: str = "permanent"
     code: str | None = None
     advice: str | None = None
+    error_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation.
@@ -132,6 +136,7 @@ class StepFailure:
             "kind": self.kind,
             "code": self.code,
             "advice": self.advice,
+            "error_type": self.error_type,
         }
 
 
