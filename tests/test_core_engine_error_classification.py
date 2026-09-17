@@ -11,6 +11,7 @@ instead. A realm's own file error is *not* systemic merely because it is an
 OSError.
 """
 
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -215,14 +216,14 @@ class TestEngineBookkeepingClassification(ClassificationTestCase):
     def test_failing_cache_marker_write_aborts_and_leaves_no_marker(self):
         """Marker failure aborts even though step success was already published."""
         emitter = RecordingEmitter()
-        original_write_text = Path.write_text
+        original_replace = os.replace
 
-        def failing_write_text(self, *args, **kwargs):
-            if self.name == "success.fingerprint":
+        def failing_replace(src, dst, *args, **kwargs):
+            if Path(dst).name == "success.fingerprint":
                 raise OSError("no space left on device")
-            return original_write_text(self, *args, **kwargs)
+            return original_replace(src, dst, *args, **kwargs)
 
-        with patch.object(Path, "write_text", failing_write_text):
+        with patch.object(os, "replace", failing_replace):
             with self.assertRaises(OrchestrationError) as cm:
                 self.run_plan(ok_step, emitter)
 
@@ -230,8 +231,10 @@ class TestEngineBookkeepingClassification(ClassificationTestCase):
         # The documented, accepted inconsistency window: success was published,
         # then the marker failed and the attempt aborted.
         self.assertIn("step.succeeded", emitter.types())
-        marker = self.work_root / "classify_plan" / "s1" / "success.fingerprint"
-        self.assertFalse(marker.exists())
+        step_dir = self.work_root / "classify_plan" / "s1"
+        self.assertFalse((step_dir / "success.fingerprint").exists())
+        # Nor is the half-published replacement left lying around.
+        self.assertEqual(list(step_dir.iterdir()), [])
 
 
 class TestRealmDataFailuresStayOrdinary(ClassificationTestCase):

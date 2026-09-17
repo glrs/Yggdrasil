@@ -19,6 +19,7 @@ Cross-thread tests coordinate with ``threading.Event`` handshakes, never sleeps;
 """
 
 import json
+import os
 import threading
 import unittest
 from collections.abc import Callable
@@ -959,20 +960,22 @@ class TestInfrastructureFailuresAbortTheAttempt(SchedulingTestCase):
         )
 
     def test_failing_cache_marker_write(self):
-        original_write_text = Path.write_text
+        original_replace = os.replace
 
-        def failing_write_text(path, *args, **kwargs):
-            if path.name == "success.fingerprint":
+        def failing_replace(src, dst, *args, **kwargs):
+            if Path(dst).name == "success.fingerprint":
                 raise OSError("no space left on device")
-            return original_write_text(path, *args, **kwargs)
+            return original_replace(src, dst, *args, **kwargs)
 
-        with patch.object(Path, "write_text", failing_write_text):
+        with patch.object(os, "replace", failing_replace):
             context, exc = self.run_attempt(self.plan_xy())
 
         self.assert_aborted(
             context, exc, fragment="Writing the cache marker", report_published=True
         )
         self.assertIn("no space left", str(exc))
+        step_dir = self.work_root / "sched_plan" / "x"
+        self.assertEqual(sorted(p.name for p in step_dir.iterdir()), [])
 
     def test_failing_execution_context_preparation(self):
         """A broken configuration must not drain as N ordinary step failures."""

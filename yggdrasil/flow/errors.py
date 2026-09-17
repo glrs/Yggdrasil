@@ -98,8 +98,8 @@ class PreflightValidationError(ValueError):
 
     Raised for structural defects in the plan itself: duplicate, empty or
     unknown step identities, self-dependencies, cycles, an unknown failure
-    policy, an unresolvable or undecorated step callable, or parameters that
-    cannot bind to a step's signature.
+    policy, malformed output declarations, an unresolvable or undecorated step
+    callable, or parameters that cannot bind to a step's signature.
 
     Subclasses ``ValueError`` because preflight rejections have always raised
     ``ValueError``, and existing callers and tests catch that. The distinct

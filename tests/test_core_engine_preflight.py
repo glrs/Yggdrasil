@@ -241,6 +241,46 @@ class TestPolicyValidation(PreflightTestCase):
                 self.assertEqual(set(self.engine._preflight(plan)), {"s1"})
 
 
+class TestOutputDeclarationValidation(PreflightTestCase):
+    """A malformed output declaration cannot gate reuse, so it rejects the plan."""
+
+    def test_malformed_output_declarations_are_rejected(self):
+        cases = {
+            "not a dict": ["config.txt"],
+            "empty path": {"config": ""},
+            "non-string path": {"config": 42},
+        }
+        for name, outputs in cases.items():
+            with self.subTest(name):
+                plan = self.plan(
+                    self.side_effect_spec(),
+                    StepSpec(
+                        step_id="s2",
+                        name="n2",
+                        fn_ref="tests.test_core_engine_preflight:plain_step",
+                        params={},
+                        outputs=outputs,  # type: ignore[arg-type]
+                    ),
+                )
+
+                self.assert_rejected_without_side_effects(
+                    plan, "Malformed outputs", "'s2'"
+                )
+
+    def test_absolute_and_workdir_relative_declarations_are_accepted(self):
+        plan = self.plan(
+            StepSpec(
+                step_id="s1",
+                name="n1",
+                fn_ref="tests.test_core_engine_preflight:plain_step",
+                params={},
+                outputs={"config": "demux.config", "report": "/shared/report.html"},
+            )
+        )
+
+        self.assertEqual(set(self.engine._preflight(plan)), {"s1"})
+
+
 class TestCallableValidation(PreflightTestCase):
     """Resolution, registration and binding, all before execution."""
 

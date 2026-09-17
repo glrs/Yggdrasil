@@ -8,7 +8,7 @@ import os
 import sys
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,11 @@ from yggdrasil.flow.outcomes import (
     StepOutcome,
     TerminationReason,
 )
+from yggdrasil.flow.outputs import (
+    find_missing_outputs,
+    resolve_declared_outputs,
+    validate_output_declarations,
+)
 from yggdrasil.flow.step import StepContext
 from yggdrasil.flow.utils.callable_ref import resolve_callable
 from yggdrasil.flow.utils.hash import dirhash_stats, sha256_file
@@ -51,6 +56,10 @@ logger = custom_logger(__name__)
 
 # Type of the one plan-level event published when an execution attempt ends.
 ATTEMPT_REPORT_EVENT = "plan.attempt_report"
+
+# File in a step's work directory recording the fingerprint of its last
+# successful execution; what makes that success reusable.
+SUCCESS_MARKER = "success.fingerprint"
 
 
 # ------------ Utilities ------------
@@ -388,13 +397,22 @@ def _resolve_step_callable(spec: StepSpec) -> Callable[..., Any]:
 
 def _default_fingerprint(spec: StepSpec, fn: Any) -> str:
     """
-    Fingerprint = sha256(JSON of params + digests of declared inputs).
+    Fingerprint = sha256(JSON of params + digests of declared inputs
+    + declared outputs, when there are any).
     Inputs are either:
       - spec.inputs (planner-provided), or
       - fn._input_keys taken from params (decorator-declared), or
       - none (params-only fallback).
+
+    Output declarations are hashed as written, not resolved, so changing a
+    step's declared output contract invalidates that step's own reuse. They are
+    added only when present: hashing an empty mapping would change the
+    fingerprint of every step that declares no outputs, invalidating every
+    existing success marker for no behavioral reason.
     """
     enriched: dict[str, Any] = {"params": spec.params}
+    if spec.outputs:
+        enriched["outputs"] = spec.outputs
 
     # (a) planner-provided inputs
     declared: dict[str, str] = dict(spec.inputs)
@@ -422,6 +440,39 @@ def _default_fingerprint(spec: StepSpec, fn: Any) -> str:
     return f"sha256:{_json_sha256(enriched)}"
 
 
+def _replace_marker(marker: Path, fingerprint: str) -> None:
+    """Replace a step's success marker atomically.
+
+    The fingerprint is written to a uniquely named temporary file beside the
+    marker, which ``os.replace`` then renames over it: atomic on POSIX for a
+    single writer within one filesystem. A reader, or a process that crashes
+    part-way, sees either the previous state or the complete new marker, never a
+    partial one. On failure the temporary file is removed and the previous state
+    is left as it was.
+
+    Nothing is fsynced, so this is not durable across power loss or filesystem
+    failure (PRD §9 does not promise rollback there). The temporary file is
+    created through ``open`` rather than ``tempfile``, so the marker keeps the
+    umask-derived permissions it always had.
+
+    Args:
+        marker: The marker path.
+        fingerprint: The fingerprint the marker records.
+
+    Raises:
+        OSError: If the temporary file cannot be written or renamed into place.
+    """
+    temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "x", encoding="utf-8") as handle:
+            handle.write(fingerprint)
+        os.replace(temporary, marker)
+    except BaseException:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 # ------------ Engine ------------
 
 
@@ -435,7 +486,10 @@ class Engine:
       ``continue_independent`` blocks only the steps that depend on it
     - plan dir + plan.json
     - per-step workdir
-    - fingerprint + cache skip (file-based)
+    - fingerprint + cache skip (file-based): a ready step is reused only when
+      its success marker matches its fingerprint and every declared output
+      exists; otherwise its marker is invalidated before it runs again, and
+      replaced atomically once it succeeds
     - event spool emission via StepContext (handled by @step decorator), plus
       one plan-level attempt report per attempt
 
@@ -569,9 +623,9 @@ class Engine:
     def _preflight(self, plan: Plan) -> dict[str, Callable[..., Any]]:
         """Validate the whole plan before any step's side effects begin.
 
-        Runs graph validation, policy validation, and callable
-        resolution/registration/binding as one pass, so that every structural
-        problem is found before the first step runs. Callable resolution used to
+        Runs graph validation, policy validation, output-declaration validation,
+        and callable resolution/registration/binding as one pass, so that every
+        structural problem is found before the first step runs. Callable resolution used to
         happen per step, interleaved with execution, which meant a bad reference
         on the *last* step was discovered only after every earlier step had
         already run.
@@ -587,8 +641,9 @@ class Engine:
 
         Raises:
             PreflightValidationError: If the plan is structurally invalid, its
-                failure policy is unknown, or a step's callable is unresolvable,
-                non-callable, undecorated, or cannot bind its params.
+                failure policy is unknown, a step's output declarations are
+                malformed, or a step's callable is unresolvable, non-callable,
+                undecorated, or cannot bind its params.
             OrchestrationError: If resolving a callable fails for a reason that
                 is not a defect of the plan, such as a real module raising while
                 being imported.
@@ -602,6 +657,13 @@ class Engine:
 
         resolved: dict[str, Callable[..., Any]] = {}
         for spec in plan.steps:
+            try:
+                validate_output_declarations(spec.outputs)
+            except ValueError as exc:
+                raise PreflightValidationError(
+                    f"Malformed outputs for step '{spec.step_id}' in plan "
+                    f"'{plan.plan_id}': {exc}"
+                ) from exc
             fn = _resolve_step_callable(spec)
             if not callable(fn):
                 raise PreflightValidationError(
@@ -838,12 +900,21 @@ class Engine:
         marker is ever read for a step whose prerequisites did not all succeed
         in this attempt.
 
+        Reuse requires a success marker matching the step's fingerprint *and*
+        every declared output present; see :meth:`_can_reuse`. A step that is
+        not reused has its marker invalidated before it is called, so however
+        the call ends, no earlier success stays reusable over outputs the call
+        may have partly replaced. A new marker is written only once the step has
+        succeeded.
+
         Failures are classified at their boundaries rather than here. Engine
-        bookkeeping, execution-context preparation and event publication raise
+        bookkeeping, execution-context preparation, event publication, and
+        failing to determine whether a declared output exists raise
         OrchestrationError. Everything else that escapes is this step's ordinary
         failure, for the failure policy to contain or propagate: the step's own
-        exception, but also realm-controlled work done on its behalf, such as
-        hashing the input paths it declares.
+        exception, a required output it did not produce, but also
+        realm-controlled work done on its behalf, such as hashing the input
+        paths it declares.
 
         Args:
             plan: The plan being executed.
@@ -856,7 +927,9 @@ class Engine:
 
         Raises:
             OrchestrationError: If engine bookkeeping, execution-context
-                preparation or event publication fails.
+                preparation, event publication or a declared-output check fails.
+            PermanentStepError: If the step returned without producing a
+                required output.
             TransientStepError: Unchanged, once step.retry_unimplemented has been
                 published; what it means for the attempt is the policy's call.
             Exception: Anything else the step, or realm-controlled work on its
@@ -874,14 +947,10 @@ class Engine:
 
         # compute fingerprint and check cache // pass fn so we can read _input_keys
         fingerprint = _default_fingerprint(spec, fn)
-        fp_file = step_dir / "success.fingerprint"
+        marker = step_dir / SUCCESS_MARKER
+        required_outputs = resolve_declared_outputs(spec.outputs, step_dir)
 
-        with _orchestration_boundary(
-            f"Reading the cache marker for step '{spec.step_id}'"
-        ):
-            cache_hit = fp_file.exists() and fp_file.read_text().strip() == fingerprint
-
-        if cache_hit:
+        if self._can_reuse(plan, spec, marker, fingerprint, required_outputs):
             self._emit_step_skipped(plan, spec, fingerprint, run_id)
             return StepOutcome.REUSED
 
@@ -892,8 +961,17 @@ class Engine:
             f"Preparing the execution context for step '{spec.step_id}'"
         ):
             ctx = self._step_context(
-                plan, spec, plan_dir, step_dir, fingerprint, run_id
+                plan, spec, plan_dir, step_dir, fingerprint, run_id, required_outputs
             )
+
+        # Invalidate before the call, not after it fails: a crash part-way
+        # through must not leave the earlier success reusable over outputs that
+        # are now partly replaced. Done last before the call, so an attempt that
+        # aborts earlier costs no needless re-execution.
+        with _orchestration_boundary(
+            f"Invalidating the cache marker for step '{spec.step_id}'"
+        ):
+            marker.unlink(missing_ok=True)
 
         try:
             # Coerce string params to Path where function signature expects it
@@ -914,27 +992,79 @@ class Engine:
                 type(result),
             )
 
-        # Success-publication ordering contract (PRD §9). The owner of this
-        # sequence is the engine, and later work implements parts of it, so the
-        # order is recorded here once:
+        # Success-publication ordering contract (PRD §9), recorded once, with
+        # the owner of each stage:
         #
-        #   required-output validation
-        #     -> step-success publication
-        #     -> atomic marker replacement
-        #     -> admission of successors (the scheduler, once this returns)
+        #   required-output validation    the @step wrapper, after the body
+        #     -> step-success publication  the @step wrapper, same call
+        #     -> atomic marker replacement here, once the wrapper has returned
+        #     -> admission of successors   the scheduler, once this returns
+        #
+        # The wrapper raises instead of returning if an output is missing, so
+        # reaching this point means the first two stages completed.
         #
         # A step-success event may already have been published when the
         # marker replacement that follows it fails. That failure aborts the
         # attempt as an OrchestrationError; it is the documented, accepted
         # inconsistency window, not a bug to design around. A failed marker
-        # write must never leave a reusable success marker behind.
+        # write never leaves a reusable success marker behind: the previous one
+        # was invalidated before the call, and a failed replacement installs
+        # nothing.
         with _orchestration_boundary(
             f"Writing the cache marker for step '{spec.step_id}'"
         ):
-            # mark success in cache after function returns without exception
-            fp_file.write_text(fingerprint)
+            _replace_marker(marker, fingerprint)
 
         return StepOutcome.SUCCEEDED
+
+    def _can_reuse(
+        self,
+        plan: Plan,
+        spec: StepSpec,
+        marker: Path,
+        fingerprint: str,
+        required_outputs: dict[str, Path],
+    ) -> bool:
+        """Decide whether a ready step's earlier success may stand in for running it.
+
+        Needs both a success marker matching the current fingerprint and every
+        declared output present. A missing output is an ordinary cache miss, so
+        the producer runs again. A step that declares no outputs is decided by
+        its marker alone, exactly as before outputs could be declared.
+
+        Args:
+            plan: The plan being executed.
+            spec: The step being evaluated; its prerequisites are satisfied.
+            marker: The step's success marker.
+            fingerprint: The step's fingerprint for this attempt.
+            required_outputs: The step's resolved declared outputs.
+
+        Returns:
+            bool: True if the step may be reused.
+
+        Raises:
+            OrchestrationError: If the marker cannot be read, or whether a
+                declared output exists cannot be determined.
+        """
+        with _orchestration_boundary(
+            f"Reading the cache marker for step '{spec.step_id}'"
+        ):
+            if not marker.exists():
+                return False
+            if marker.read_text(encoding="utf-8").strip() != fingerprint:
+                return False
+
+        missing = find_missing_outputs(required_outputs, step_id=spec.step_id)
+        if missing:
+            self._logger.warning(
+                "Not reusing step '%s' of plan '%s': its success marker matches, "
+                "but declared outputs are missing: %s. Running it again.",
+                spec.step_id,
+                plan.plan_id,
+                ", ".join(f"{key}={path}" for key, path in missing.items()),
+            )
+            return False
+        return True
 
     def _step_context(
         self,
@@ -944,6 +1074,7 @@ class Engine:
         step_dir: Path,
         fingerprint: str,
         run_id: str,
+        required_outputs: dict[str, Path],
     ) -> StepContext:
         """Build the context one step invocation executes with.
 
@@ -954,6 +1085,8 @@ class Engine:
             step_dir: The step's work directory.
             fingerprint: The step's fingerprint for this invocation.
             run_id: The ID of this invocation.
+            required_outputs: The step's resolved declared outputs, which the
+                @step wrapper verifies before reporting success.
 
         Returns:
             StepContext: The context passed to the step function.
@@ -983,6 +1116,7 @@ class Engine:
             run_mode=os.environ.get("YGG_RUN_MODE", "auto"),
             fingerprint=fingerprint,
             run_id=run_id,
+            required_outputs=required_outputs,
             data=DataAccess(
                 plan.realm,
                 phase="execution",
