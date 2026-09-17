@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 from yggdrasil.flow.artifacts import ArtifactRefProtocol, ensure_artifact_ref
 from yggdrasil.flow.errors import (
+    EventPublicationError,
     OrchestrationError,
     PermanentStepError,
     TransientStepError,
@@ -121,7 +122,7 @@ class StepContext:
             **payload: Additional event fields merged into the envelope.
 
         Raises:
-            OrchestrationError: If the injected emitter fails to publish.
+            EventPublicationError: If the injected emitter fails to publish.
         """
         seq = self._next_seq()
         event = {
@@ -151,7 +152,7 @@ class StepContext:
             # author code: a realm never calls EventEmitter.emit directly. If it
             # fails we can no longer observe this attempt, so it must abort
             # rather than be contained as this step's ordinary failure.
-            raise OrchestrationError(
+            raise EventPublicationError(
                 f"Event publication failed for {type_!r} on step "
                 f"{self.step_id!r} (plan {self.plan_id!r}): {exc}"
             ) from exc
@@ -212,15 +213,15 @@ def _emit_step_failed(
         **payload: The step.failed event fields.
 
     Raises:
-        OrchestrationError: If publishing the failure also fails. The original
-            step error is named in the message so it survives str()-only
-            logging, and both exception objects stay reachable through the
-            cause/context chain.
+        EventPublicationError: If publishing the failure also fails. The
+            original step error is named in the message so it survives
+            str()-only logging, and both exception objects stay reachable
+            through the cause/context chain.
     """
     try:
         ctx.emit("step.failed", **payload)
     except OrchestrationError as publish_error:
-        raise OrchestrationError(
+        raise EventPublicationError(
             f"Failed to publish step.failed for step {ctx.step_id!r}; the "
             f"original {type(original).__name__} is preserved: {original}"
         ) from publish_error

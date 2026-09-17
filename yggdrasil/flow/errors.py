@@ -8,8 +8,12 @@ Three families live here, and the boundaries between them are load-bearing:
   branches keep running.
 - ``OrchestrationError`` — Yggdrasil's own infrastructure failed, so the
   attempt can no longer be tracked or reported reliably. Never contained.
+  ``EventPublicationError`` narrows it to the reporting channel itself.
 - ``PreflightValidationError`` — the plan itself is malformed and was rejected
   before any step ran.
+
+``AttemptCancelledError`` sits outside all three: it is a control-flow signal,
+not a failure of the plan, a step, or the infrastructure.
 """
 
 
@@ -48,6 +52,38 @@ class OrchestrationError(Exception):
     For callers deciding whether an execution request is finished: an
     ``OrchestrationError`` means "we do not know whether this ran", so the
     request must stay eligible — unlike :class:`PreflightValidationError`.
+    """
+
+
+class EventPublicationError(OrchestrationError):
+    """The event emitter failed to publish, so reporting itself is broken.
+
+    A narrower :class:`OrchestrationError` for the one infrastructure failure
+    that also disables the channel used to describe failures. It exists so that
+    code which would otherwise report through that channel — the engine
+    publishing an attempt's final report, for instance — can tell by type that
+    publishing again would only fail again, and skip it rather than bury the
+    original cause under a second, identical publication failure.
+
+    Everything said about :class:`OrchestrationError` applies unchanged: the
+    attempt aborts and the execution request stays eligible.
+    """
+
+
+class AttemptCancelledError(Exception):
+    """An execution attempt stopped starting new steps because it was cancelled.
+
+    Raised by the engine between steps, never from inside one, once the attempt's
+    cooperative cancellation signal is set and runnable work remains. The work
+    already started has finished, and the outcomes determined so far stay in the
+    attempt's report.
+
+    Deliberately none of the other three families. It is not a
+    :class:`StepError`, because no step failed; not an
+    :class:`OrchestrationError`, because nothing is broken; and not a
+    ``ValueError``, because the plan is fine. Above all it must never be read as
+    a completed attempt that failed: an interrupted attempt did not finish, so
+    its execution request must stay eligible.
     """
 
 
