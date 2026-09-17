@@ -225,6 +225,9 @@ class AttemptReport:
         failed_ancestors: Per blocked step, every originating failed step
             upstream of it.
         diagnostic: Attempt-level failure, if any.
+        publication_failure: Why this closed report could not be published, if
+            it could not; None once it was published or while it is open. See
+            :meth:`record_publication_failure`.
     """
 
     execution_id: str
@@ -241,6 +244,7 @@ class AttemptReport:
     direct_blockers: dict[str, list[str]] = field(default_factory=dict)
     failed_ancestors: dict[str, list[str]] = field(default_factory=dict)
     diagnostic: AttemptDiagnostic | None = None
+    publication_failure: AttemptDiagnostic | None = None
 
     # ----- recording -----
 
@@ -415,6 +419,56 @@ class AttemptReport:
         self.termination_reason = reason
         self.ended_at = ended_at or utcnow_iso()
 
+    def record_publication_failure(self, diagnostic: AttemptDiagnostic) -> None:
+        """Record that this closed report could not be published.
+
+        A report is published only after it is closed, because the published
+        report has to say how the attempt ended. If publication then fails, the
+        attempt was not tracked reliably after all, and the report must stop
+        claiming the ending it was closed with. Otherwise the caller would hold
+        an orchestration failure next to a report that says the attempt drained.
+
+        - The termination reason becomes ORCHESTRATION_ERROR. The reason it
+          replaces is kept as ``superseded_termination_reason`` in the recorded
+          diagnostic's details.
+        - A CANCELLED ending is kept as it is: the attempt was interrupted, and
+          that remains what callers must act on. The publication failure is
+          recorded alongside it.
+        - Step outcomes, failures, blocker diagnostics and the attempt-level
+          ``diagnostic`` are left untouched, so the original ending stays
+          readable as context.
+
+        Args:
+            diagnostic: What prevented publication.
+
+        Raises:
+            OrchestrationError: If the report is not closed yet, or a publication
+                failure was already recorded for it.
+        """
+        reason = self.termination_reason
+        if reason is None:
+            raise OrchestrationError(
+                f"Cannot record a publication failure for attempt "
+                f"'{self.execution_id}': its report is not closed yet."
+            )
+        if self.publication_failure is not None:
+            raise OrchestrationError(
+                f"Cannot record a second publication failure for attempt "
+                f"'{self.execution_id}'."
+            )
+        details = dict(diagnostic.details)
+        if reason not in (
+            TerminationReason.CANCELLED,
+            TerminationReason.ORCHESTRATION_ERROR,
+        ):
+            details["superseded_termination_reason"] = reason.value
+            self.termination_reason = TerminationReason.ORCHESTRATION_ERROR
+        self.publication_failure = AttemptDiagnostic(
+            message=diagnostic.message,
+            error_type=diagnostic.error_type,
+            details=details,
+        )
+
     # ----- derived views -----
 
     @property
@@ -526,5 +580,8 @@ class AttemptReport:
                 sid: list(ancestors) for sid, ancestors in self.failed_ancestors.items()
             },
             "diagnostic": self.diagnostic.to_dict() if self.diagnostic else None,
+            "publication_failure": (
+                self.publication_failure.to_dict() if self.publication_failure else None
+            ),
             "counts": self.counts,
         }

@@ -496,5 +496,130 @@ class TestAttemptReportConsistencyGuards(unittest.TestCase):
         self.assertFalse(report.is_finished)
 
 
+class TestAttemptReportPublicationFailure(unittest.TestCase):
+    """A closed report that could not be published must stop claiming its ending."""
+
+    def publication_failure(self) -> AttemptDiagnostic:
+        return AttemptDiagnostic(
+            message="Publishing the report: spool unavailable",
+            error_type="EventPublicationError",
+        )
+
+    def test_a_drained_report_becomes_an_orchestration_error(self):
+        report = _report("a", "b")
+        report.record_outcome("a", StepOutcome.SUCCEEDED)
+        report.record_failure(StepFailure(step_id="b", error="boom"))
+        report.finish(TerminationReason.COMPLETED)
+        self.assertTrue(report.is_drained)
+
+        report.record_publication_failure(self.publication_failure())
+
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        self.assertFalse(report.is_drained)
+        self.assertIs(report.outcome, ExecutionOutcome.FAILED)
+        failure = report.publication_failure
+        assert failure is not None
+        self.assertEqual(
+            failure.details, {"superseded_termination_reason": "completed"}
+        )
+        # Nothing the attempt established is rewritten.
+        self.assertEqual(
+            report.step_outcomes,
+            {"a": StepOutcome.SUCCEEDED, "b": StepOutcome.FAILED},
+        )
+        self.assertEqual(report.failures["b"].error, "boom")
+        self.assertIsNone(report.diagnostic)
+
+    def test_every_non_cancelled_ending_is_superseded_and_kept_as_context(self):
+        for reason in (
+            TerminationReason.FAILED_FAST,
+            TerminationReason.PREFLIGHT_REJECTED,
+        ):
+            with self.subTest(reason=reason):
+                report = _report("a")
+                original = AttemptDiagnostic(message="duplicate step_id")
+                report.record_diagnostic(original)
+                report.finish(reason)
+
+                report.record_publication_failure(self.publication_failure())
+
+                self.assertIs(
+                    report.termination_reason, TerminationReason.ORCHESTRATION_ERROR
+                )
+                failure = report.publication_failure
+                assert failure is not None
+                self.assertEqual(
+                    failure.details["superseded_termination_reason"], reason.value
+                )
+                self.assertIs(report.diagnostic, original)
+
+    def test_a_cancelled_ending_is_kept(self):
+        report = _report("a")
+        report.record_diagnostic(
+            AttemptDiagnostic(message="", error_type="KeyboardInterrupt")
+        )
+        report.finish(TerminationReason.CANCELLED)
+
+        report.record_publication_failure(self.publication_failure())
+
+        self.assertIs(report.termination_reason, TerminationReason.CANCELLED)
+        failure = report.publication_failure
+        assert failure is not None
+        self.assertNotIn("superseded_termination_reason", failure.details)
+
+    def test_an_orchestration_error_has_nothing_to_supersede(self):
+        report = _report("a")
+        report.finish(TerminationReason.ORCHESTRATION_ERROR)
+
+        report.record_publication_failure(self.publication_failure())
+
+        self.assertIs(report.termination_reason, TerminationReason.ORCHESTRATION_ERROR)
+        failure = report.publication_failure
+        assert failure is not None
+        self.assertEqual(failure.details, {})
+
+    def test_the_callers_diagnostic_object_is_not_mutated(self):
+        report = _report()
+        report.finish(TerminationReason.COMPLETED)
+        given = self.publication_failure()
+
+        report.record_publication_failure(given)
+
+        self.assertEqual(given.details, {})
+
+    def test_an_open_report_cannot_record_a_publication_failure(self):
+        report = _report("a")
+
+        with self.assertRaises(OrchestrationError):
+            report.record_publication_failure(self.publication_failure())
+
+        self.assertIsNone(report.publication_failure)
+
+    def test_only_one_publication_failure_can_be_recorded(self):
+        report = _report()
+        report.finish(TerminationReason.COMPLETED)
+        report.record_publication_failure(self.publication_failure())
+
+        with self.assertRaises(OrchestrationError):
+            report.record_publication_failure(self.publication_failure())
+
+    def test_publication_failure_is_serialized(self):
+        report = _report()
+        report.finish(TerminationReason.COMPLETED)
+        self.assertIsNone(report.to_dict()["publication_failure"])
+
+        report.record_publication_failure(self.publication_failure())
+        payload = json.loads(json.dumps(report.to_dict()))
+
+        self.assertEqual(payload["termination_reason"], "orchestration_error")
+        self.assertEqual(
+            payload["publication_failure"]["error_type"], "EventPublicationError"
+        )
+        self.assertEqual(
+            payload["publication_failure"]["details"],
+            {"superseded_termination_reason": "completed"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
