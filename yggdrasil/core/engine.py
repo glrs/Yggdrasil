@@ -14,14 +14,33 @@ from typing import Any
 
 from lib.core_utils.logging_utils import custom_logger
 from lib.core_utils.runtime_paths import resolve_work_root
+from yggdrasil.core.scheduler import DependencyScheduler
+from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.errors import (
+    AttemptCancelledError,
+    EventPublicationError,
     OrchestrationError,
     PermanentStepError,
     PreflightValidationError,
+    StepError,
     TransientStepError,
 )
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
-from yggdrasil.flow.model import Plan, StepResult, StepSpec, validate_failure_policy
+from yggdrasil.flow.model import (
+    CONTINUE_INDEPENDENT_POLICY,
+    FAIL_FAST_POLICY,
+    Plan,
+    StepResult,
+    StepSpec,
+    validate_failure_policy,
+)
+from yggdrasil.flow.outcomes import (
+    AttemptDiagnostic,
+    AttemptReport,
+    StepFailure,
+    StepOutcome,
+    TerminationReason,
+)
 from yggdrasil.flow.step import StepContext
 from yggdrasil.flow.utils.callable_ref import resolve_callable
 from yggdrasil.flow.utils.hash import dirhash_stats, sha256_file
@@ -29,6 +48,9 @@ from yggdrasil.flow.utils.typing_coerce import coerce_params_to_signature_types
 from yggdrasil.flow.utils.ygg_time import utcnow_compact, utcnow_iso
 
 logger = custom_logger(__name__)
+
+# Type of the one plan-level event published when an execution attempt ends.
+ATTEMPT_REPORT_EVENT = "plan.attempt_report"
 
 
 # ------------ Utilities ------------
@@ -46,6 +68,67 @@ def _short(h: str, n: int = 4) -> str:
 
 def _new_run_id() -> str:
     return f"run_{utcnow_compact()}_{uuid.uuid4().hex[:6]}"
+
+
+def _new_execution_id() -> str:
+    """Allocate an identifier for one execution attempt of a plan.
+
+    Timestamp-prefixed like run IDs, so identifiers sort chronologically while
+    the clock moves forward, with a full UUID suffix for uniqueness. Nothing
+    here protects that ordering against a clock that moves backwards.
+
+    Returns:
+        str: A new execution ID, e.g. "exec_20260916T101500123456Z_<uuid hex>".
+    """
+    return f"exec_{utcnow_compact()}_{uuid.uuid4().hex}"
+
+
+def _step_failure(step_id: str, exc: Exception) -> StepFailure:
+    """Describe a contained step failure the way the step wrapper reports it.
+
+    Mirrors the ``step.failed`` payload: a StepError carries its kind, code and
+    advice, and any other exception counts as permanent. The exception class is
+    kept as well, because ``str(exc)`` alone often loses it.
+
+    Args:
+        step_id: The step that failed.
+        exc: The exception it failed with.
+
+    Returns:
+        StepFailure: The failure detail for the attempt report.
+    """
+    if isinstance(exc, StepError):
+        return StepFailure(
+            step_id=step_id,
+            error=str(exc),
+            kind="transient" if isinstance(exc, TransientStepError) else "permanent",
+            code=exc.code,
+            advice=exc.advice,
+            error_type=type(exc).__name__,
+        )
+    return StepFailure(step_id=step_id, error=str(exc), error_type=type(exc).__name__)
+
+
+def _unplanned_stop_reason(exc: BaseException) -> TerminationReason:
+    """Classify an attempt exit that no deliberate early exit accounted for.
+
+    Preflight rejection, cancellation and fail-fast termination each name their
+    own reason before raising, so anything reaching this function was not one of
+    them. An Exception here is infrastructure failing, or an engine defect
+    outside any step's failure containment; either way the attempt could not be
+    carried out reliably. Anything that is not an Exception - KeyboardInterrupt,
+    SystemExit - is an external interruption.
+
+    Args:
+        exc: The exception ending the attempt.
+
+    Returns:
+        TerminationReason: ORCHESTRATION_ERROR for an Exception, CANCELLED for
+        any other BaseException.
+    """
+    if isinstance(exc, Exception):
+        return TerminationReason.ORCHESTRATION_ERROR
+    return TerminationReason.CANCELLED
 
 
 def _looks_like_path(v: Any) -> bool:
@@ -72,7 +155,9 @@ _CTX_PLACEHOLDER = object()
 
 
 @contextmanager
-def _orchestration_boundary(description: str) -> Iterator[None]:
+def _orchestration_boundary(
+    description: str, *, error_type: type[OrchestrationError] = OrchestrationError
+) -> Iterator[None]:
     """Classify failures of engine-owned bookkeeping as OrchestrationError.
 
     Wraps operations on Yggdrasil's own state — the plan file, step
@@ -83,21 +168,23 @@ def _orchestration_boundary(description: str) -> Iterator[None]:
 
     Args:
         description: What was being attempted, for the error message.
+        error_type: The OrchestrationError type to raise; EventPublicationError
+            when the wrapped operation is event publication.
 
     Yields:
         None: Control to the wrapped operation.
 
     Raises:
-        OrchestrationError: If the wrapped operation fails. An OrchestrationError
-            raised within is re-raised unchanged, so nested boundaries do not
-            wrap the same failure twice.
+        OrchestrationError: If the wrapped operation fails, as ``error_type``.
+            An OrchestrationError raised within is re-raised unchanged, so
+            nested boundaries do not wrap the same failure twice.
     """
     try:
         yield
     except OrchestrationError:
         raise
     except Exception as exc:
-        raise OrchestrationError(f"{description}: {exc}") from exc
+        raise error_type(f"{description}: {exc}") from exc
 
 
 def _find_cycle(steps: list[StepSpec]) -> list[str] | None:
@@ -336,11 +423,21 @@ def _default_fingerprint(spec: StepSpec, fn: Any) -> str:
 
 class Engine:
     """
-    Minimal sequential executor with:
+    Sequential, dependency-driven plan executor with:
+    - whole-plan preflight before any side effect
+    - dependency scheduling: a step starts only once every step it depends on
+      has succeeded or been reused, earliest in plan order first
+    - failure policies: ``fail_fast`` stops at the first step failure;
+      ``continue_independent`` blocks only the steps that depend on it
     - plan dir + plan.json
     - per-step workdir
     - fingerprint + cache skip (file-based)
-    - event spool emission via StepContext (handled by @step decorator)
+    - event spool emission via StepContext (handled by @step decorator), plus
+      one plan-level attempt report per attempt
+
+    An Engine is long-lived and shared across plans, so it holds no attempt
+    state: each attempt's outcomes live in its AttemptContext and a scheduler
+    built for that attempt alone.
     """
 
     def __init__(
@@ -368,9 +465,11 @@ class Engine:
             event: The event payload.
 
         Raises:
-            OrchestrationError: If the emitter fails to publish.
+            EventPublicationError: If the emitter fails to publish.
         """
-        with _orchestration_boundary(f"Publishing {description}"):
+        with _orchestration_boundary(
+            f"Publishing {description}", error_type=EventPublicationError
+        ):
             self.emitter.emit(event)
 
     def _scope_dir(self, plan_dir: Path) -> Path:
@@ -516,166 +615,549 @@ class Engine:
             resolved[spec.step_id] = fn
         return resolved
 
-    def run(self, plan: Plan) -> None:
-        """Execute a plan's steps.
+    def run(self, plan: Plan) -> AttemptReport | None:
+        """Execute a plan's steps in dependency order.
 
         Preflight runs before anything is written, so a rejected plan leaves
         existing plan snapshots, artifacts and cache markers untouched.
 
+        The return contract depends on the plan's failure policy. Static typing
+        cannot express that, so it is dispatched at runtime:
+
+        - ``fail_fast``: returns None on success and raises on the first step
+          failure, exactly as before failure policies existed.
+        - ``continue_independent``: runs everything whose prerequisites
+          succeeded and returns the drained report. Its outcome may well be
+          failed — a returned report is not in itself a successful execution.
+
+        Callers that need the report under both policies, or after an attempt
+        that raised, use :meth:`_run_attempt` with a context of their own.
+
         Args:
             plan: The plan to execute.
+
+        Returns:
+            AttemptReport | None: The drained report for a
+            ``continue_independent`` plan; None for a successful ``fail_fast``
+            plan.
 
         Raises:
             PreflightValidationError: If the plan is rejected by preflight.
             OrchestrationError: If engine bookkeeping or event publication fails.
-            StepError: If a step fails.
+            StepError: If a step fails under ``fail_fast``. A TransientStepError
+                surfaces as a PermanentStepError, because retries are not
+                implemented.
+            Exception: Any other exception a step raised under ``fail_fast``,
+                unchanged.
         """
-        # Validate everything before the first side effect of any kind — this
-        # includes the plan snapshot below, which used to be written first.
-        resolved = self._preflight(plan)
+        context = AttemptContext.for_plan(plan, execution_id=_new_execution_id())
+        report = self._run_attempt(plan, context=context)
+        if report.failure_policy == CONTINUE_INDEPENDENT_POLICY:
+            return report
+        return None
 
-        plan_dir = self._plan_dir(plan)
-        self._write_plan_file(plan, plan_dir)
+    def _run_attempt(self, plan: Plan, *, context: AttemptContext) -> AttemptReport:
+        """Run one execution attempt, recording what happens into its context.
 
-        for spec in plan.steps:
-            step_dir = self._step_dir(plan_dir, spec)
-            with _orchestration_boundary(
-                f"Creating work directory for step '{spec.step_id}'"
-            ):
-                step_dir.mkdir(parents=True, exist_ok=True)
+        The one scheduler and the one exit path for both failure policies. The
+        policy changes only the response to an ordinary step failure: under
+        ``fail_fast`` the attempt stops; under ``continue_independent`` the
+        failure is recorded, every step depending on it is blocked, and all
+        other runnable work continues.
 
-            # Resolution, registration and binding were all settled in preflight.
-            fn = resolved[spec.step_id]
-            _lint_missing_inputs(spec, fn)
+        A normal return means the attempt drained: every planned step reached a
+        terminal outcome. Every other ending raises, but only after the report
+        in ``context`` has been closed with the outcomes determined so far, the
+        diagnostics, and a termination reason that tells the endings apart — and
+        after that report has been published. The caller therefore holds a
+        readable report whichever way the attempt ends. Publishing the report
+        never consumes an execution request; that decision belongs to the caller.
 
-            run_id = _new_run_id()
+        Cancellation is cooperative: it is checked only between steps, and only
+        while runnable work remains, so it never interrupts a running step and a
+        signal arriving after the last step does not undo a drained attempt.
 
-            # compute fingerprint and check cache // pass fn so we can read _input_keys
-            fingerprint = _default_fingerprint(spec, fn)
-            fp_file = step_dir / "success.fingerprint"
+        Args:
+            plan: The plan to execute.
+            context: A fresh context opened for ``plan``, used by no other attempt.
 
-            with _orchestration_boundary(
-                f"Reading the cache marker for step '{spec.step_id}'"
-            ):
-                cache_hit = (
-                    fp_file.exists() and fp_file.read_text().strip() == fingerprint
-                )
+        Returns:
+            AttemptReport: The drained report, ``context.report``. Its outcome is
+            failed if any step failed or was blocked.
 
-            if cache_hit:
-                # emit a 'skipped' event
-                self._emit_engine_event(
-                    f"step.skipped for step '{spec.step_id}'",
-                    {
-                        "type": "step.skipped",
-                        "realm": plan.realm,
-                        "scope": plan.scope,
-                        "plan_id": plan.plan_id,
-                        "step_id": spec.step_id,
-                        "step_name": spec.name,
-                        "fingerprint": fingerprint,
-                        "seq": 1,
-                        "eid": str(uuid.uuid4()),
-                        "ts": utcnow_iso(),
-                        "_spool_path": {
-                            "realm": plan.realm,
-                            "plan_id": plan.plan_id,
-                            "step_id": spec.step_id,
-                            "run_id": run_id,
-                            "filename": "0001_step_skipped.json",
-                        },
-                    },
-                )
-                continue
+        Raises:
+            PreflightValidationError: If preflight rejects the plan
+                (PREFLIGHT_REJECTED).
+            AttemptCancelledError: If cancellation was signaled while runnable
+                work remained (CANCELLED).
+            OrchestrationError: If infrastructure failed or a scheduler invariant
+                was violated (ORCHESTRATION_ERROR); or if ``context`` does not
+                belong to a fresh attempt at ``plan``, in which case the report
+                is left untouched and nothing runs.
+            EventPublicationError: If publishing the report itself failed. When
+                the attempt was already ending with an exception, that original
+                exception is named in the message and kept in the chain.
+            StepError: Under ``fail_fast``, the first step failure (FAILED_FAST).
+                A TransientStepError surfaces as a PermanentStepError.
+            Exception: Under ``fail_fast``, any other first step failure,
+                unchanged (FAILED_FAST).
+            BaseException: An interruption such as KeyboardInterrupt, unchanged
+                (CANCELLED).
+        """
+        self._check_attempt_context(plan, context)
+        report = context.report
+        scheduler: DependencyScheduler | None = None
+        # Set immediately before each deliberate early exit. An exception that
+        # escapes with this still unset is an unplanned abort.
+        stop_reason: TerminationReason | None = None
 
-            # build context and call the step function
-            from yggdrasil.flow.data_access import DataAccess, DataAccessTraceContext
-
-            trace_ctx = DataAccessTraceContext(
-                realm=plan.realm,
-                phase="execution",
-                plan_id=plan.plan_id,
-                run_id=run_id,
-                step_id=spec.step_id,
-                step_name=spec.name,
-                scope=spec.scope or plan.scope,
-                emitter=self.emitter,
-            )
-
-            ctx = StepContext(
-                realm=plan.realm,
-                scope=spec.scope or plan.scope,
-                plan_id=plan.plan_id,
-                step_id=spec.step_id,
-                step_name=spec.name,
-                workdir=step_dir,
-                scope_dir=self._scope_dir(plan_dir),
-                emitter=self.emitter,
-                run_mode=os.environ.get("YGG_RUN_MODE", "auto"),
-                fingerprint=fingerprint,
-                run_id=run_id,
-                data=DataAccess(
-                    plan.realm,
-                    phase="execution",
-                    trace_context=trace_ctx,
-                ),
-            )
-
+        try:
             try:
-                # Coerce string params to Path where function signature expects it
-                coerced_params = coerce_params_to_signature_types(fn, spec.params)
-                # returns StepResult (decorator wraps emissions)
-                result = fn(ctx, **coerced_params)
-            except TransientStepError as e:
-                # The @step wrapper has already emitted "step.failed".
-                # Add a precise diagnostic so operators know retry isn't wired yet.
-                # TODO: Implement retry.
-                self._emit_engine_event(
-                    f"step.retry_unimplemented for step '{spec.step_id}'",
-                    {
-                        "type": "step.retry_unimplemented",
-                        "realm": plan.realm,
-                        "scope": plan.scope,
-                        "plan_id": plan.plan_id,
-                        "step_id": spec.step_id,
-                        "error": str(e),
-                        "kind": "transient",
-                        "_spool_path": {
-                            "realm": plan.realm,
-                            "plan_id": plan.plan_id,
-                            "step_id": spec.step_id,
-                            "run_id": run_id,
-                            "filename": "retry_unimplemented.json",
-                        },
-                    },
-                )
-                # Treat transient as permanent until retries are implemented.
-                raise PermanentStepError(
-                    f"Retry not implemented for transient failure: {e}"
-                ) from e
+                resolved = self._preflight(plan)
+            except PreflightValidationError:
+                stop_reason = TerminationReason.PREFLIGHT_REJECTED
+                raise
 
-            if result is not None and not isinstance(result, StepResult):
-                self._logger.warning(
-                    "Step %s returned %r (expected StepResult or None)",
-                    spec.step_id,
-                    type(result),
-                )
+            plan_dir = self._plan_dir(plan)
+            self._write_plan_file(plan, plan_dir)
+            scheduler = DependencyScheduler(plan.steps, report)
 
-            # Success-publication ordering contract (PRD §9). The owner of this
-            # sequence is the engine, and both this phase's successors implement
-            # parts of it, so the order is recorded here once:
-            #
-            #   required-output validation
-            #     -> step-success publication
-            #     -> atomic marker replacement
-            #     -> admission of successors
-            #
-            # A step-success event may already have been published when the
-            # marker replacement that follows it fails. That failure aborts the
-            # attempt as an OrchestrationError; it is the documented, accepted
-            # inconsistency window, not a bug to design around. A failed marker
-            # write must never leave a reusable success marker behind.
-            with _orchestration_boundary(
-                f"Writing the cache marker for step '{spec.step_id}'"
-            ):
-                # mark success in cache after function returns without exception
-                fp_file.write_text(fingerprint)
+            while scheduler.has_runnable():
+                if context.cancellation_requested:
+                    stop_reason = TerminationReason.CANCELLED
+                    raise AttemptCancelledError(
+                        f"Attempt '{report.execution_id}' for plan '{plan.plan_id}' "
+                        f"was cancelled; no further steps were started."
+                    )
+
+                spec = scheduler.start_next()
+                try:
+                    outcome = self._execute_step(
+                        plan, spec, resolved[spec.step_id], plan_dir
+                    )
+                except OrchestrationError:
+                    raise
+                except Exception as exc:
+                    scheduler.record_failure(_step_failure(spec.step_id, exc))
+                    if plan.failure_policy == FAIL_FAST_POLICY:
+                        stop_reason = TerminationReason.FAILED_FAST
+                        if isinstance(exc, TransientStepError):
+                            # Treat transient as permanent until retries are implemented.
+                            raise PermanentStepError(
+                                f"Retry not implemented for transient failure: {exc}"
+                            ) from exc
+                        raise
+                    blocked = scheduler.block_dependents(spec.step_id)
+                    self._logger.warning(
+                        "Step '%s' of plan '%s' failed (%s: %s); continuing "
+                        "independent work. Blocked dependents: %s",
+                        spec.step_id,
+                        plan.plan_id,
+                        type(exc).__name__,
+                        exc,
+                        blocked or "none",
+                    )
+                    continue
+
+                scheduler.record_success(spec.step_id, outcome)
+
+            scheduler.ensure_drained()
+            self._close_report(report, scheduler, TerminationReason.COMPLETED)
+        except BaseException as exc:
+            self._close_report(
+                report,
+                scheduler,
+                stop_reason or _unplanned_stop_reason(exc),
+                cause=exc,
+            )
+            self._publish_attempt_report(plan, report, cause=exc)
+            raise
+
+        self._publish_attempt_report(plan, report, cause=None)
+        return report
+
+    def _check_attempt_context(self, plan: Plan, context: AttemptContext) -> None:
+        """Refuse a context that does not belong to a fresh attempt at ``plan``.
+
+        The report is an attempt's only record. Recording one plan's outcomes
+        into a report opened for a different plan or step inventory, or into a
+        report an earlier attempt already filled, would make it describe
+        something that never happened. Such a context is a caller defect, so it
+        is refused before anything runs and left exactly as it was.
+
+        Args:
+            plan: The plan about to be executed.
+            context: The context the caller supplied.
+
+        Raises:
+            OrchestrationError: If the context's report was opened for another
+                plan, step inventory or failure policy, or has already been used.
+        """
+        report = context.report
+        problems: list[str] = []
+        if report.plan_id != plan.plan_id:
+            problems.append(f"its report was opened for plan '{report.plan_id}'")
+        if report.step_ids != [spec.step_id for spec in plan.steps]:
+            problems.append("its step inventory differs from the plan's steps")
+        if report.failure_policy != plan.failure_policy:
+            problems.append(
+                f"its failure policy is '{report.failure_policy}', "
+                f"not '{plan.failure_policy}'"
+            )
+        if report.is_finished or report.step_outcomes or report.diagnostic:
+            problems.append("its report was already used by another attempt")
+        if problems:
+            raise OrchestrationError(
+                f"Attempt context '{report.execution_id}' cannot run plan "
+                f"'{plan.plan_id}': {'; '.join(problems)}."
+            )
+
+    def _execute_step(
+        self,
+        plan: Plan,
+        spec: StepSpec,
+        fn: Callable[..., Any],
+        plan_dir: Path,
+    ) -> StepOutcome:
+        """Reuse or execute one step whose prerequisites have all been satisfied.
+
+        Called only once the scheduler has established readiness, so no cache
+        marker is ever read for a step whose prerequisites did not all succeed
+        in this attempt.
+
+        Failures are classified at their boundaries rather than here. Engine
+        bookkeeping, execution-context preparation and event publication raise
+        OrchestrationError. Everything else that escapes is this step's ordinary
+        failure, for the failure policy to contain or propagate: the step's own
+        exception, but also realm-controlled work done on its behalf, such as
+        hashing the input paths it declares.
+
+        Args:
+            plan: The plan being executed.
+            spec: The step to reuse or execute.
+            fn: The step's callable, resolved during preflight.
+            plan_dir: Directory for this plan's execution state.
+
+        Returns:
+            StepOutcome: REUSED on a cache hit, SUCCEEDED after execution.
+
+        Raises:
+            OrchestrationError: If engine bookkeeping, execution-context
+                preparation or event publication fails.
+            TransientStepError: Unchanged, once step.retry_unimplemented has been
+                published; what it means for the attempt is the policy's call.
+            Exception: Anything else the step, or realm-controlled work on its
+                behalf, raised.
+        """
+        step_dir = self._step_dir(plan_dir, spec)
+        with _orchestration_boundary(
+            f"Creating work directory for step '{spec.step_id}'"
+        ):
+            step_dir.mkdir(parents=True, exist_ok=True)
+
+        _lint_missing_inputs(spec, fn)
+
+        run_id = _new_run_id()
+
+        # compute fingerprint and check cache // pass fn so we can read _input_keys
+        fingerprint = _default_fingerprint(spec, fn)
+        fp_file = step_dir / "success.fingerprint"
+
+        with _orchestration_boundary(
+            f"Reading the cache marker for step '{spec.step_id}'"
+        ):
+            cache_hit = fp_file.exists() and fp_file.read_text().strip() == fingerprint
+
+        if cache_hit:
+            self._emit_step_skipped(plan, spec, fingerprint, run_id)
+            return StepOutcome.REUSED
+
+        # Building the context loads Yggdrasil's own external-systems
+        # configuration. A broken configuration fails every step alike; it must
+        # abort the attempt, not drain as a list of ordinary step failures.
+        with _orchestration_boundary(
+            f"Preparing the execution context for step '{spec.step_id}'"
+        ):
+            ctx = self._step_context(
+                plan, spec, plan_dir, step_dir, fingerprint, run_id
+            )
+
+        try:
+            # Coerce string params to Path where function signature expects it
+            coerced_params = coerce_params_to_signature_types(fn, spec.params)
+            # returns StepResult (decorator wraps emissions)
+            result = fn(ctx, **coerced_params)
+        except TransientStepError as exc:
+            # The @step wrapper has already emitted "step.failed".
+            # Add a precise diagnostic so operators know retry isn't wired yet.
+            # TODO: Implement retry.
+            self._emit_retry_unimplemented(plan, spec, run_id, exc)
+            raise
+
+        if result is not None and not isinstance(result, StepResult):
+            self._logger.warning(
+                "Step %s returned %r (expected StepResult or None)",
+                spec.step_id,
+                type(result),
+            )
+
+        # Success-publication ordering contract (PRD §9). The owner of this
+        # sequence is the engine, and later work implements parts of it, so the
+        # order is recorded here once:
+        #
+        #   required-output validation
+        #     -> step-success publication
+        #     -> atomic marker replacement
+        #     -> admission of successors (the scheduler, once this returns)
+        #
+        # A step-success event may already have been published when the
+        # marker replacement that follows it fails. That failure aborts the
+        # attempt as an OrchestrationError; it is the documented, accepted
+        # inconsistency window, not a bug to design around. A failed marker
+        # write must never leave a reusable success marker behind.
+        with _orchestration_boundary(
+            f"Writing the cache marker for step '{spec.step_id}'"
+        ):
+            # mark success in cache after function returns without exception
+            fp_file.write_text(fingerprint)
+
+        return StepOutcome.SUCCEEDED
+
+    def _step_context(
+        self,
+        plan: Plan,
+        spec: StepSpec,
+        plan_dir: Path,
+        step_dir: Path,
+        fingerprint: str,
+        run_id: str,
+    ) -> StepContext:
+        """Build the context one step invocation executes with.
+
+        Args:
+            plan: The plan being executed.
+            spec: The step about to run.
+            plan_dir: Directory for this plan's execution state.
+            step_dir: The step's work directory.
+            fingerprint: The step's fingerprint for this invocation.
+            run_id: The ID of this invocation.
+
+        Returns:
+            StepContext: The context passed to the step function.
+        """
+        from yggdrasil.flow.data_access import DataAccess, DataAccessTraceContext
+
+        trace_ctx = DataAccessTraceContext(
+            realm=plan.realm,
+            phase="execution",
+            plan_id=plan.plan_id,
+            run_id=run_id,
+            step_id=spec.step_id,
+            step_name=spec.name,
+            scope=spec.scope or plan.scope,
+            emitter=self.emitter,
+        )
+
+        return StepContext(
+            realm=plan.realm,
+            scope=spec.scope or plan.scope,
+            plan_id=plan.plan_id,
+            step_id=spec.step_id,
+            step_name=spec.name,
+            workdir=step_dir,
+            scope_dir=self._scope_dir(plan_dir),
+            emitter=self.emitter,
+            run_mode=os.environ.get("YGG_RUN_MODE", "auto"),
+            fingerprint=fingerprint,
+            run_id=run_id,
+            data=DataAccess(
+                plan.realm,
+                phase="execution",
+                trace_context=trace_ctx,
+            ),
+        )
+
+    def _emit_step_skipped(
+        self, plan: Plan, spec: StepSpec, fingerprint: str, run_id: str
+    ) -> None:
+        """Publish the cache-hit event for a reused step.
+
+        Args:
+            plan: The plan being executed.
+            spec: The reused step.
+            fingerprint: The fingerprint its cache marker matched.
+            run_id: The ID allocated for this evaluation of the step.
+
+        Raises:
+            EventPublicationError: If the emitter fails to publish.
+        """
+        self._emit_engine_event(
+            f"step.skipped for step '{spec.step_id}'",
+            {
+                "type": "step.skipped",
+                "realm": plan.realm,
+                "scope": plan.scope,
+                "plan_id": plan.plan_id,
+                "step_id": spec.step_id,
+                "step_name": spec.name,
+                "fingerprint": fingerprint,
+                "seq": 1,
+                "eid": str(uuid.uuid4()),
+                "ts": utcnow_iso(),
+                "_spool_path": {
+                    "realm": plan.realm,
+                    "plan_id": plan.plan_id,
+                    "step_id": spec.step_id,
+                    "run_id": run_id,
+                    "filename": "0001_step_skipped.json",
+                },
+            },
+        )
+
+    def _emit_retry_unimplemented(
+        self, plan: Plan, spec: StepSpec, run_id: str, exc: TransientStepError
+    ) -> None:
+        """Publish the diagnostic that a transient failure was not retried.
+
+        Args:
+            plan: The plan being executed.
+            spec: The step that failed transiently.
+            run_id: The ID of the failed invocation.
+            exc: The transient failure.
+
+        Raises:
+            EventPublicationError: If the emitter fails to publish.
+        """
+        self._emit_engine_event(
+            f"step.retry_unimplemented for step '{spec.step_id}'",
+            {
+                "type": "step.retry_unimplemented",
+                "realm": plan.realm,
+                "scope": plan.scope,
+                "plan_id": plan.plan_id,
+                "step_id": spec.step_id,
+                "error": str(exc),
+                "kind": "transient",
+                "_spool_path": {
+                    "realm": plan.realm,
+                    "plan_id": plan.plan_id,
+                    "step_id": spec.step_id,
+                    "run_id": run_id,
+                    "filename": "retry_unimplemented.json",
+                },
+            },
+        )
+
+    def _close_report(
+        self,
+        report: AttemptReport,
+        scheduler: DependencyScheduler | None,
+        reason: TerminationReason,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Close an attempt's report with how the attempt ended.
+
+        Settles the final blocker diagnostics first, so a report closed early —
+        by fail-fast termination, cancellation or an abort — is as complete as
+        one that drained. A fail-fast step failure is already described by that
+        step's failure record; any other exceptional ending is recorded as an
+        attempt-level diagnostic, naming the step that was running if there was
+        one.
+
+        Args:
+            report: The attempt's report.
+            scheduler: The attempt's scheduler, or None if the attempt ended
+                before scheduling began.
+            reason: How the attempt ended.
+            cause: The exception ending the attempt, if any.
+
+        Raises:
+            OrchestrationError: If ``reason`` is COMPLETED but the report cannot
+                truthfully say so.
+        """
+        if scheduler is not None:
+            scheduler.record_blocker_diagnostics()
+        if cause is not None and reason is not TerminationReason.FAILED_FAST:
+            running = scheduler.running_step_id if scheduler is not None else None
+            report.record_diagnostic(
+                AttemptDiagnostic.from_exception(
+                    cause, details={"running_step_id": running} if running else None
+                )
+            )
+        report.finish(reason)
+        self._logger.info(
+            "Attempt '%s' for plan '%s' ended (%s): outcome=%s, steps=%s",
+            report.execution_id,
+            report.plan_id,
+            reason.value,
+            report.outcome.value if report.outcome else None,
+            report.counts,
+        )
+
+    def _publish_attempt_report(
+        self, plan: Plan, report: AttemptReport, *, cause: BaseException | None
+    ) -> None:
+        """Publish an attempt's closed report as its one plan-level event.
+
+        Published on every ending, so no attempt is left looking as if it were
+        still running. The event names no step and no filename: the spool files
+        it directly under the plan, named after its unique event ID, so reports
+        from different attempts of one plan never overwrite each other.
+
+        If the attempt is ending *because* event publication failed, publishing
+        again would only fail the same way and bury the original cause under a
+        second, identical failure, so publication is skipped.
+
+        Args:
+            plan: The plan the attempt executed.
+            report: The attempt's closed report.
+            cause: The exception ending the attempt, or None if it drained.
+
+        Raises:
+            EventPublicationError: If publication fails and the attempt drained
+                or is ending with an Exception. In the latter case the message
+                names that exception and it stays reachable through the chain.
+                An interruption that is not an Exception is never replaced: the
+                publication failure is attached to it as a note instead.
+        """
+        if isinstance(cause, EventPublicationError):
+            self._logger.error(
+                "Not publishing the report of attempt '%s' for plan '%s': event "
+                "publication already failed during this attempt.",
+                report.execution_id,
+                plan.plan_id,
+            )
+            return
+
+        event: dict[str, Any] = {
+            "type": ATTEMPT_REPORT_EVENT,
+            "realm": plan.realm,
+            "scope": plan.scope,
+            "plan_id": plan.plan_id,
+            "execution_id": report.execution_id,
+            "report": report.to_dict(),
+            "eid": str(uuid.uuid4()),
+            "ts": utcnow_iso(),
+            "_spool_path": {"realm": plan.realm, "plan_id": plan.plan_id},
+        }
+        try:
+            self._emit_engine_event(
+                f"the report of attempt '{report.execution_id}' for plan "
+                f"'{plan.plan_id}'",
+                event,
+            )
+        except EventPublicationError as publish_error:
+            if cause is None:
+                raise
+            if not isinstance(cause, Exception):
+                cause.add_note(
+                    f"Publishing the attempt report also failed: {publish_error}"
+                )
+                self._logger.error("%s", publish_error)
+                return
+            raise EventPublicationError(
+                f"Failed to publish the report of attempt '{report.execution_id}' "
+                f"for plan '{plan.plan_id}'; the original "
+                f"{type(cause).__name__} is preserved: {cause}"
+            ) from publish_error
