@@ -139,6 +139,15 @@ class PlanBuilder:
 
     ``base`` is made absolute on construction, so every path derived from it -
     injected parameters, declared outputs, registry entries - is absolute too.
+
+    Output paths are settled once per step, so the path a step writes, the path
+    it declares and the path the registry records agree. Input paths are not
+    wired that way yet (Tech Debt #20): a step's input parameter and its
+    ``StepSpec.inputs`` entry come from its own ``In(...)`` annotation, never
+    from the producer's registry entry or an explicit input override.
+    Dependencies are still inferred correctly from artifact keys, but a consumer
+    can read - and fingerprint - a different file than its producer wrote once
+    that producer's output path is overridden.
     """
 
     plan_id: str
@@ -156,6 +165,14 @@ class PlanBuilder:
         A relative base would leak relative paths into output declarations, and
         the engine reads a relative output declaration as relative to the step's
         work directory, not to wherever the plan happened to be built.
+
+        Inputs derived from a relative base become absolute as well, resolved
+        against the working directory at construction. A relative base used to
+        yield relative paths, so a plan rebuilt from one gets different params,
+        and therefore different fingerprints, than it had before: its steps run
+        once more instead of reusing successes recorded under the old paths.
+        Already persisted plans are unaffected; they execute with the paths
+        they were built with.
         """
         self.base = Path(self.base).absolute()
 
