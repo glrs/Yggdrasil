@@ -2,12 +2,22 @@
 
 Single source of truth for the plan document shape so the CouchDB and SQLite
 plan stores cannot drift. Extracted from ``PlanDBManager`` (which now
-delegates here) — the document schema is unchanged.
+delegates here).
+
+Plan generation:
+    Every document written by ``save_plan`` carries a fresh opaque
+    ``plan_generation`` ID. It identifies one planned version of the plan:
+    approval changes and run-token increments keep it, while regenerating the
+    plan replaces it. It is never a stable default, so a plan that is deleted
+    and later recreated under the same ID cannot be mistaken for its earlier
+    version. A document written before the field existed gets one lazily, the
+    first time it is needed (see ``lib/storage/plan_updates.py``).
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +26,13 @@ from yggdrasil.flow.model import Plan
 
 # Valid values for the execution_authority field
 VALID_EXECUTION_AUTHORITIES = frozenset({"daemon", "run_once"})
+
+# Document field holding the generation ID of the stored plan version.
+PLAN_GENERATION_FIELD = "plan_generation"
+
+# Document field holding the result recorded when an execution request was
+# finalized; see ExecutionFinalization in lib/storage/plan_updates.py.
+LAST_FINALIZED_EXECUTION_FIELD = "last_finalized_execution"
 
 
 def json_safe(value: Any) -> Any:
@@ -50,6 +67,35 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def new_plan_generation() -> str:
+    """Return a fresh, globally unique plan generation ID.
+
+    Returns:
+        str: An opaque random ID. Generations are compared only for equality;
+        they carry no order.
+    """
+    return uuid.uuid4().hex
+
+
+def plan_generation_of(doc: dict[str, Any]) -> str | None:
+    """Return a plan document's generation ID, if it has a usable one.
+
+    Anything other than a non-empty string counts as no generation, so a
+    missing, empty, or mistyped value can never be matched against a
+    generation an execution captured.
+
+    Args:
+        doc: A persisted plan document.
+
+    Returns:
+        str | None: The generation ID, or None if the document has none.
+    """
+    generation = doc.get(PLAN_GENERATION_FIELD)
+    if isinstance(generation, str) and generation:
+        return generation
+    return None
+
+
 def build_plan_document(
     plan: Plan,
     realm: str,
@@ -64,12 +110,16 @@ def build_plan_document(
     notes: str | None = None,
     existing: dict[str, Any] | None = None,
     now: str | None = None,
+    plan_generation: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical plan document for persistence.
 
-    On regeneration (``existing`` provided), execution tokens are reset so the
-    new plan is eligible for execution, while ``created_at`` is preserved.
-    Backend-specific fields (``_rev``) are the caller's responsibility.
+    Every call builds a new plan version: the document gets a fresh
+    ``plan_generation``. On regeneration (``existing`` provided), execution
+    tokens are reset so the new plan is eligible for execution, and any
+    recorded execution result is dropped with them, while ``created_at`` is
+    preserved. Backend-specific fields (``_rev``) are the caller's
+    responsibility.
 
     Args:
         plan: The Plan object to persist (plan.plan_id is used as _id).
@@ -84,6 +134,8 @@ def build_plan_document(
         notes: Optional notes about the plan.
         existing: Previously persisted document, if any (for created_at).
         now: ISO-8601 timestamp override; defaults to current UTC time.
+        plan_generation: Generation ID override; defaults to a fresh one from
+            new_plan_generation().
 
     Returns:
         dict: JSON-safe plan document including ``_id``.
@@ -105,6 +157,7 @@ def build_plan_document(
         "status": "approved" if auto_run else "draft",
         "plan": plan.to_dict(),
         "preview": preview or {},
+        PLAN_GENERATION_FIELD: plan_generation or new_plan_generation(),
         "run_token": 0,
         "executed_run_token": -1,
         "execution_authority": execution_authority,
@@ -155,7 +208,13 @@ def plan_model_from_document(
 
 
 def plan_summary_from_document(doc: dict[str, Any]) -> dict[str, Any]:
-    """Extract the minimal display summary from a plan document."""
+    """Extract the minimal display summary from a plan document.
+
+    Approval ``status`` and the outcome of the last finalized execution are
+    reported as separate fields: an approved plan whose tokens are equal has
+    finished its last request, not necessarily succeeded at it.
+    """
+    last_execution = doc.get(LAST_FINALIZED_EXECUTION_FIELD)
     return {
         "status": doc.get("status", "unknown"),
         "execution_authority": doc.get("execution_authority", "daemon"),
@@ -164,4 +223,8 @@ def plan_summary_from_document(doc: dict[str, Any]) -> dict[str, Any]:
         "realm": doc.get("realm", "unknown"),
         "run_token": doc.get("run_token", 0),
         "executed_run_token": doc.get("executed_run_token", -1),
+        "plan_generation": plan_generation_of(doc),
+        "last_finalized_outcome": (
+            last_execution.get("outcome") if isinstance(last_execution, dict) else None
+        ),
     }
