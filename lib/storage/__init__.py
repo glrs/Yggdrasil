@@ -20,7 +20,14 @@ from lib.storage.config import (
     default_sqlite_path,
     resolve_internal_storage_config,
 )
+from lib.storage.errors import PlanStoreError, RevisionConflictError
 from lib.storage.factory import build_internal_storage
+from lib.storage.plan_updates import (
+    ExecutionFinalization,
+    FinalizationResult,
+    FinalizationStatus,
+    SupersessionReason,
+)
 from lib.storage.protocols import (
     InternalStorageBundle,
     OpsSnapshotSink,
@@ -30,11 +37,17 @@ from lib.storage.protocols import (
 
 __all__ = [
     "CouchInternalStorageConfig",
+    "ExecutionFinalization",
+    "FinalizationResult",
+    "FinalizationStatus",
     "InternalStorageBundle",
     "OpsSnapshotSink",
     "PlanChangeSource",
     "PlanStore",
+    "PlanStoreError",
+    "RevisionConflictError",
     "SQLiteInternalStorageConfig",
+    "SupersessionReason",
     "build_internal_storage",
     "default_sqlite_path",
     "resolve_internal_storage_config",
