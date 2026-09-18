@@ -197,8 +197,12 @@ Approval changes `status` to `"approved"`. Requesting another execution
 increments `run_token`; a plan is eligible only while `run_token` is
 greater than `executed_run_token`. A SQLite integration must also advance
 the plan change sequence transactionally so PlanWatcher observes the
-update. Editing only the stored JSON is insufficient, and SQLite tooling
-must be kept compatible with Yggdrasil's internal schema.
+update, and must write only if the plan is still at the revision it read
+(`SQLiteInternalStore.put_document(..., expected_rev=...)`), so it never
+overwrites a plan that Yggdrasil updated in the meantime. On a conflict,
+reread the plan and decide again. Editing only the stored JSON is
+insufficient, and SQLite tooling must be kept compatible with Yggdrasil's
+internal schema.
 
 External data sources are unaffected by the storage backend. Realm watch
 sources and realm `data_access` providers still resolve through

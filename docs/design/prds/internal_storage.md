@@ -249,9 +249,12 @@ realm access.
   (pre-existing; `docs/TECH_DEBT_LEDGER.md` #16).
 - Daemon startup recovery is not wired (Tech Debt #17). The remaining
   full eligible-plan scan has no active production caller.
-- SQLite plan mutations that read and then rewrite a whole document do
-  not use compare-and-swap (Tech Debt #18). Do not race an external approval
-  update or plan regeneration against a daemon update to the same plan.
+- Plan-store writes to SQLite are conditional on the revision they were
+  derived from, so a stale write is rejected instead of overwriting (Tech
+  Debt #18, resolved). `SQLiteInternalStore.put_document` still upserts
+  unconditionally when no `expected_rev` is given, so an external integration
+  that rewrites plan documents must pass the revision it read, or it can
+  overwrite a concurrent daemon update to the same plan.
 
 ## Deferred
 
