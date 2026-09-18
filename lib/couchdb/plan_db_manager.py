@@ -13,7 +13,8 @@ from typing import Any, cast
 
 from ibm_cloud_sdk_core.api_exception import ApiException
 from ibmcloudant.cloudant_v1 import Document
-from requests import RequestException
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import RequestException, SSLError, Timeout
 
 from lib.core_utils.logging_utils import custom_logger
 from lib.couchdb.couchdb_connection import CouchDBHandler
@@ -379,10 +380,16 @@ class PlanDBManager(CouchDBHandler):
         """
         Wrap a CouchDB failure as a backend-neutral plan-store error.
 
-        Transport failures and the responses CouchDB returns while it is
-        overloaded or restarting can succeed on a later attempt. Everything
-        else — a rejected credential, a missing database, a malformed request
-        — would fail again the same way, so it is not offered for retry.
+        Only two kinds of failure are offered for retry: the responses CouchDB
+        returns while it is overloaded or restarting, and a request that timed
+        out or whose connection failed. Everything else would fail again the
+        same way — a rejected credential, a missing database, a malformed
+        request, an unusable URL or header, a redirect loop — and so would a
+        TLS failure, since certificates and handshakes do not fix themselves;
+        ``SSLError`` is a ``ConnectionError`` in Requests, so it is excluded
+        before connections are considered transient. A transport failure this
+        code does not recognize is left non-retryable too, rather than
+        assuming the most convenient explanation for it.
 
         Args:
             doc_id: The plan document ID
@@ -393,9 +400,12 @@ class PlanDBManager(CouchDBHandler):
             PlanStoreError: Carrying the message and retry classification
         """
         status = getattr(exc, "status_code", None)
-        retryable = (
-            isinstance(exc, RequestException) or status in RETRYABLE_STATUS_CODES
-        )
+        if status is not None:
+            retryable = status in RETRYABLE_STATUS_CODES
+        elif isinstance(exc, SSLError):
+            retryable = False
+        else:
+            retryable = isinstance(exc, Timeout | RequestsConnectionError)
         return PlanStoreError(
             f"CouchDB failed to {action} plan '{doc_id}': {exc}",
             retryable=retryable,

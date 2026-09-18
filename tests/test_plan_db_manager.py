@@ -15,6 +15,16 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import (
+    ConnectTimeout,
+    InvalidHeader,
+    InvalidURL,
+    ProxyError,
+    ReadTimeout,
+    RequestException,
+    SSLError,
+    TooManyRedirects,
+)
 
 from lib.couchdb.plan_db_manager import PlanDBManager
 from lib.storage.errors import PlanStoreError, RevisionConflictError
@@ -846,23 +856,35 @@ class TestPlanDBManager(unittest.TestCase):
 
         self.assertEqual(result.reason, SupersessionReason.GENERATION_CHANGED)
 
-    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
-    def test_finalize_backend_failures_are_plan_store_errors(self):
-        """Server and network failures surface as PlanStoreError.
+    def _failure_cases(self):
+        """Failures the plan store can meet, and whether a retry could help.
 
-        Whether another attempt could help is part of that contract: a busy or
-        restarting server and a dropped connection are worth retrying, while a
-        rejected credential or a malformed request would fail again the same
-        way.
+        Retrying is worth it only when the server was busy or the request
+        never completed. A configuration or protocol problem produces the
+        same failure every time, and a TLS failure is one of those even
+        though Requests models it as a connection error.
         """
-        cases = {
-            "overloaded": (MockApiException(503, "Service unavailable"), True),
+        return {
+            "rate limited": (MockApiException(429, "Too many requests"), True),
             "server error": (MockApiException(500, "Server error"), True),
-            "dropped connection": (RequestsConnectionError("reset"), True),
+            "overloaded": (MockApiException(503, "Service unavailable"), True),
+            "read timeout": (ReadTimeout("timed out"), True),
+            "connect timeout": (ConnectTimeout("timed out"), True),
+            "dropped connection": (RequestsConnectionError("reset by peer"), True),
+            "proxy unreachable": (ProxyError("no route"), True),
             "forbidden": (MockApiException(403, "Forbidden"), False),
             "bad request": (MockApiException(400, "Bad request"), False),
+            "unusable url": (InvalidURL("http://:@/"), False),
+            "unusable header": (InvalidHeader("bad header value"), False),
+            "redirect loop": (TooManyRedirects("exceeded 30 redirects"), False),
+            "tls failure": (SSLError("certificate verify failed"), False),
+            "unclassified transport failure": (RequestException("something"), False),
         }
-        for label, (error, retryable) in cases.items():
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_write_failures_are_classified_plan_store_errors(self):
+        """A failed write says whether another attempt could get past it."""
+        for label, (error, retryable) in self._failure_cases().items():
             with self.subTest(label):
                 doc = self._stored_doc()
                 self._get_returns(doc)
@@ -875,6 +897,22 @@ class TestPlanDBManager(unittest.TestCase):
                 self.assertIs(ctx.exception.__cause__, error)
                 self.assertEqual(ctx.exception.retryable, retryable)
                 self.manager.server.put_document.assert_called_once()
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_read_failures_are_classified_plan_store_errors(self):
+        """The same classification applies before anything is written."""
+        request = self._finalization(self._stored_doc())
+        for label, (error, retryable) in self._failure_cases().items():
+            with self.subTest(label):
+                self._get_returns(error)
+                self.manager.server.put_document.reset_mock()
+
+                with self.assertRaises(PlanStoreError) as ctx:
+                    self.manager.finalize_execution(request)
+
+                self.assertIs(ctx.exception.__cause__, error)
+                self.assertEqual(ctx.exception.retryable, retryable)
+                self.manager.server.put_document.assert_not_called()
 
     @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
     def test_finalize_reports_a_genuinely_deleted_plan_as_missing(self):
