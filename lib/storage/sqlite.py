@@ -25,6 +25,18 @@ Change feed:
     ``change_seq > cursor``; multiple mutations between polls coalesce to
     the latest state (current eligibility, not an audit feed). Deletions
     are tombstones.
+
+Conditional writes:
+    Each document row carries a revision that increases on every write and
+    is never reused, not even after a tombstone. ``put_document`` can make a
+    write conditional on the revision the writer read (or on no live
+    document existing), checked inside the same ``BEGIN IMMEDIATE``
+    transaction as the write, so no other write can land between the check
+    and the write. A rejected write changes nothing: not the body, not the
+    revision, not the plan-change counter. Every plan-document write in this
+    module that is derived from an earlier read is conditional. Checkpoints
+    and operations snapshots keep unconditional upserts: each of their writes
+    replaces the stored value outright rather than modifying what was read.
 """
 
 from __future__ import annotations
@@ -35,14 +47,16 @@ import logging
 import os
 import sqlite3
 from collections.abc import AsyncIterator
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Final, Literal
 
 from lib.core_utils.errors import InternalStorageConfigurationError
 from lib.core_utils.logging_utils import custom_logger
 from lib.core_utils.plan_eligibility import is_plan_eligible
 from lib.couchdb.partitions import partition_key
 from lib.storage.config import SQLiteInternalStorageConfig
+from lib.storage.errors import PlanStoreError, RevisionConflictError
 from lib.storage.plan_documents import (
     build_plan_document,
     json_safe,
@@ -50,6 +64,12 @@ from lib.storage.plan_documents import (
     plan_summary_from_document,
     utc_now_iso,
     validate_execution_authority,
+)
+from lib.storage.plan_updates import (
+    ExecutionFinalization,
+    FinalizationResult,
+    finalize_execution,
+    initialize_plan_generation,
 )
 from lib.storage.protocols import InternalStorageBundle
 from lib.watchers.backends.base import Checkpoint, CheckpointStore, RawWatchEvent
@@ -63,6 +83,15 @@ _PLAN_SEQ_KEY = "plan_change_seq"
 _NS_PLANS = "plans"
 _NS_CHECKPOINTS = "checkpoints"
 _NS_OPS = "operations_snapshots"
+
+
+class _Unconditional(Enum):
+    """Sentinel type for a write that applies whatever revision is stored."""
+
+    TOKEN = "unconditional"
+
+
+_UNCONDITIONAL: Final = _Unconditional.TOKEN
 
 # Individual statements so the fresh-init can run them inside one explicit
 # transaction (executescript would auto-commit and break atomicity).
@@ -99,6 +128,34 @@ class SQLiteStorageError(InternalStorageConfigurationError):
     startup handling prints one concise operator message. Never triggers
     automatic deletion — resolving requires operator action.
     """
+
+
+def _conflict_message(
+    namespace: str, doc_id: str, expected_rev: str | None, current_rev: str | None
+) -> str:
+    """Describe a rejected conditional write for a RevisionConflictError.
+
+    Args:
+        namespace: Document namespace.
+        doc_id: Document ID.
+        expected_rev: The revision the writer expected; None for create.
+        current_rev: The stored live revision; None if there is none.
+
+    Returns:
+        str: One sentence naming what was expected and what was found.
+    """
+    target = f"{namespace}/{doc_id}"
+    if expected_rev is None:
+        return f"Cannot create '{target}': it already exists at revision {current_rev}"
+    if current_rev is None:
+        return (
+            f"Cannot replace '{target}' at revision {expected_rev}: it no longer "
+            "exists"
+        )
+    return (
+        f"Cannot replace '{target}' at revision {expected_rev}: it is now at "
+        f"revision {current_rev}"
+    )
 
 
 class SQLiteInternalStore:
@@ -321,11 +378,38 @@ class SQLiteInternalStore:
         body: dict[str, Any],
         *,
         bump_plan_seq: bool = False,
-    ) -> None:
-        """Upsert a document; optionally advance the plan-change counter.
+        expected_rev: str | None | Literal[_Unconditional.TOKEN] = _UNCONDITIONAL,
+    ) -> str:
+        """Write a document; optionally advance the plan-change counter.
 
-        The revision increments on every write. ``_rev`` is stripped from
-        the stored body (it is derived state, exposed on read).
+        ``expected_rev`` selects one of three write modes:
+
+        - omitted: unconditional upsert, whatever is stored.
+        - ``None``: create-if-absent. The write applies only if no live
+          document exists; a tombstone counts as absent.
+        - a revision string: expected-revision replace. The write applies
+          only if a live document exists at exactly that revision, as
+          returned in ``_rev`` by the read the new body was derived from.
+
+        The condition is checked in the same ``BEGIN IMMEDIATE`` transaction
+        as the write. A rejected write leaves the stored row and the
+        plan-change counter untouched. The revision increments on every
+        write. ``_rev`` is stripped from the stored body (it is derived
+        state, exposed on read), so it never takes part in the condition.
+
+        Args:
+            namespace: Document namespace.
+            doc_id: Document ID within the namespace.
+            body: The complete document body to store.
+            bump_plan_seq: Advance the plan-change counter and stamp the row
+                with the new value.
+            expected_rev: Write condition, as described above.
+
+        Returns:
+            str: The new revision, in the same form as ``_rev`` on read.
+
+        Raises:
+            RevisionConflictError: If the write condition does not hold.
         """
         payload = dict(body)
         payload.pop("_rev", None)
@@ -337,10 +421,20 @@ class SQLiteInternalStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT revision, change_seq FROM documents "
+                "SELECT revision, change_seq, deleted FROM documents "
                 "WHERE namespace = ? AND document_id = ?",
                 (namespace, doc_id),
             ).fetchone()
+            if expected_rev is not _UNCONDITIONAL:
+                current_rev = (
+                    None if row is None or row["deleted"] else str(row["revision"])
+                )
+                if current_rev != expected_rev:
+                    raise RevisionConflictError(
+                        _conflict_message(namespace, doc_id, expected_rev, current_rev),
+                        doc_id=doc_id,
+                        expected_rev=expected_rev,
+                    )
             revision = (row["revision"] + 1) if row else 1
             change_seq = row["change_seq"] if row else None
             if bump_plan_seq:
@@ -367,6 +461,7 @@ class SQLiteInternalStore:
             raise
         finally:
             conn.close()
+        return str(revision)
 
     def delete_document(
         self,
@@ -539,7 +634,10 @@ class SQLitePlanStore:
     """PlanStore over :class:`SQLiteInternalStore` (namespace ``plans``).
 
     Document shapes, eligibility, regeneration, and token semantics are
-    shared with the CouchDB backend via ``lib/storage/plan_documents.py``.
+    shared with the CouchDB backend via ``lib/storage/plan_documents.py``,
+    and generation initialization and finalization via
+    ``lib/storage/plan_updates.py``. Every write that replaces a plan
+    document's content is conditioned on the state it was derived from.
     """
 
     def __init__(
@@ -566,7 +664,20 @@ class SQLitePlanStore:
         source_doc_rev: str | None = None,
         notes: str | None = None,
     ) -> str:
-        """Persist a plan document (see PlanStore protocol)."""
+        """Persist a plan document (see PlanStore protocol).
+
+        The write is conditioned on the document state that was read: a
+        brand-new plan is created only if no other writer created it first,
+        and a regeneration replaces only the revision it read. A lost race
+        is surfaced rather than replayed, because this call's planning intent
+        may be older than the document that won.
+
+        Raises:
+            ValueError: If execution_authority is invalid or plan.plan_id is
+                missing.
+            RevisionConflictError: If another writer changed the plan document
+                after it was read. Nothing was written.
+        """
         validate_execution_authority(execution_authority)
         doc_id = plan.plan_id
         if not doc_id:
@@ -586,7 +697,17 @@ class SQLitePlanStore:
             notes=notes,
             existing=existing,
         )
-        self._store.put_document(_NS_PLANS, doc_id, plan_doc, bump_plan_seq=True)
+        try:
+            self._store.put_document(
+                _NS_PLANS,
+                doc_id,
+                plan_doc,
+                bump_plan_seq=True,
+                expected_rev=existing["_rev"] if existing else None,
+            )
+        except RevisionConflictError as exc:
+            self._logger.error("Failed to save plan '%s': %s", doc_id, exc)
+            raise
         self._logger.info(
             "Saved plan '%s' (realm=%s, status=%s)",
             doc_id,
@@ -615,21 +736,147 @@ class SQLitePlanStore:
     ) -> bool:
         """Record a successful execution of ``run_token``.
 
-        ``max_retries`` is accepted for protocol parity; local transactions
-        cannot hit CouchDB-style revision conflicts.
+        Each attempt rereads the plan and writes the token conditioned on the
+        revision it read. A lost race rereads and reapplies the token to the
+        newer state, never resending the stale document, up to
+        ``max_retries`` attempts in total, matching the CouchDB backend.
+
+        This update does not check the plan generation or record an outcome;
+        :meth:`finalize_execution` does both.
+
+        Returns:
+            bool: True if the token was written; False if the plan does not
+            exist or every attempt lost a race.
         """
-        doc = self._store.get_document(_NS_PLANS, doc_id)
-        if not doc:
-            self._logger.error("Cannot update token: plan '%s' not found", doc_id)
-            return False
-        doc["executed_run_token"] = run_token
-        doc["last_executed_at"] = utc_now_iso()
-        doc["updated_at"] = utc_now_iso()
-        self._store.put_document(_NS_PLANS, doc_id, doc, bump_plan_seq=True)
-        self._logger.debug(
-            "Updated executed_run_token=%d for plan '%s'", run_token, doc_id
+        for attempt in range(1, max_retries + 1):
+            doc = self._store.get_document(_NS_PLANS, doc_id)
+            if not doc:
+                self._logger.error("Cannot update token: plan '%s' not found", doc_id)
+                return False
+            now = utc_now_iso()
+            doc["executed_run_token"] = run_token
+            doc["last_executed_at"] = now
+            doc["updated_at"] = now
+            try:
+                self._store.put_document(
+                    _NS_PLANS,
+                    doc_id,
+                    doc,
+                    bump_plan_seq=True,
+                    expected_rev=doc["_rev"],
+                )
+            except RevisionConflictError:
+                self._logger.warning(
+                    "Conflict updating plan '%s'; retry %d/%d",
+                    doc_id,
+                    attempt,
+                    max_retries,
+                )
+                continue
+            self._logger.debug(
+                "Updated executed_run_token=%d for plan '%s'", run_token, doc_id
+            )
+            return True
+
+        self._logger.error(
+            "Failed to update plan '%s' after %d retries", doc_id, max_retries
         )
-        return True
+        return False
+
+    def ensure_plan_generation(self, doc_id: str) -> dict[str, Any] | None:
+        """Return the current plan document, giving a legacy one a generation.
+
+        See :func:`lib.storage.plan_updates.initialize_plan_generation`.
+
+        Args:
+            doc_id: The plan document ID.
+
+        Returns:
+            dict | None: The current document with its ``plan_generation``, or
+            None if the plan does not exist.
+
+        Raises:
+            RevisionConflictError: If the document kept changing without
+                gaining a generation.
+            PlanStoreError: If the SQLite database fails.
+        """
+        return initialize_plan_generation(
+            doc_id,
+            fetch=self._fetch_plan_document,
+            replace=self._replace_plan_document,
+            logger=self._logger,
+        )
+
+    def finalize_execution(self, request: ExecutionFinalization) -> FinalizationResult:
+        """Record a finished execution request in its plan document.
+
+        See :func:`lib.storage.plan_updates.finalize_execution`.
+
+        Args:
+            request: The finished request to record.
+
+        Returns:
+            FinalizationResult: How this one attempt resolved.
+
+        Raises:
+            PlanStoreError: If the SQLite database fails.
+        """
+        return finalize_execution(
+            request,
+            fetch=self._fetch_plan_document,
+            replace=self._replace_plan_document,
+            logger=self._logger,
+        )
+
+    def _fetch_plan_document(self, doc_id: str) -> dict[str, Any] | None:
+        """Fetch a live plan document for a conditional update.
+
+        Args:
+            doc_id: The plan document ID.
+
+        Returns:
+            dict | None: The document with ``_rev``, or None if absent.
+
+        Raises:
+            PlanStoreError: If the SQLite database fails.
+        """
+        try:
+            return self._store.get_document(_NS_PLANS, doc_id)
+        except sqlite3.Error as exc:
+            raise PlanStoreError(
+                f"SQLite failed to read plan '{doc_id}': {exc}"
+            ) from exc
+
+    def _replace_plan_document(
+        self, doc_id: str, body: dict[str, Any], expected_rev: str
+    ) -> str:
+        """Replace a plan document only if it is still at expected_rev.
+
+        Args:
+            doc_id: The plan document ID.
+            body: The complete new document body.
+            expected_rev: The revision the body was derived from.
+
+        Returns:
+            str: The new revision.
+
+        Raises:
+            RevisionConflictError: If the document is no longer at expected_rev.
+            PlanStoreError: If the SQLite database fails; the write may or may
+                not have been committed.
+        """
+        try:
+            return self._store.put_document(
+                _NS_PLANS,
+                doc_id,
+                body,
+                bump_plan_seq=True,
+                expected_rev=expected_rev,
+            )
+        except sqlite3.Error as exc:
+            raise PlanStoreError(
+                f"SQLite failed to write plan '{doc_id}': {exc}"
+            ) from exc
 
     def query_approved_pending(self) -> list[dict[str, Any]]:
         """Return all plans eligible for execution (recovery)."""
