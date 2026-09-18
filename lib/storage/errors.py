@@ -52,4 +52,32 @@ class PlanStoreError(Exception):
     Operations that raise it recheck the document on every call, so calling
     them again is how that uncertainty is resolved. The backend's original
     exception is chained as ``__cause__``.
+
+    ``retryable`` says whether trying the same operation again could plausibly
+    succeed, so that a caller can decide without catching the backend's own
+    exception types — which is the whole point of having one storage boundary.
+    The adapter that wraps the failure classifies it: a lost connection, a
+    timeout, an overloaded server or a busy database file are retryable; a
+    rejected credential, a missing database, a malformed response, and
+    anything else whose cause is unknown are not, because retrying those
+    repeats a failure rather than waiting out a temporary one.
+
+    A non-retryable failure is not a verdict on the execution it was
+    finalizing. The caller keeps the result and its execution exclusion either
+    way; only automatic retrying is ruled out.
+
+    Attributes:
+        retryable: Whether trying the same operation again could succeed.
     """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        """Initialize the failure with its retry classification.
+
+        Args:
+            message: Human-readable description of the failure.
+            retryable: Whether trying the same operation again could succeed.
+                Defaults to False, so an unclassified failure is never retried
+                automatically.
+        """
+        super().__init__(message)
+        self.retryable = retryable

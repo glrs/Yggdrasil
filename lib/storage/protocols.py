@@ -36,9 +36,16 @@ class PlanStore(Protocol):
 
     Every write that replaces a plan document's content is conditioned on
     the state it was derived from, so a concurrent writer is never silently
-    overwritten. Conflicts and backend failures surface as the
-    backend-neutral :class:`~lib.storage.errors.RevisionConflictError` and
-    :class:`~lib.storage.errors.PlanStoreError`.
+    overwritten, and a lost race always surfaces as the backend-neutral
+    :class:`~lib.storage.errors.RevisionConflictError`.
+
+    Backend *failures* are normalized only by the two conditional-update
+    methods, :meth:`ensure_plan_generation` and :meth:`finalize_execution`:
+    they raise :class:`~lib.storage.errors.PlanStoreError`, which also says
+    whether another attempt could help. The older methods still let their
+    backend's own exceptions through — a CouchDB ``ApiException``, a
+    ``sqlite3.Error`` — so a caller that must behave identically on both
+    backends either uses these two methods or catches broadly.
     """
 
     def save_plan(
@@ -125,7 +132,8 @@ class PlanStore(Protocol):
 
         Raises:
             PlanStoreError: If the storage backend fails. The write may have
-                landed; calling again reports that as ALREADY_COMMITTED.
+                landed; calling again reports that as ALREADY_COMMITTED. Its
+                ``retryable`` flag says whether another attempt could help.
         """
         ...
 

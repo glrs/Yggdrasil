@@ -16,9 +16,10 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from lib.core_utils.plan_eligibility import is_plan_eligible
-from lib.storage.errors import RevisionConflictError
+from lib.storage.errors import PlanStoreError, RevisionConflictError
 from lib.storage.plan_documents import build_plan_document
 from lib.storage.plan_updates import FinalizationStatus
 from lib.storage.sqlite import SQLiteInternalStore, SQLitePlanStore
@@ -487,6 +488,50 @@ class TestBoundedRereads(_SQLiteTestBase):
         self.assertEqual(len(writes), 3)
         del self.store.get_document
         self.assertNotIn("plan_generation", self.plans.fetch_plan(PLAN_ID))
+
+
+class TestBackendFailureClassification(_SQLiteTestBase):
+    """Which SQLite failures a caller may retry."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = SQLiteInternalStore(self.path)
+        self.plans = SQLitePlanStore(self.store)
+        self.plans.save_plan(
+            make_plan(PLAN_ID), "test_realm", dict(SCOPE), auto_run=True
+        )
+        self.request = finalization_for(self.plans.fetch_plan(PLAN_ID))
+
+    def test_only_contention_is_offered_for_retry(self):
+        cases = {
+            "locked by another writer": (
+                sqlite3.OperationalError("database is locked"),
+                True,
+            ),
+            "busy": (sqlite3.OperationalError("database is busy"), True),
+            "corrupt file": (sqlite3.DatabaseError("file is not a database"), False),
+            "schema gone": (
+                sqlite3.OperationalError("no such table: documents"),
+                False,
+            ),
+            "failing disk": (sqlite3.OperationalError("disk I/O error"), False),
+        }
+        for label, (error, retryable) in cases.items():
+            with self.subTest(label):
+                with patch.object(
+                    SQLiteInternalStore, "put_document", side_effect=error
+                ):
+                    with self.assertRaises(PlanStoreError) as ctx:
+                        self.plans.finalize_execution(self.request)
+
+                self.assertIs(ctx.exception.__cause__, error)
+                self.assertEqual(ctx.exception.retryable, retryable)
+
+        # Nothing was written, so the request can still be finalized.
+        self.assertEqual(
+            self.plans.finalize_execution(self.request).status,
+            FinalizationStatus.COMMITTED,
+        )
 
 
 if __name__ == "__main__":

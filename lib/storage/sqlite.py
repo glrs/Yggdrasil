@@ -158,6 +158,30 @@ def _conflict_message(
     )
 
 
+def _plan_store_error(doc_id: str, action: str, exc: sqlite3.Error) -> PlanStoreError:
+    """Wrap a SQLite failure as a backend-neutral plan-store error.
+
+    Only contention is worth another attempt: a database busy or locked by
+    another writer for longer than the busy timeout clears on its own. A
+    corrupt file, a schema mismatch or a misuse of the API would fail again
+    identically, so those are not offered for retry.
+
+    Args:
+        doc_id: The plan document ID.
+        action: "read" or "write", for the message.
+        exc: The sqlite3 exception to wrap.
+
+    Returns:
+        PlanStoreError: Carrying the message and retry classification.
+    """
+    contended = isinstance(exc, sqlite3.OperationalError) and any(
+        reason in str(exc).lower() for reason in ("locked", "busy")
+    )
+    return PlanStoreError(
+        f"SQLite failed to {action} plan '{doc_id}': {exc}", retryable=contended
+    )
+
+
 class SQLiteInternalStore:
     """Low-level namespaced JSON document store on one SQLite file.
 
@@ -843,9 +867,7 @@ class SQLitePlanStore:
         try:
             return self._store.get_document(_NS_PLANS, doc_id)
         except sqlite3.Error as exc:
-            raise PlanStoreError(
-                f"SQLite failed to read plan '{doc_id}': {exc}"
-            ) from exc
+            raise _plan_store_error(doc_id, "read", exc) from exc
 
     def _replace_plan_document(
         self, doc_id: str, body: dict[str, Any], expected_rev: str
@@ -874,9 +896,7 @@ class SQLitePlanStore:
                 expected_rev=expected_rev,
             )
         except sqlite3.Error as exc:
-            raise PlanStoreError(
-                f"SQLite failed to write plan '{doc_id}': {exc}"
-            ) from exc
+            raise _plan_store_error(doc_id, "write", exc) from exc
 
     def query_approved_pending(self) -> list[dict[str, Any]]:
         """Return all plans eligible for execution (recovery)."""
