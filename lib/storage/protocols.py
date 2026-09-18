@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from lib.storage.plan_updates import ExecutionFinalization, FinalizationResult
 from lib.watchers.backends.base import CheckpointStore, RawWatchEvent
 from yggdrasil.flow.model import Plan
 
@@ -28,9 +29,16 @@ from yggdrasil.flow.model import Plan
 class PlanStore(Protocol):
     """Storage for plan documents (intent + approval state).
 
-    Mirrors the existing ``PlanDBManager`` contract exactly. Plan
-    eligibility, regeneration, run tokens, execution authority, ownership,
-    and document shapes are identical across backends.
+    Mirrors the ``PlanDBManager`` contract exactly. Plan eligibility,
+    regeneration, run tokens, plan generations, execution authority,
+    ownership, document shapes, and conflict behavior are identical across
+    backends.
+
+    Every write that replaces a plan document's content is conditioned on
+    the state it was derived from, so a concurrent writer is never silently
+    overwritten. Conflicts and backend failures surface as the
+    backend-neutral :class:`~lib.storage.errors.RevisionConflictError` and
+    :class:`~lib.storage.errors.PlanStoreError`.
     """
 
     def save_plan(
@@ -47,7 +55,19 @@ class PlanStore(Protocol):
         source_doc_rev: str | None = None,
         notes: str | None = None,
     ) -> str:
-        """Persist a plan document; returns the document ID."""
+        """Persist a new or regenerated plan document; returns the document ID.
+
+        Every call assigns a fresh ``plan_generation`` and resets execution
+        tokens. The write applies only to the document state that was read,
+        so a lost race raises instead of replaying this call's planning intent
+        over a newer document.
+
+        Raises:
+            ValueError: If execution_authority is invalid or plan.plan_id is
+                missing.
+            RevisionConflictError: If another writer created or changed the
+                plan document first. Nothing was written.
+        """
         ...
 
     def fetch_plan(self, doc_id: str) -> dict[str, Any] | None:
@@ -65,7 +85,48 @@ class PlanStore(Protocol):
         *,
         max_retries: int = 3,
     ) -> bool:
-        """Record a successful execution of ``run_token`` for the plan."""
+        """Record a successful execution of ``run_token`` for the plan.
+
+        Retries lost races by rereading and reapplying the token, up to
+        ``max_retries`` attempts in total. Unlike :meth:`finalize_execution`,
+        it does not check that the plan is still the generation that was
+        executed, and records no outcome.
+        """
+        ...
+
+    def ensure_plan_generation(self, doc_id: str) -> dict[str, Any] | None:
+        """Return the current plan document, giving a legacy one a generation.
+
+        A document that predates ``plan_generation`` gets a fresh generation
+        through a conditional write that changes nothing else. The returned
+        document is one consistent snapshot to capture an execution request
+        from.
+
+        Returns:
+            The current document with its ``plan_generation``, or None if the
+            plan does not exist.
+
+        Raises:
+            RevisionConflictError: If the document kept changing without
+                gaining a generation.
+            PlanStoreError: If the storage backend fails.
+        """
+        ...
+
+    def finalize_execution(self, request: ExecutionFinalization) -> FinalizationResult:
+        """Record a finished execution request's outcome and executed token.
+
+        Both are written together in one conditional write, and only if the
+        plan is still the captured generation, under the captured authority
+        and owner, and has not recorded this request or a newer one. Each
+        call makes one attempt and resolves to one status: COMMITTED,
+        ALREADY_COMMITTED (this execution's completion was already recorded),
+        CONFLICT (still valid, retry), or SUPERSEDED (never retry).
+
+        Raises:
+            PlanStoreError: If the storage backend fails. The write may have
+                landed; calling again reports that as ALREADY_COMMITTED.
+        """
         ...
 
     def query_approved_pending(self) -> list[dict[str, Any]]:
