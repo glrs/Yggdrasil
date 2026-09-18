@@ -58,8 +58,15 @@ class PlanStoreContract:
         """Apply the next write, then make the backend call fail anyway."""
         raise NotImplementedError
 
-    def fail_next_read(self) -> None:
-        """Make the next document read fail in the backend."""
+    def fail_next_read(self, *, transient: bool = True) -> None:
+        """Make the next document read fail in the backend.
+
+        Args:
+            transient: True for a failure another attempt could get past (a
+                busy database, an overloaded server); False for one that would
+                fail again identically (a refused permission, an unusable
+                file).
+        """
         raise NotImplementedError
 
     def raw_put(self, doc: dict[str, Any]) -> None:
@@ -390,12 +397,29 @@ class PlanStoreContract:
         self.assertEqual(result.reason, SupersessionReason.PLAN_MISSING)
         self.assertIsNone(self.plans.fetch_plan(PLAN_ID))
 
-    def test_backend_read_failure_is_a_plan_store_error(self):
+    def test_backend_failure_says_whether_another_attempt_could_help(self):
+        """The retry decision is available without catching backend errors.
+
+        A caller bounded to a few finalization attempts has to tell "the
+        database was busy" from "this will never work", and it cannot import
+        sqlite3 or CouchDB exception types to do it.
+        """
         request = finalization_for(self.save())
-        self.fail_next_read()
-        with self.assertRaises(PlanStoreError) as ctx:
-            self.plans.finalize_execution(request)
-        self.assertIsNotNone(ctx.exception.__cause__)
+        for transient in (True, False):
+            with self.subTest(transient=transient):
+                self.fail_next_read(transient=transient)
+
+                with self.assertRaises(PlanStoreError) as ctx:
+                    self.plans.finalize_execution(request)
+
+                self.assertIsNotNone(ctx.exception.__cause__)
+                self.assertEqual(ctx.exception.retryable, transient)
+
+        # The plan is untouched, so a later attempt still finalizes it.
+        self.assertEqual(
+            self.plans.finalize_execution(request).status,
+            FinalizationStatus.COMMITTED,
+        )
 
     # ----- legacy generation initialization -----
 
@@ -487,12 +511,17 @@ class TestSQLiteConditionalUpdates(PlanStoreContract, unittest.TestCase):
 
         self.store.put_document = write_then_fail
 
-    def fail_next_read(self):
+    def fail_next_read(self, *, transient=True):
         real = self.store.get_document
+        error = (
+            sqlite3.OperationalError("database is locked")
+            if transient
+            else sqlite3.DatabaseError("file is not a database")
+        )
 
         def fail(namespace, doc_id):
             self.store.get_document = real  # one-shot
-            raise sqlite3.OperationalError("database is locked")
+            raise error
 
         self.store.get_document = fail
 
@@ -522,8 +551,12 @@ class TestCouchConditionalUpdates(PlanStoreContract, unittest.TestCase):
     def fail_after_next_write(self):
         self.server.fail_after_next_write = RequestsConnectionError("reset by peer")
 
-    def fail_next_read(self):
-        self.server.fail_next_read = FakeApiException(503, "unavailable")
+    def fail_next_read(self, *, transient=True):
+        self.server.fail_next_read = (
+            FakeApiException(503, "unavailable")
+            if transient
+            else FakeApiException(403, "forbidden")
+        )
 
     def raw_put(self, doc):
         body = dict(doc)

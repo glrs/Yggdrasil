@@ -53,6 +53,7 @@ class CouchDBClientFactory:
         pass_env: str,
         *,
         verify_connection: bool = True,
+        enable_retries: bool = True,
     ) -> cloudant_v1.CloudantV1:
         """
         Create a new CloudantV1 client.
@@ -62,6 +63,12 @@ class CouchDBClientFactory:
             user_env: Environment variable name containing username
             pass_env: Environment variable name containing password
             verify_connection: If True, ping server to fail fast (default True)
+            enable_retries: If True (default), the SDK retries transient
+                failures inside a single call (up to 3 extra attempts,
+                including for PUT). Pass False where the caller owns a bounded
+                retry policy of its own: an invisible transport retry would
+                multiply that bound and repeat a write the caller meant to
+                attempt exactly once.
 
         Returns:
             CloudantV1 client instance (caller owns this client)
@@ -97,7 +104,8 @@ class CouchDBClientFactory:
                 authenticator=CouchDbSessionAuthenticator(user, password)
             )
             client.set_service_url(url)
-            client.enable_retries(max_retries=3, retry_interval=5.0)
+            if enable_retries:
+                client.enable_retries(max_retries=3, retry_interval=5.0)
 
             # Verify connection (fail fast)
             if verify_connection:
@@ -168,6 +176,7 @@ class CouchDBHandler:
         user_env: str,
         pass_env: str,
         logger: logging.Logger | None = None,
+        enable_retries: bool = True,
     ) -> None:
         """
         Initialize CouchDB handler for a specific database.
@@ -177,6 +186,8 @@ class CouchDBHandler:
             url: CouchDB server URL (must include http:// or https://)
             user_env: Environment variable name containing username
             pass_env: Environment variable name containing password
+            enable_retries: Whether the SDK may retry transient failures
+                inside one call; see CouchDBClientFactory.create_client
 
         Raises:
             ValueError: If URL is missing scheme
@@ -192,6 +203,7 @@ class CouchDBHandler:
             url=url,
             user_env=user_env,
             pass_env=pass_env,
+            enable_retries=enable_retries,
         )
 
         # Store URL and credentials for raw HTTP requests (validated by factory above)

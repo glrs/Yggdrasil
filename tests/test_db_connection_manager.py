@@ -233,6 +233,7 @@ class TestCouchDBHandler(unittest.TestCase):
             url="http://localhost:5984",
             user_env="TEST_USER",
             pass_env="TEST_PASS",
+            enable_retries=True,
         )
 
         # Verify database was checked

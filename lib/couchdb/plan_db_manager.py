@@ -40,6 +40,12 @@ logger = custom_logger(__name__)
 
 __all__ = ["PlanDBManager", "VALID_EXECUTION_AUTHORITIES"]
 
+# Responses that mean "busy or restarting, ask again" rather than "this
+# request is wrong". Matches the statuses the Cloudant SDK itself treats as
+# transient, so disabling its retries does not change which failures are
+# considered worth another attempt — only who decides to make one.
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 # Backwards-compatible aliases; canonical definitions live in
 # lib/storage/plan_documents.py, shared with the SQLite backend.
 _json_safe = json_safe
@@ -87,7 +93,17 @@ class PlanDBManager(CouchDBHandler):
         db_name: str = "yggdrasil_plans",
         logger: logging.Logger | None = None,
     ) -> None:
-        """Initialize connection to the plans database."""
+        """Initialize connection to the plans database.
+
+        The client is built without the SDK's automatic retries. Every retry
+        of a plan-document write belongs to the caller that owns the attempt
+        bound, and has to refetch and recheck generation, token and authority
+        before writing again. A transport retry does neither: it would repeat
+        a PUT that the shared finalizer intends to attempt exactly once, and
+        turn a caller's bounded number of attempts into a multiple of it.
+        Reads are left to the same rule for one policy per client; the plan
+        change feed built on this handler runs its own bounded retry loop.
+        """
         self._logger = logger or custom_logger(f"{__name__}.{type(self).__name__}")
         params = resolve_couchdb_params(
             endpoint=endpoint,
@@ -102,6 +118,7 @@ class PlanDBManager(CouchDBHandler):
             user_env=params.user_env,
             pass_env=params.pass_env,
             logger=self._logger,
+            enable_retries=False,
         )
 
     def save_plan(
@@ -356,25 +373,77 @@ class PlanDBManager(CouchDBHandler):
             logger=self._logger,
         )
 
+    def _plan_store_error(
+        self, doc_id: str, action: str, exc: Exception
+    ) -> PlanStoreError:
+        """
+        Wrap a CouchDB failure as a backend-neutral plan-store error.
+
+        Transport failures and the responses CouchDB returns while it is
+        overloaded or restarting can succeed on a later attempt. Everything
+        else — a rejected credential, a missing database, a malformed request
+        — would fail again the same way, so it is not offered for retry.
+
+        Args:
+            doc_id: The plan document ID
+            action: "read" or "write", for the message
+            exc: The CouchDB or transport exception to wrap
+
+        Returns:
+            PlanStoreError: Carrying the message and retry classification
+        """
+        status = getattr(exc, "status_code", None)
+        retryable = (
+            isinstance(exc, RequestException) or status in RETRYABLE_STATUS_CODES
+        )
+        return PlanStoreError(
+            f"CouchDB failed to {action} plan '{doc_id}': {exc}",
+            retryable=retryable,
+        )
+
     def _fetch_plan_document(self, doc_id: str) -> dict[str, Any] | None:
         """
         Fetch a plan document for a conditional update.
+
+        Reads the document directly rather than through
+        :meth:`fetch_document_by_id`, which reports a malformed response as a
+        missing document. A conditional update must not confuse the two: a
+        missing plan tells the caller its execution request was superseded and
+        can never be recorded, which a proxy returning a non-document body is
+        no evidence of.
 
         Args:
             doc_id: The plan document ID
 
         Returns:
-            dict or None: The document with ``_rev``, or None if not found
+            dict or None: The document with ``_rev``, or None if CouchDB
+                reports it does not exist
 
         Raises:
-            PlanStoreError: If CouchDB fails or cannot be reached
+            PlanStoreError: If CouchDB fails, cannot be reached, or answers
+                with something other than a document
         """
         try:
-            return self.fetch_document_by_id(doc_id)
-        except (ApiException, RequestException) as exc:
+            document = self.server.get_document(
+                db=self.db_name,
+                doc_id=doc_id,
+            ).get_result()
+        except ApiException as exc:
+            if exc.status_code == 404:
+                self._logger.debug(
+                    "Plan '%s' not found in database '%s'", doc_id, self.db_name
+                )
+                return None
+            raise self._plan_store_error(doc_id, "read", exc) from exc
+        except RequestException as exc:
+            raise self._plan_store_error(doc_id, "read", exc) from exc
+
+        if not isinstance(document, dict):
             raise PlanStoreError(
-                f"CouchDB failed to read plan '{doc_id}': {exc}"
-            ) from exc
+                f"CouchDB answered with {type(document).__name__} instead of a "
+                f"document for plan '{doc_id}'; the plan's existence is unknown"
+            )
+        return document
 
     def _replace_plan_document(
         self, doc_id: str, body: dict[str, Any], expected_rev: str
@@ -412,13 +481,9 @@ class PlanDBManager(CouchDBHandler):
                     doc_id=doc_id,
                     expected_rev=expected_rev,
                 ) from exc
-            raise PlanStoreError(
-                f"CouchDB failed to write plan '{doc_id}': {exc}"
-            ) from exc
+            raise self._plan_store_error(doc_id, "write", exc) from exc
         except RequestException as exc:
-            raise PlanStoreError(
-                f"CouchDB failed to write plan '{doc_id}': {exc}"
-            ) from exc
+            raise self._plan_store_error(doc_id, "write", exc) from exc
 
         new_rev = response.get("rev") if isinstance(response, dict) else None
         if not isinstance(new_rev, str):

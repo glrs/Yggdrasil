@@ -721,6 +721,26 @@ class TestPlanDBManager(unittest.TestCase):
         context.report.finish(TerminationReason.COMPLETED)
         return ExecutionFinalization.from_attempt(context)
 
+    def _get_returns(self, *documents):
+        """Queue the plan store's document reads.
+
+        Each entry is a response body or an exception to raise. The last entry
+        answers every further read, so a test lists only the reads it cares
+        about.
+        """
+        queued = list(documents)
+
+        def _read(*, db, doc_id):
+            item = queued.pop(0) if len(queued) > 1 else queued[0]
+            result = Mock()
+            if isinstance(item, BaseException):
+                result.get_result.side_effect = item
+            else:
+                result.get_result.return_value = item
+            return result
+
+        self.manager.server.get_document = Mock(side_effect=_read)
+
     def _put_returns(self, result=None, error=None):
         mock_result = Mock()
         if error is not None:
@@ -775,9 +795,7 @@ class TestPlanDBManager(unittest.TestCase):
     def test_finalize_rejects_a_generation_mismatch_without_any_409(self):
         """The _rev would allow the write; the generation check must not."""
         request = self._finalization(self._stored_doc())
-        self.manager.fetch_document_by_id = Mock(
-            return_value=self._stored_doc(_rev="7-current", plan_generation="gen-2")
-        )
+        self._get_returns(self._stored_doc(_rev="7-current", plan_generation="gen-2"))
 
         result = self.manager.finalize_execution(request)
 
@@ -789,7 +807,7 @@ class TestPlanDBManager(unittest.TestCase):
         """Outcome and token go out together in one conditional write."""
         doc = self._stored_doc(run_token=1)
         request = self._finalization(doc)
-        self.manager.fetch_document_by_id = Mock(return_value=doc)
+        self._get_returns(doc)
         self._put_returns({"ok": True, "rev": "2-def"})
 
         result = self.manager.finalize_execution(request)
@@ -807,25 +825,21 @@ class TestPlanDBManager(unittest.TestCase):
         """One call makes one write attempt; the caller owns retries."""
         doc = self._stored_doc()
         request = self._finalization(doc)
-        self.manager.fetch_document_by_id = Mock(
-            side_effect=[doc, self._stored_doc(_rev="2-xyz", run_token=1)]
-        )
+        self._get_returns(doc, self._stored_doc(_rev="2-xyz", run_token=1))
         self._put_returns(error=MockApiException(409, "Conflict"))
 
         result = self.manager.finalize_execution(request)
 
         self.assertEqual(result.status, FinalizationStatus.CONFLICT)
         self.manager.server.put_document.assert_called_once()
-        self.assertEqual(self.manager.fetch_document_by_id.call_count, 2)
+        self.assertEqual(self.manager.server.get_document.call_count, 2)
 
     @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
     def test_finalize_409_revealing_a_regeneration_is_superseded(self):
         """After a conflict the reread decides; a new generation is final."""
         doc = self._stored_doc()
         request = self._finalization(doc)
-        self.manager.fetch_document_by_id = Mock(
-            side_effect=[doc, self._stored_doc(_rev="2-xyz", plan_generation="gen-2")]
-        )
+        self._get_returns(doc, self._stored_doc(_rev="2-xyz", plan_generation="gen-2"))
         self._put_returns(error=MockApiException(409, "Conflict"))
 
         result = self.manager.finalize_execution(request)
@@ -834,14 +848,24 @@ class TestPlanDBManager(unittest.TestCase):
 
     @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
     def test_finalize_backend_failures_are_plan_store_errors(self):
-        """Server and network failures surface as PlanStoreError."""
-        for error in (
-            MockApiException(500, "Server error"),
-            RequestsConnectionError("connection reset"),
-        ):
-            with self.subTest(error=type(error).__name__):
+        """Server and network failures surface as PlanStoreError.
+
+        Whether another attempt could help is part of that contract: a busy or
+        restarting server and a dropped connection are worth retrying, while a
+        rejected credential or a malformed request would fail again the same
+        way.
+        """
+        cases = {
+            "overloaded": (MockApiException(503, "Service unavailable"), True),
+            "server error": (MockApiException(500, "Server error"), True),
+            "dropped connection": (RequestsConnectionError("reset"), True),
+            "forbidden": (MockApiException(403, "Forbidden"), False),
+            "bad request": (MockApiException(400, "Bad request"), False),
+        }
+        for label, (error, retryable) in cases.items():
+            with self.subTest(label):
                 doc = self._stored_doc()
-                self.manager.fetch_document_by_id = Mock(return_value=doc)
+                self._get_returns(doc)
                 self.manager.server.put_document.reset_mock()
                 self._put_returns(error=error)
 
@@ -849,12 +873,64 @@ class TestPlanDBManager(unittest.TestCase):
                     self.manager.finalize_execution(self._finalization(doc))
 
                 self.assertIs(ctx.exception.__cause__, error)
+                self.assertEqual(ctx.exception.retryable, retryable)
                 self.manager.server.put_document.assert_called_once()
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_finalize_reports_a_genuinely_deleted_plan_as_missing(self):
+        """Only CouchDB's own 404 means the plan is gone."""
+        request = self._finalization(self._stored_doc())
+        self._get_returns(MockApiException(404, "missing"))
+
+        result = self.manager.finalize_execution(request)
+
+        self.assertEqual(result.reason, SupersessionReason.PLAN_MISSING)
+        self.manager.server.put_document.assert_not_called()
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_finalize_refuses_to_read_a_malformed_response_as_a_missing_plan(self):
+        """A non-document answer says nothing about whether the plan exists.
+
+        Reporting supersession here would tell the caller its completed
+        execution can never be recorded, and stop it from trying again.
+        """
+        request = self._finalization(self._stored_doc())
+        for body in ("", "not json", [], [{"_id": "x"}], None, 42):
+            with self.subTest(body=repr(body)):
+                self._get_returns(body)
+                self.manager.server.put_document.reset_mock()
+
+                with self.assertRaises(PlanStoreError) as ctx:
+                    self.manager.finalize_execution(request)
+
+                self.assertFalse(ctx.exception.retryable)
+                self.manager.server.put_document.assert_not_called()
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_finalize_refuses_a_malformed_response_after_a_conflict(self):
+        """The reread that interprets a conflict must be trustworthy too."""
+        doc = self._stored_doc()
+        request = self._finalization(doc)
+        self._get_returns(doc, "<html>proxy error</html>")
+        self._put_returns(error=MockApiException(409, "Conflict"))
+
+        with self.assertRaises(PlanStoreError):
+            self.manager.finalize_execution(request)
+
+    @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
+    def test_ensure_plan_generation_refuses_a_malformed_response(self):
+        """A generation is never assigned on top of an unreadable answer."""
+        self._get_returns(["not", "a", "document"])
+
+        with self.assertRaises(PlanStoreError):
+            self.manager.ensure_plan_generation("pln_tenx_P12345_v1")
+
+        self.manager.server.put_document.assert_not_called()
 
     def test_finalize_response_without_a_revision_is_a_plan_store_error(self):
         """A write whose new revision is unknown is not reported as committed."""
         doc = self._stored_doc()
-        self.manager.fetch_document_by_id = Mock(return_value=doc)
+        self._get_returns(doc)
         self._put_returns({"ok": True})
 
         with self.assertRaises(PlanStoreError):
@@ -864,7 +940,7 @@ class TestPlanDBManager(unittest.TestCase):
         """A legacy document gains a generation at the fetched revision."""
         legacy = self._stored_doc()
         del legacy["plan_generation"]
-        self.manager.fetch_document_by_id = Mock(return_value=legacy)
+        self._get_returns(legacy)
         self._put_returns({"ok": True, "rev": "2-def"})
 
         doc = self.manager.ensure_plan_generation(legacy["_id"])
@@ -883,7 +959,7 @@ class TestPlanDBManager(unittest.TestCase):
         legacy = self._stored_doc()
         del legacy["plan_generation"]
         winner = self._stored_doc(_rev="2-xyz", plan_generation="gen-winner")
-        self.manager.fetch_document_by_id = Mock(side_effect=[legacy, winner])
+        self._get_returns(legacy, winner)
         self._put_returns(error=MockApiException(409, "Conflict"))
 
         doc = self.manager.ensure_plan_generation(legacy["_id"])
@@ -894,9 +970,7 @@ class TestPlanDBManager(unittest.TestCase):
     @patch("lib.couchdb.plan_db_manager.ApiException", MockApiException)
     def test_ensure_plan_generation_read_failure_is_a_plan_store_error(self):
         """A failed read is a backend failure, not a missing plan."""
-        self.manager.fetch_document_by_id = Mock(
-            side_effect=MockApiException(500, "Server error")
-        )
+        self._get_returns(MockApiException(500, "Server error"))
         with self.assertRaises(PlanStoreError):
             self.manager.ensure_plan_generation("pln_tenx_P12345_v1")
 
