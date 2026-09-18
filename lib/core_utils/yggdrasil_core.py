@@ -8,7 +8,13 @@ from typing import Any
 
 from lib.core_utils.event_types import EventType
 from lib.core_utils.logging_utils import custom_logger
-from lib.core_utils.plan_eligibility import is_plan_eligible
+from lib.core_utils.plan_execution import (
+    DAEMON_CLAIM,
+    ExecutionClaim,
+    ExecutionResult,
+    ExecutionStatus,
+    PlanExecutionCoordinator,
+)
 from lib.core_utils.runtime_paths import resolve_event_spool, resolve_work_root
 from lib.core_utils.singleton_decorator import singleton
 from lib.couchdb.project_db_manager import ProjectDBManager
@@ -113,6 +119,15 @@ class YggdrasilCore:
         )
 
         self._init_db_managers()
+
+        # One coordinator for both execution callers (daemon and run-once):
+        # admission from one plan snapshot, at most one attempt per plan in
+        # flight, result interpretation and bounded finalization.
+        self.plan_executions = PlanExecutionCoordinator(
+            engine=self.engine,
+            plan_store=self.storage.plans,
+            logger=self._logger,
+        )
 
         self._logger.info("YggdrasilCore initialized.")
 
@@ -656,7 +671,8 @@ class YggdrasilCore:
         managed by their respective CLI sessions.
 
         The watcher emits PLAN_EXECUTION_EVENT for eligible plans, which
-        triggers execute_approved_plan() via handle_plan_execution_event().
+        hands the plan to the execution coordinator via
+        _handle_plan_execution_event().
         """
         poll_interval = self.config.get("plan_watcher_poll_interval", 5.0)
 
@@ -680,10 +696,14 @@ class YggdrasilCore:
         Handle EventType.PLAN_EXECUTION from PlanWatcher.
 
         This is the callback invoked when PlanWatcher detects an eligible plan.
-        It schedules execution via execute_approved_plan().
+        It hands the plan to the execution coordinator without waiting. The
+        event only prompts a check: the plan is admitted from a fresh read of
+        its document, never from the document the event carries, and an event
+        for a plan already in flight is checked again once that attempt is
+        done rather than run alongside it.
 
         Args:
-            event: YggdrasilEvent with payload containing plan_doc_id and plan_doc
+            event: YggdrasilEvent with payload containing plan_doc_id
         """
         if event.event_type != EventType.PLAN_EXECUTION:
             self._logger.warning(
@@ -693,7 +713,6 @@ class YggdrasilCore:
 
         payload = event.payload or {}
         plan_doc_id = payload.get("plan_doc_id")
-        plan_doc = payload.get("plan_doc")
 
         if not plan_doc_id:
             self._logger.error("Plan execution event missing 'plan_doc_id'")
@@ -705,86 +724,9 @@ class YggdrasilCore:
             event.source,
         )
 
-        # Schedule execution (non-blocking)
-        asyncio.create_task(self._execute_approved_plan(plan_doc_id, plan_doc))
-
-    async def _execute_approved_plan(
-        self,
-        plan_doc_id: str,
-        plan_doc: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Execute an approved plan via Engine and update executed_run_token.
-
-        This is the core execution logic triggered by PlanWatcher events.
-        On success, updates executed_run_token to prevent re-execution.
-        On failure, leaves token unchanged so plan remains eligible for retry.
-
-        Args:
-            plan_doc_id: The plan document ID in yggdrasil_plans
-            plan_doc: Optional plan document (if already fetched by watcher)
-        """
-        try:
-            # Fetch plan document if not provided
-            if plan_doc is None:
-                plan_doc = self.plan_dbm.fetch_plan(plan_doc_id)
-                if not plan_doc:
-                    self._logger.error(
-                        "Plan document '%s' not found; cannot execute", plan_doc_id
-                    )
-                    return
-
-            # Re-verify eligibility (race protection)
-            if not is_plan_eligible(plan_doc):
-                self._logger.info(
-                    "Plan '%s' no longer eligible; skipping execution", plan_doc_id
-                )
-                return
-
-            # Get the Plan model for execution
-            plan = self.plan_dbm.fetch_plan_as_model(plan_doc_id)
-            if not plan:
-                self._logger.error(
-                    "Failed to deserialize plan '%s'; cannot execute", plan_doc_id
-                )
-                return
-
-            run_token = plan_doc.get("run_token", 0)
-            realm = plan_doc.get("realm", "unknown")
-
-            self._logger.info(
-                "Executing plan '%s' (realm=%s, run_token=%d)",
-                plan_doc_id,
-                realm,
-                run_token,
-            )
-
-            # Execute via Engine in a thread pool to avoid blocking the event loop.
-            # This keeps watchers responsive during long-running plan executions.
-            await asyncio.to_thread(self.engine.run, plan)
-
-            self._logger.info(
-                "✓ Plan '%s' execution completed successfully", plan_doc_id
-            )
-
-            # Update executed_run_token (marks as executed, prevents re-run)
-            success = self.plan_dbm.update_executed_token(plan_doc_id, run_token)
-            if success:
-                self._logger.info(
-                    "Updated executed_run_token=%d for plan '%s'",
-                    run_token,
-                    plan_doc_id,
-                )
-            else:
-                self._logger.warning(
-                    "Failed to update executed_run_token for plan '%s'; "
-                    "plan may be re-executed on restart",
-                    plan_doc_id,
-                )
-
-        except Exception as exc:
-            self._logger.exception("Failed to execute plan '%s': %s", plan_doc_id, exc)
-            # Token NOT updated → plan remains eligible for retry
+        # Non-blocking: the coordinator keeps the execution task, and logs how
+        # the request was resolved.
+        self.plan_executions.submit(plan_doc_id, DAEMON_CLAIM)
 
     async def _recover_approved_plans(self) -> None:
         """Queue all eligible plans through the configured daemon watcher.
@@ -848,6 +790,11 @@ class YggdrasilCore:
         """
         Stop all watchers gracefully. This sets _running=False, so watchers that
         poll or wait in loops will naturally exit. Then we wait for them to finish.
+
+        Plan executions still in flight are then asked to stop starting new
+        steps, and awaited until their running step has finished and their
+        result is recorded or retained. The ops consumer stops last, so it can
+        still pick up the events those executions publish.
         """
         if not self._running:
             self._logger.debug("YggdrasilCore stop called, but not running.")
@@ -865,6 +812,8 @@ class YggdrasilCore:
         if self.watcher_manager:
             await self.watcher_manager.stop()
             self._logger.info("WatcherManager stopped.")
+
+        await self.plan_executions.drain()
 
         # Stop the ops consumer service
         try:
@@ -1272,11 +1221,32 @@ class YggdrasilCore:
         IMPORTANT: This is the SOLE execution path for run-once mode.
         Whether auto_run=True or False, plans are executed here when eligible.
 
+        Eligible plans are executed one at a time, in the order they became
+        eligible, through the same execution coordinator as the daemon: each
+        is admitted from a fresh read of its document under this session's
+        authority and owner, and a finished request is recorded with the
+        generation-safe finalizer. Execution runs in a worker thread, so the
+        watcher keeps polling meanwhile.
+
         Completion is tracked in session-local memory only. The following
         behaviors are explicitly prohibited:
         - Writing completion markers back to the plan document
         - Modifying executed_run_token for plans not executed by this process
         - Updating plan status during ownership transfer detection
+
+        A plan is completed, for this session, once its execution request is
+        resolved, or once it turns out to be no longer this session's to
+        execute. Every resolution other than a recorded success or such a
+        transfer is an error, including a ``continue_independent`` execution
+        that finished its request with failures, and a result that could not
+        be recorded.
+
+        Ctrl+C stops the session from starting further plans and asks the plan
+        in flight to stop starting further steps; its running step still
+        finishes, and the plan stays eligible. The timeout bounds the wait for
+        plans to become executable, such as waiting for approval. It never
+        interrupts an execution in progress, which is awaited before the
+        session ends.
 
         Args:
             pending_plan_ids: List of plan doc IDs to track
@@ -1284,14 +1254,23 @@ class YggdrasilCore:
             timeout_seconds: Max wait time
 
         Returns:
-            int: Exit code (0=all completed, 1=error/timeout, 130=interrupted)
+            int: Exit code (0=all completed successfully, 1=error/timeout,
+                130=interrupted)
         """
         import signal
+
+        claim = ExecutionClaim(authority="run_once", owner=execution_owner)
 
         # Track completion: plan_doc_id -> completed (True/False)
         # This is SESSION-LOCAL state only; never persisted to DB
         completion_status: dict[str, bool] = {pid: False for pid in pending_plan_ids}
         completion_event = asyncio.Event()
+        # Plans reported eligible and waiting to be executed, in arrival order.
+        # None tells the executing task to stop.
+        requested: asyncio.Queue[str | None] = asyncio.Queue()
+        queued: set[str] = set()
+        executing_plan: str | None = None
+        accepting = True
         interrupted = False
         error_occurred = False
 
@@ -1299,21 +1278,17 @@ class YggdrasilCore:
             """
             Callback when watcher detects an eligible plan.
 
-            Validates ownership, executes if still ours, updates local completion.
+            Queues the plan for execution. Ownership and eligibility are
+            checked again, from the plan document, when it is executed.
             """
-            nonlocal error_occurred
-
-            # Stop launching new plans once interrupted. The plan already
-            # running (if any) finishes; subsequent recovered/live plans are
-            # skipped and left pending in the DB for manual handling. Matters
-            # most for the synchronous recovery pass, which would otherwise
-            # execute every recovered plan before the interrupt is observed.
-            if interrupted:
+            # Stop launching new plans once interrupted or timed out. The plan
+            # already running (if any) finishes; subsequent recovered/live
+            # plans are skipped and left pending in the DB for manual handling.
+            if not accepting:
                 return
 
             payload = event.payload or {}
             plan_doc_id = payload.get("plan_doc_id")
-            plan_doc = payload.get("plan_doc")
 
             # IMPORTANT: Ignore plans not created in THIS session.
             # This prevents "owner collision" side effects (unlikely with UUID, but safe).
@@ -1323,84 +1298,60 @@ class YggdrasilCore:
                 )
                 return
 
-            if completion_status[plan_doc_id]:
-                # Already completed (locally)
+            if completion_status[plan_doc_id] or plan_doc_id in queued:
+                # Already completed (locally), or already waiting its turn
                 return
 
-            # Fetch fresh doc to verify ownership (source of truth)
-            if plan_doc is None:
-                plan_doc = self.plan_dbm.fetch_plan(plan_doc_id)
+            queued.add(plan_doc_id)
+            requested.put_nowait(plan_doc_id)
 
-            if not plan_doc:
-                self._logger.error("Plan '%s' not found in DB", plan_doc_id)
-                error_occurred = True
-                completion_status[plan_doc_id] = True
-                _check_all_completed()
-                return
+        def record_result(result: ExecutionResult) -> None:
+            """Update session-local completion from how a request was resolved."""
+            nonlocal error_occurred
+            plan_doc_id = result.plan_doc_id
 
-            # Check whether an external actor transferred execution ownership.
-            if plan_doc.get("execution_authority") != "run_once":
-                self._logger.info(
-                    "Plan '%s' transferred to daemon; marking completed (no action)",
-                    plan_doc_id,
-                )
-                # Do NOT write anything to DB; just mark locally completed
-                completion_status[plan_doc_id] = True
-                _check_all_completed()
-                return
-
-            if plan_doc.get("execution_owner") != execution_owner:
-                self._logger.warning(
-                    "Plan '%s' owner changed to '%s'; marking completed (no action)",
-                    plan_doc_id,
-                    plan_doc.get("execution_owner"),
-                )
-                completion_status[plan_doc_id] = True
-                _check_all_completed()
-                return
-
-            # Re-verify eligibility from DB (source of truth)
-            if not is_plan_eligible(plan_doc):
+            if result.status is ExecutionStatus.NOT_ELIGIBLE:
                 self._logger.debug(
                     "Plan '%s' no longer eligible; will retry on next poll",
                     plan_doc_id,
                 )
                 return
+            if result.status is ExecutionStatus.CANCELLED:
+                # Interrupted before it finished: left eligible in the DB.
+                return
 
-            # Execute!
-            self._logger.info("Executing plan '%s' via Engine...", plan_doc_id)
-            try:
-                plan = self.plan_dbm.fetch_plan_as_model(plan_doc_id)
-                if not plan:
-                    self._logger.error("Failed to deserialize plan '%s'", plan_doc_id)
-                    error_occurred = True
-                    completion_status[plan_doc_id] = True
-                    _check_all_completed()
-                    return
-
-                run_token = plan_doc.get("run_token", 0)
-                if interrupted:
-                    return
-                self.engine.run(plan)
-                self._logger.info("✓ Plan '%s' execution completed", plan_doc_id)
-
-                # Update executed token (we DID execute this plan)
-                self.plan_dbm.update_executed_token(plan_doc_id, run_token)
-                completion_status[plan_doc_id] = True
-                _check_all_completed()
-
-            except Exception as exc:
-                self._logger.exception(
-                    "Plan '%s' execution failed: %s", plan_doc_id, exc
+            completion_status[plan_doc_id] = True
+            if result.status is ExecutionStatus.NOT_AUTHORIZED:
+                # An external actor transferred execution ownership. Do NOT
+                # write anything to DB; just mark locally completed.
+                self._logger.info(
+                    "Plan '%s' is no longer this session's to execute; marking "
+                    "completed (no action)",
+                    plan_doc_id,
                 )
+            elif not result.succeeded:
                 error_occurred = True
-                completion_status[plan_doc_id] = True
-                _check_all_completed()
+            _check_all_completed()
 
         def _check_all_completed() -> None:
             """Signal completion_event if all plans are done."""
             if all(completion_status.values()):
                 completion_event.set()
+
+        async def execute_requested() -> None:
+            """Execute queued plans, one at a time, until told to stop."""
+            nonlocal executing_plan
+            while (plan_doc_id := await requested.get()) is not None:
+                queued.discard(plan_doc_id)
+                if not accepting or completion_status[plan_doc_id]:
+                    continue
+                self._logger.info("Executing plan '%s' via Engine...", plan_doc_id)
+                executing_plan = plan_doc_id
+                try:
+                    result = await self.plan_executions.execute(plan_doc_id, claim)
+                finally:
+                    executing_plan = None
+                record_result(result)
 
         # Create scoped watcher (filters by execution_owner only)
         scoped_watcher = PlanWatcher(
@@ -1410,16 +1361,21 @@ class YggdrasilCore:
             change_source=self.storage.plan_changes,
             checkpoint_store=self.storage.checkpoints,
             execution_owner_filter=execution_owner,
-            # NOTE: No execution_authority_filter; we check origin in callback
+            # NOTE: No execution_authority_filter; authority is checked on execution
         )
 
         # Handle Ctrl+C
         def handle_interrupt(signum: int, frame: Any) -> None:
-            nonlocal interrupted
+            nonlocal interrupted, accepting
             interrupted = True
+            accepting = False
+            # Thread-safe: only sets each attempt's cancellation event.
+            for plan_doc_id in pending_plan_ids:
+                self.plan_executions.request_cancellation(plan_doc_id)
             completion_event.set()
 
         original_handler = signal.signal(signal.SIGINT, handle_interrupt)
+        executing = asyncio.create_task(execute_requested())
 
         try:
             # Recovery pass before the live watcher starts: plans were saved
@@ -1441,20 +1397,14 @@ class YggdrasilCore:
                     timeout=float(timeout_seconds),
                 )
             except TimeoutError:
-                pending = [pid for pid, done in completion_status.items() if not done]
-                self._logger.error(
-                    "Timeout after %ds waiting for plans: %s\n"
-                    "Plans left in DB for manual handling.",
-                    timeout_seconds,
-                    ", ".join(pending),
-                )
-                await scoped_watcher.stop()
-                watcher_task.cancel()
-                try:
-                    await watcher_task
-                except asyncio.CancelledError:
-                    pass
-                return 1
+                accepting = False
+                if executing_plan is not None:
+                    self._logger.warning(
+                        "Timeout after %ds; waiting for plan '%s', which is "
+                        "executing, before stopping",
+                        timeout_seconds,
+                        executing_plan,
+                    )
 
             # Stop watcher
             await scoped_watcher.stop()
@@ -1464,18 +1414,34 @@ class YggdrasilCore:
             except asyncio.CancelledError:
                 pass
 
-            if interrupted:
-                pending = [pid for pid, done in completion_status.items() if not done]
-                self._logger.info(
-                    "\nInterrupted. Plan(s) left in current state: %s",
-                    ", ".join(pending) if pending else "(all completed)",
-                )
-                return 130  # Standard SIGINT exit code
-
-            return 1 if error_occurred else 0
-
         finally:
+            # Start nothing new, but let the plan in flight, if any, end: in
+            # full, or after its running step when interrupted. Plans still
+            # queued are left pending in the DB for manual handling.
+            accepting = False
+            requested.put_nowait(None)
+            await executing
             signal.signal(signal.SIGINT, original_handler)
+
+        if interrupted:
+            pending = [pid for pid, done in completion_status.items() if not done]
+            self._logger.info(
+                "\nInterrupted. Plan(s) left in current state: %s",
+                ", ".join(pending) if pending else "(all completed)",
+            )
+            return 130  # Standard SIGINT exit code
+
+        pending = [pid for pid, done in completion_status.items() if not done]
+        if pending:
+            self._logger.error(
+                "Timeout after %ds waiting for plans: %s\n"
+                "Plans left in DB for manual handling.",
+                timeout_seconds,
+                ", ".join(pending),
+            )
+            return 1
+
+        return 1 if error_occurred else 0
 
     def handle_event(self, event: YggdrasilEvent) -> None:
         """
@@ -1597,7 +1563,7 @@ class YggdrasilCore:
         In daemon mode, this method ONLY generates and persists the plan.
         Execution is handled exclusively by PlanWatcher, which detects
         eligible plans (approved + run_token > executed_run_token) and
-        triggers execution via _execute_approved_plan().
+        hands it to the execution coordinator via _handle_plan_execution_event().
 
         This separation ensures:
         - Single execution path (no double-execution bugs)

@@ -1197,6 +1197,29 @@ class TestRunDocModeFlags(unittest.TestCase):
             # Should NOT call create_plan_from_doc
             mock_core.create_plan_from_doc.assert_not_called()
 
+    def test_run_doc_run_once_failure_exits_nonzero(self):
+        """A failed run-once execution's exit code reaches the process unchanged.
+
+        run_once_with_watcher returns 1 when a plan's execution did not
+        succeed, including a continue_independent plan that finished its
+        healthy branches but failed overall.
+        """
+        sys.argv = ["yggdrasil", "run-doc", "P12345", "--run-once"]
+
+        with (
+            patch("yggdrasil.cli.ConfigLoader") as mock_config_loader,
+            patch("yggdrasil.cli.YggdrasilCore") as mock_core_class,
+            patch("yggdrasil.cli.YggSession"),
+        ):
+            mock_config_loader.return_value.load_config.return_value = self.mock_config
+            mock_core = Mock()
+            mock_core.run_once_with_watcher.return_value = 1
+            mock_core_class.return_value = mock_core
+
+            with self.assertRaises(SystemExit) as context:
+                main()
+            self.assertEqual(context.exception.code, 1)
+
     def test_run_doc_run_once_short_flag(self):
         """Test short -r flag for run-once mode."""
         sys.argv = ["yggdrasil", "run-doc", "P12345", "-r"]

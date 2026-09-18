@@ -14,11 +14,51 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from lib.core_utils.event_types import EventType
+from lib.core_utils.singleton_decorator import SingletonMeta
 from lib.core_utils.yggdrasil_core import (  # type: ignore[attr-defined]
     YggdrasilCore,
     _generate_run_once_owner,
 )
+from lib.storage.plan_updates import FinalizationResult, FinalizationStatus
 from lib.watchers.abstract_watcher import YggdrasilEvent
+from yggdrasil.flow.attempt import AttemptContext
+from yggdrasil.flow.model import Plan, StepSpec
+from yggdrasil.flow.outcomes import AttemptReport, StepOutcome, TerminationReason
+
+
+def _run_once_plan_doc(plan_id: str, execution_owner: str) -> dict:
+    """An approved, eligible plan document owned by a run-once session."""
+    plan = Plan(
+        plan_id=plan_id,
+        realm="test_realm",
+        scope={"kind": "project", "id": "P1"},
+        steps=[
+            StepSpec(step_id="s1", name="s1", fn_ref="tests.run_once:s1", params={})
+        ],
+    )
+    return {
+        "_id": plan_id,
+        "_rev": "1-test",
+        "status": "approved",
+        "run_token": 1,
+        "executed_run_token": 0,
+        "execution_authority": "run_once",
+        "execution_owner": execution_owner,
+        "plan_generation": f"generation-of-{plan_id}",
+        "plan": plan.to_dict(),
+    }
+
+
+def _complete_attempt(plan: Plan, *, context: AttemptContext) -> AttemptReport:
+    """Stand in for Engine._run_attempt: every step succeeds."""
+    report = context.report
+    for step_id in report.step_ids:
+        report.record_outcome(step_id, StepOutcome.SUCCEEDED)
+    report.finish(TerminationReason.COMPLETED)
+    return report
+
+
+_COMMITTED = FinalizationResult(status=FinalizationStatus.COMMITTED, message="ok")
 
 
 class TestGenerateRunOnceOwner(unittest.TestCase):
@@ -421,7 +461,9 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
-        YggdrasilCore._instance = None
+        # YggdrasilCore is a singleton held by its metaclass; each test needs
+        # its own, with its own engine, storage and execution coordinator.
+        SingletonMeta._instances.clear()
         self.storage_patcher = patch(
             "lib.core_utils.yggdrasil_core.build_internal_storage"
         )
@@ -432,10 +474,9 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
     def tearDown(self):
         """Clean up singleton."""
         self.storage_patcher.stop()
-        YggdrasilCore._instance = None
+        SingletonMeta._instances.clear()
 
     @patch("lib.core_utils.yggdrasil_core.PlanWatcher")
-    @patch("lib.core_utils.yggdrasil_core.is_plan_eligible")
     @patch("lib.core_utils.yggdrasil_core.OpsConsumerService")
     @patch("lib.core_utils.yggdrasil_core.FileSpoolEmitter")
     @patch("lib.core_utils.yggdrasil_core.Engine")
@@ -446,7 +487,6 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         mock_engine_class,
         mock_emitter,
         mock_ops,
-        mock_eligible,
         mock_watcher_cls,
     ):
         """Test that loop returns 1 when timeout occurs."""
@@ -481,7 +521,6 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         )
 
     @patch("lib.core_utils.yggdrasil_core.PlanWatcher")
-    @patch("lib.core_utils.yggdrasil_core.is_plan_eligible")
     @patch("lib.core_utils.yggdrasil_core.OpsConsumerService")
     @patch("lib.core_utils.yggdrasil_core.FileSpoolEmitter")
     @patch("lib.core_utils.yggdrasil_core.Engine")
@@ -492,26 +531,20 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         mock_engine_class,
         mock_emitter,
         mock_ops,
-        mock_eligible,
         mock_watcher_cls,
     ):
         """Ctrl+C during the recovery pass finishes the current plan but
         skips subsequent recovered plans (they stay pending)."""
-        mock_eligible.return_value = True
         execution_owner = "run_once:test-uuid"
+        docs = {
+            plan_id: _run_once_plan_doc(plan_id, execution_owner)
+            for plan_id in ("pln_1", "pln_2")
+        }
 
         def _event(plan_id: str) -> YggdrasilEvent:
-            doc = {
-                "_id": plan_id,
-                "status": "approved",
-                "run_token": 1,
-                "executed_run_token": 0,
-                "execution_authority": "run_once",
-                "execution_owner": execution_owner,
-            }
             return YggdrasilEvent(
                 EventType.PLAN_EXECUTION,
-                {"plan_doc_id": plan_id, "plan_doc": doc},
+                {"plan_doc_id": plan_id, "plan_doc": docs[plan_id]},
                 "test",
             )
 
@@ -531,20 +564,21 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         mock_watcher_cls.return_value = mock_watcher
 
         core = YggdrasilCore(self.mock_config)
-        core.plan_dbm = self.mock_plan_dbm
-        self.mock_plan_dbm.fetch_plan_as_model.return_value = MagicMock()
+        self.mock_storage.plans.ensure_plan_generation.side_effect = docs.get
+        self.mock_storage.plans.finalize_execution.return_value = _COMMITTED
 
         # The first executed plan raises SIGINT (delivered to the loop's own
         # interrupt handler, installed before recovery); the second must be
         # skipped by the interrupt guard.
         executed: list[str] = []
 
-        def _engine_run(plan):
-            executed.append("run")
+        def _engine_run(plan, *, context):
+            executed.append(plan.plan_id)
             if len(executed) == 1:
                 signal.raise_signal(signal.SIGINT)
+            return _complete_attempt(plan, context=context)
 
-        core.engine.run.side_effect = _engine_run
+        core.engine._run_attempt.side_effect = _engine_run
 
         original = signal.getsignal(signal.SIGINT)
         try:
@@ -559,12 +593,11 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
             signal.signal(signal.SIGINT, original)
 
         # Only the first recovered plan executed; the second was skipped.
-        self.assertEqual(len(executed), 1)
-        self.assertEqual(core.engine.run.call_count, 1)
+        self.assertEqual(executed, ["pln_1"])
+        self.assertEqual(core.engine._run_attempt.call_count, 1)
         self.assertEqual(result, 130)
 
     @patch("lib.core_utils.yggdrasil_core.PlanWatcher")
-    @patch("lib.core_utils.yggdrasil_core.is_plan_eligible")
     @patch("lib.core_utils.yggdrasil_core.OpsConsumerService")
     @patch("lib.core_utils.yggdrasil_core.FileSpoolEmitter")
     @patch("lib.core_utils.yggdrasil_core.Engine")
@@ -575,20 +608,11 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         mock_engine_class,
         mock_emitter,
         mock_ops,
-        mock_eligible,
         mock_watcher_cls,
     ):
         """Ctrl+C while loading a plan prevents the subsequent Engine call."""
-        mock_eligible.return_value = True
         execution_owner = "run_once:test-uuid"
-        plan_doc = {
-            "_id": "pln_1",
-            "status": "approved",
-            "run_token": 1,
-            "executed_run_token": 0,
-            "execution_authority": "run_once",
-            "execution_owner": execution_owner,
-        }
+        plan_doc = _run_once_plan_doc("pln_1", execution_owner)
 
         def _recover_side_effect(*, plan_ids):
             self.assertEqual(plan_ids, ["pln_1"])
@@ -609,26 +633,28 @@ class TestRunOnceWatcherLoop(unittest.TestCase):
         mock_watcher_cls.return_value = mock_watcher
 
         core = YggdrasilCore(self.mock_config)
-        core.plan_dbm = self.mock_plan_dbm
-        core.engine.run.reset_mock(side_effect=True)
 
-        def _fetch_plan_as_model(plan_id):
+        def _load_plan(plan_id):
             self.assertEqual(plan_id, "pln_1")
             signal.raise_signal(signal.SIGINT)
-            return MagicMock()
+            return plan_doc
 
-        self.mock_plan_dbm.fetch_plan_as_model.side_effect = _fetch_plan_as_model
+        self.mock_storage.plans.ensure_plan_generation.side_effect = _load_plan
 
-        result = asyncio.run(
-            core._run_once_watcher_loop(
-                pending_plan_ids=["pln_1"],
-                execution_owner=execution_owner,
-                timeout_seconds=5.0,
+        original = signal.getsignal(signal.SIGINT)
+        try:
+            result = asyncio.run(
+                core._run_once_watcher_loop(
+                    pending_plan_ids=["pln_1"],
+                    execution_owner=execution_owner,
+                    timeout_seconds=5.0,
+                )
             )
-        )
+        finally:
+            signal.signal(signal.SIGINT, original)
 
-        core.engine.run.assert_not_called()
-        self.mock_plan_dbm.update_executed_token.assert_not_called()
+        core.engine._run_attempt.assert_not_called()
+        self.mock_storage.plans.finalize_execution.assert_not_called()
         self.assertEqual(result, 130)
 
 

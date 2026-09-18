@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 from lib.core_utils.event_types import EventType
+from lib.core_utils.plan_execution import DAEMON_CLAIM
 from lib.core_utils.singleton_decorator import SingletonMeta
 from lib.core_utils.yggdrasil_core import YggdrasilCore
 from lib.watchers.abstract_watcher import YggdrasilEvent
@@ -768,10 +769,14 @@ class TestYggdrasilCore(unittest.TestCase):
 
     @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
     def test_handle_plan_execution_event_success(self, mock_init_db):
-        """Test handling PLAN_EXECUTION event from PlanWatcher."""
+        """PLAN_EXECUTION events are handed to the coordinator under daemon authority.
+
+        Only the plan ID is passed on: the coordinator admits the plan from a
+        fresh read, never from the document the event carries.
+        """
         # Arrange
         core = YggdrasilCore(self.test_config, self.mock_logger)
-        core._execute_approved_plan = AsyncMock()
+        core.plan_executions = Mock()
 
         plan_event = YggdrasilEvent(
             event_type=EventType.PLAN_EXECUTION,
@@ -783,11 +788,12 @@ class TestYggdrasilCore(unittest.TestCase):
         )
 
         # Act
-        with patch("asyncio.create_task") as mock_create_task:
-            core._handle_plan_execution_event(plan_event)
+        core._handle_plan_execution_event(plan_event)
 
-            # Assert
-            mock_create_task.assert_called_once()
+        # Assert
+        core.plan_executions.submit.assert_called_once_with(
+            "pln_test_123", DAEMON_CLAIM
+        )
 
     @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
     def test_handle_plan_execution_event_wrong_type(self, mock_init_db):
@@ -822,135 +828,6 @@ class TestYggdrasilCore(unittest.TestCase):
 
         # Assert
         self.mock_logger.error.assert_called()
-
-    @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
-    def test_execute_approved_plan_success(self, mock_init_db):
-        """Test successfully executing an approved plan."""
-
-        async def test_execute():
-            # Arrange
-            core = YggdrasilCore(self.test_config, self.mock_logger)
-            core.plan_dbm = Mock()
-            core.plan_dbm.fetch_plan.return_value = {
-                "_id": "pln_test_123",
-                "status": "approved",
-                "run_token": 1,
-                "executed_run_token": 0,
-                "realm": "test_realm",
-            }
-
-            mock_plan_model = Mock()
-            core.plan_dbm.fetch_plan_as_model.return_value = mock_plan_model
-            core.plan_dbm.update_executed_token.return_value = True
-
-            core.engine = Mock()
-            core.engine.run = Mock()
-
-            with (
-                patch(
-                    "lib.core_utils.yggdrasil_core.is_plan_eligible",
-                    return_value=True,
-                ),
-                patch(
-                    "lib.core_utils.yggdrasil_core.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                ) as mock_to_thread,
-            ):
-                # Act
-                await core._execute_approved_plan("pln_test_123")
-
-                # Assert
-                core.plan_dbm.fetch_plan.assert_called_once_with("pln_test_123")
-                mock_to_thread.assert_awaited_once_with(
-                    core.engine.run, mock_plan_model
-                )
-                core.plan_dbm.update_executed_token.assert_called_once_with(
-                    "pln_test_123", 1
-                )
-
-        asyncio.run(test_execute())
-
-    @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
-    def test_execute_approved_plan_not_eligible(self, mock_init_db):
-        """Test skipping execution when plan is not eligible."""
-
-        async def test_execute():
-            # Arrange
-            core = YggdrasilCore(self.test_config, self.mock_logger)
-            core.plan_dbm = Mock()
-            core.plan_dbm.fetch_plan.return_value = {
-                "_id": "pln_test_123",
-                "status": "draft",  # Not approved
-            }
-
-            with patch(
-                "lib.core_utils.yggdrasil_core.is_plan_eligible", return_value=False
-            ):
-                # Act
-                await core._execute_approved_plan("pln_test_123")
-
-                # Assert
-                core.plan_dbm.fetch_plan_as_model.assert_not_called()
-
-        asyncio.run(test_execute())
-
-    @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
-    def test_execute_approved_plan_not_found(self, mock_init_db):
-        """Test executing plan that doesn't exist in database."""
-
-        async def test_execute():
-            # Arrange
-            core = YggdrasilCore(self.test_config, self.mock_logger)
-            core.plan_dbm = Mock()
-            core.plan_dbm.fetch_plan.return_value = None
-
-            # Act
-            await core._execute_approved_plan("pln_nonexistent")
-
-            # Assert
-            self.mock_logger.error.assert_called()
-            core.plan_dbm.fetch_plan_as_model.assert_not_called()
-
-        asyncio.run(test_execute())
-
-    @patch("lib.core_utils.yggdrasil_core.YggdrasilCore._init_db_managers")
-    def test_execute_approved_plan_engine_failure(self, mock_init_db):
-        """Test handling engine execution failure."""
-
-        async def test_execute():
-            # Arrange
-            core = YggdrasilCore(self.test_config, self.mock_logger)
-            core.plan_dbm = Mock()
-            core.plan_dbm.fetch_plan.return_value = {
-                "_id": "pln_test_123",
-                "status": "approved",
-                "run_token": 1,
-                "executed_run_token": 0,
-            }
-            core.plan_dbm.fetch_plan_as_model.return_value = Mock()
-            core.engine = Mock()
-            core.engine.run = Mock()
-
-            with (
-                patch(
-                    "lib.core_utils.yggdrasil_core.is_plan_eligible",
-                    return_value=True,
-                ),
-                patch(
-                    "lib.core_utils.yggdrasil_core.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                    side_effect=Exception("Engine failed"),
-                ),
-            ):
-                # Act
-                await core._execute_approved_plan("pln_test_123")
-
-                # Assert - should log exception but not crash
-                self.mock_logger.exception.assert_called()
-                # Token should NOT be updated on failure
-                core.plan_dbm.update_executed_token.assert_not_called()
-
-        asyncio.run(test_execute())
 
     # =====================================================
     # CREATE_PLAN_FROM_DOC TESTS (--plan-only mode)
