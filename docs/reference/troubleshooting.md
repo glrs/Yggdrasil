@@ -248,9 +248,10 @@ the configured backend.
 
 A daemon with no checkpoint can miss a plan approved before it started.
 After confirming PlanWatcher is running, the operator-provided storage
-integration can re-emit an observable change for that plan. Do this only
-when the plan is definitely not already executing, because re-emitting
-an in-flight plan may schedule it twice.
+integration can re-emit an observable change for that plan. Re-emitting a
+plan that is already executing does not start a second attempt: the daemon
+runs one attempt per plan at a time, and checks the plan again once the
+running attempt is finished, so an already-served request is not rerun.
 
 ---
 
