@@ -8,12 +8,13 @@ or fail them at chosen points. The logic under test is never replaced.
 
 Cross-thread coordination uses ``threading.Event`` handshakes (:class:`Gate`),
 never sleeps. ``WAIT`` is only an upper bound that keeps a broken test from
-hanging.
+hanging, and :class:`Watchdog` fails a test whose event loop stops running.
 """
 
 from __future__ import annotations
 
 import asyncio
+import signal
 import threading
 import unittest
 from collections import Counter
@@ -56,6 +57,10 @@ WAIT = 5.0
 # result unresolved fails the test instead of hanging the suite.
 SCENARIO_LIMIT = 30.0
 
+# How much longer the watchdog waits than a scenario's own limit: it is only
+# for a loop too stuck for that limit to fire.
+WATCHDOG_GRACE = 5.0
+
 # Every step resolves to the same scripted callable; the reference is nominal.
 STEP_REF = "tests.execution:scripted"
 
@@ -69,19 +74,78 @@ RETRYABLE = PlanStoreError("database is locked", retryable=True)
 T = TypeVar("T")
 
 
-def run_bounded(scenario: Coroutine[Any, Any, T]) -> T:
-    """Run a scenario on a fresh event loop, failing after SCENARIO_LIMIT.
+class EventLoopStalled(Exception):
+    """Raised by a :class:`Watchdog` into a main thread that stopped progressing."""
+
+
+class Watchdog:
+    """Fails a test whose main thread stops making progress, from outside it.
+
+    An asyncio timeout fires only when the event loop regains control, which a
+    coroutine spinning without yielding never gives back. A real-time interval
+    timer does not depend on the loop: SIGALRM interrupts the main thread
+    whatever it is doing and raises :class:`EventLoopStalled` there. Because
+    code under test may swallow that exception, the watchdog also records that
+    it fired, and callers assert on :attr:`expired`.
+
+    A no-op off the main thread and where interval timers do not exist.
+
+    Attributes:
+        limit: Seconds before the watchdog fires.
+        expired: Whether it fired.
+    """
+
+    def __init__(self, limit: float) -> None:
+        self.limit = limit
+        self.expired = False
+        self._armed = False
+        self._previous: Any = None
+
+    def __enter__(self) -> Watchdog:
+        self._armed = (
+            hasattr(signal, "setitimer")
+            and threading.current_thread() is threading.main_thread()
+        )
+        if self._armed:
+            self._previous = signal.signal(signal.SIGALRM, self._expire)
+            signal.setitimer(signal.ITIMER_REAL, self.limit)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._previous)
+
+    def _expire(self, signum: int, frame: object) -> None:
+        self.expired = True
+        raise EventLoopStalled(f"no progress within {self.limit}s")
+
+
+def run_bounded(
+    scenario: Coroutine[Any, Any, T], *, limit: float = SCENARIO_LIMIT
+) -> T:
+    """Run a scenario on a fresh event loop, failing instead of hanging.
+
+    ``asyncio.wait_for`` fails a scenario whose awaited result never arrives;
+    a :class:`Watchdog`, a little later, fails one whose event loop stopped
+    running altogether.
 
     Args:
         scenario: The coroutine to run.
+        limit: Seconds the scenario may take.
 
     Returns:
         T: What the scenario returned.
 
     Raises:
-        TimeoutError: If the scenario did not finish within SCENARIO_LIMIT.
+        TimeoutError: If the scenario did not finish within limit.
+        AssertionError: If the event loop stopped making progress.
     """
-    return asyncio.run(asyncio.wait_for(scenario, SCENARIO_LIMIT))
+    with Watchdog(limit + WATCHDOG_GRACE) as watchdog:
+        result = asyncio.run(asyncio.wait_for(scenario, limit))
+    if watchdog.expired:
+        raise AssertionError("the event loop stopped making progress")
+    return result
 
 
 class Gate:
@@ -173,7 +237,7 @@ class ScriptedSteps:
 
         self.fn = scripted
 
-    def fail(self, step_id: str, exc: Exception) -> None:
+    def fail(self, step_id: str, exc: BaseException) -> None:
         """Make a step raise exc when invoked."""
 
         def raise_(ctx: StepContext) -> None:

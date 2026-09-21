@@ -10,11 +10,15 @@ and would fail if that guarantee were removed:
   and a ``continue_independent`` preflight rejection are recorded, and every
   other ending leaves the plan eligible;
 - at most one attempt per plan is in flight, excluded until its result is
-  recorded or retained, and a request arriving meanwhile is rechecked, not lost;
+  recorded or retained; a request arriving meanwhile is rechecked, not lost,
+  and runs only if it is newer than the request that attempt ran;
 - cancellation, of a caller or of the coordination itself, stops new steps but
-  never abandons a running worker or a drained result;
+  never abandons a running worker or a drained result; a coordination
+  cancelled before it starts still releases its plan, and a CancelledError a
+  step raises itself ends that attempt without stalling anything else;
 - finalization is retried within its bound, never re-executes the plan, and a
-  result it cannot record is kept and settled before the plan runs again.
+  result it cannot record is kept and settled before the plan runs again, with
+  one more bounded retry cycle per newer run request.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from tests.execution_support import (
     WAIT,
     CouchBackend,
     ExecutionTestCase,
+    Gate,
     chain_plan,
     lanes_plan,
     make_plan,
@@ -405,6 +410,63 @@ class TestExclusion(ExecutionTestCase):
         self.assertEqual(second.status, ExecutionStatus.NOT_ELIGIBLE)
         self.assertEqual(len(self.engine.contexts), 1)
 
+    def test_duplicate_of_an_unfinished_attempt_is_not_run_again(self):
+        # The duplicate arrived while the attempt was running, so it asks for
+        # the very request that attempt ran. Running it again would retry a
+        # failure nobody asked to retry; a later request still retries it.
+        gate = Gate()
+
+        def fail_at_gate(ctx):
+            gate.pass_through()
+            raise RuntimeError("boom")
+
+        self.steps.behaviors["a"] = fail_at_gate
+        self.save()
+
+        async def scenario():
+            first = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            await gate.reached()
+            duplicate = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            gate.release()
+            return await first, await duplicate
+
+        first, duplicate = run_bounded(scenario())
+
+        self.assertEqual(first.status, ExecutionStatus.UNFINISHED)
+        self.assertEqual(duplicate.status, ExecutionStatus.DUPLICATE)
+        self.assertEqual(self.journal, ["read", "attempt:0", "read"])
+        self.assert_unconsumed()
+        self.assertEqual(self.execute().status, ExecutionStatus.UNFINISHED)
+        self.assertEqual(len(self.engine.contexts), 2)
+
+    def test_newer_request_after_an_unfinished_attempt_still_runs(self):
+        gate = Gate()
+        attempts = []
+
+        def fail_first_attempt_at_gate(ctx):
+            attempts.append(ctx.run_id)
+            if len(attempts) == 1:
+                gate.pass_through()
+                raise RuntimeError("boom")
+
+        self.steps.behaviors["a"] = fail_first_attempt_at_gate
+        self.save()
+
+        async def scenario():
+            first = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            await gate.reached()
+            await asyncio.to_thread(self.request_rerun)
+            newer = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            gate.release()
+            return await first, await newer
+
+        first, newer = run_bounded(scenario())
+
+        self.assertEqual(first.status, ExecutionStatus.UNFINISHED)
+        self.assertTrue(newer.succeeded)
+        self.assertEqual(newer.report.run_token, 1)
+        self.assert_recorded(newer, run_token=1)
+
 
 class TestCancellation(ExecutionTestCase):
     """Cancellation stops new steps; it never abandons a worker or a result."""
@@ -571,6 +633,58 @@ class TestCancellation(ExecutionTestCase):
         self.assertEqual(self.delays, [0.5])
         self.assertEqual(self.store.calls["finalize"], 2)
         self.assert_recorded(result)
+
+    def test_step_raising_cancelled_error_neither_stalls_nor_holds_the_plan(self):
+        # A step's own asyncio.CancelledError, say from asynchronous subwork it
+        # ran and cancelled, ends that attempt as cancelled. It is not a
+        # cancellation of the coordination: nothing else may stop because of
+        # it, least of all the event loop every other plan runs on.
+        self.steps.fail("a", asyncio.CancelledError("subwork was cancelled"))
+        self.save()
+        self.save(make_plan(spec("x"), plan_id="pln_other"))
+
+        async def scenario():
+            first = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            other = self.coordinator.submit("pln_other", DAEMON_CLAIM)
+            return await first, await other
+
+        first, other = run_bounded(scenario(), limit=WAIT)
+
+        self.assertEqual(first.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(first.report.termination_reason, TerminationReason.CANCELLED)
+        self.assertTrue(other.succeeded)
+        context = next(c for c in self.engine.contexts if c.plan_id == PLAN_ID)
+        self.assertFalse(context.cancellation_requested)
+        self.assertFalse(self.coordinator.is_in_flight(PLAN_ID))
+        self.assert_unconsumed()
+
+    def test_coordination_cancelled_before_it_starts_releases_the_plan(self):
+        # Anything that cancels the coordination task before its first step,
+        # such as an explicit cancel right after submission, skips its body
+        # and with it the cleanup that body would do.
+        self.save()
+
+        async def scenario():
+            first = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            duplicate = self.coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            coordination = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"plan-execution:{PLAN_ID}"
+            )
+            coordination.cancel()
+            await self.coordinator.drain()
+            self.assertFalse(self.coordinator.is_in_flight(PLAN_ID))
+            return await first, await duplicate
+
+        first, duplicate = run_bounded(scenario(), limit=WAIT)
+
+        self.assertEqual(first.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(duplicate.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(self.journal, [])
+        self.assert_unconsumed()
+        # The plan is free again: a later request runs normally.
+        self.assertTrue(self.execute().succeeded)
 
 
 class TestFinalizationRetries(ExecutionTestCase):
@@ -744,7 +858,7 @@ class TestFinalizationRetries(ExecutionTestCase):
 
     def test_newer_request_waits_while_the_pending_result_cannot_be_recorded(self):
         self.save()
-        self.store.fail_finalize(*[RETRYABLE] * 6)
+        self.store.fail_finalize(*[RETRYABLE] * 9)
         pending = self.execute()
         self.request_rerun()
 
@@ -759,6 +873,25 @@ class TestFinalizationRetries(ExecutionTestCase):
         )
         self.assertEqual(self.stored()["run_token"], 1)
         self.assertEqual(self.stored()["executed_run_token"], -1)
+
+        # Run token 1 has had its retry cycle; duplicates of it get none.
+        for _ in range(3):
+            duplicate = self.execute()
+            self.assertEqual(duplicate.status, ExecutionStatus.FINALIZATION_PENDING)
+        self.assertEqual(self.store.calls["finalize"], 6)
+        self.assertEqual(len(self.engine.contexts), 1)
+
+        # Only a newer request authorizes one more bounded cycle.
+        self.request_rerun()
+        self.assertEqual(self.execute().status, ExecutionStatus.FINALIZATION_PENDING)
+        self.assertEqual(self.store.calls["finalize"], 9)
+        self.execute()
+        self.assertEqual(self.store.calls["finalize"], 9)
+        self.assertEqual(len(self.engine.contexts), 1)
+        self.assertEqual(
+            self.coordinator.pending_finalization(PLAN_ID).execution_id,
+            pending.report.execution_id,
+        )
 
     def test_regenerated_plan_settles_the_pending_result_without_writing(self):
         self.save()

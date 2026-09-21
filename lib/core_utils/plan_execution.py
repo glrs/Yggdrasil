@@ -29,9 +29,12 @@ Exclusion:
     pending, not merely until the worker returns, so a duplicate request that
     arrives while a result is being finalized cannot start a second attempt.
     Such a request is not dropped either: once the active attempt is done, the
-    plan is checked again from a fresh snapshot, which runs a newer request and
-    finds an already-served one ineligible. Other processes and hosts are not
-    covered; ``DaemonLock`` keeps to one daemon per mode on a host.
+    plan is checked again from a fresh snapshot. That check runs a newer
+    request, finds an already-served one ineligible, and does not run the
+    request just attempted a second time, even when that attempt left it
+    eligible: the duplicate arrived while that very request was running. Other
+    processes and hosts are not covered; ``DaemonLock`` keeps to one daemon per
+    mode on a host.
 
 Cancellation:
     Cancelling the task that awaits a worker thread does not stop the worker,
@@ -43,7 +46,10 @@ Cancellation:
     asks the engine to stop starting new steps, keeps waiting for the worker,
     and then interprets and records whatever the attempt reached. An attempt
     interrupted before it drained leaves its request unconsumed; one that
-    drained is recorded like any other.
+    drained is recorded like any other. A task cancelled before it ever ran
+    releases its plan through its completion callback instead, since its body
+    never runs. A CancelledError that a worker raises itself, from a step's own
+    asynchronous work say, cancels nothing: it ends that attempt as cancelled.
 
 Finalization retries:
     Each attempt is one call to ``PlanStore.finalize_execution``, which rereads
@@ -57,16 +63,17 @@ Finalization retries:
 
     When no attempt records the result, it is kept in memory as a pending
     finalization, and that is established before the plan's guard is released.
-    While it is pending, the plan is never executed again. A repeated request
-    for the same run token changes nothing, and starts no further retries. A
-    change of generation or authority, or the result turning out to be recorded
-    after all, is recognized by reading the plan alone, and ends the pending
-    state without writing anything. A newer run token in the same generation
-    retries the pending finalization first, and runs the newer request only
-    once the old result is recorded or definitively rejected. A pending result
-    does not survive a restart; the request is then still eligible, so it may
-    run again, and realm idempotency remains the protection against repeated
-    side effects.
+    While it is pending, the plan is never executed again. A change of
+    generation or authority, or the result turning out to be recorded after
+    all, is recognized by reading the plan alone, and ends the pending state
+    without writing anything. A newer run token in the same generation retries
+    the pending finalization first, with one more bounded cycle, and runs the
+    newer request only once the old result is recorded or definitively
+    rejected. Each newer run token buys one such cycle: repeated requests, for
+    the pending run token or for one that already had its cycle, change
+    nothing and retry nothing. A pending result does not survive a restart;
+    the request is then still eligible, so it may run again, and realm
+    idempotency remains the protection against repeated side effects.
 """
 
 from __future__ import annotations
@@ -77,7 +84,7 @@ import logging
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, TypeVar
 
@@ -169,6 +176,10 @@ class ExecutionStatus(str, Enum):
             authority or owner differs from the caller's claim.
         NOT_ELIGIBLE: The plan is not approved, or its current request was
             already served.
+        DUPLICATE: The request is the one the plan's previous attempt ran; it
+            arrived while that attempt was in flight. It is not run a second
+            time: that attempt's result stands for it. An unfinished request
+            stays eligible, so a later event still retries it.
         INVALID_DOCUMENT: The plan document is eligible but does not describe
             an executable request. Nothing ran; the plan stays eligible.
         ADMISSION_FAILED: The plan store could not provide the snapshot to
@@ -180,9 +191,11 @@ class ExecutionStatus(str, Enum):
             than by cancellation: a ``fail_fast`` step failure or preflight
             rejection, or an orchestration failure. Nothing was recorded; the
             plan stays eligible.
-        CANCELLED: The attempt was interrupted before it drained, or never
-            started because cancellation came first. Nothing was recorded; the
-            plan stays eligible.
+        CANCELLED: The attempt was interrupted before it drained: by
+            cooperative cancellation, or by a step raising a control-flow
+            exception such as its own ``asyncio.CancelledError``. Or it never
+            started, because cancellation came first. Nothing was recorded;
+            the plan stays eligible.
         FINALIZATION_PENDING: The attempt finished its request but its result
             could not be recorded. It is retained in memory, and the plan is
             not executed again while it is.
@@ -194,6 +207,7 @@ class ExecutionStatus(str, Enum):
     NOT_FOUND = "not_found"
     NOT_AUTHORIZED = "not_authorized"
     NOT_ELIGIBLE = "not_eligible"
+    DUPLICATE = "duplicate"
     INVALID_DOCUMENT = "invalid_document"
     ADMISSION_FAILED = "admission_failed"
     FINALIZED = "finalized"
@@ -260,12 +274,18 @@ class _PendingFinalization:
     """A finished request whose result could not be recorded yet.
 
     Attributes:
-        request: The finalization to record.
+        request: The finalization to record. Its identity never changes while
+            it is pending.
         report: The report of the attempt that finished the request.
+        retried_for: The newest run token whose request has already been
+            spent on retrying this finalization, if any. Each newer request
+            buys at most one bounded retry cycle, so repeated events for a run
+            token that already had its cycle retry nothing.
     """
 
     request: ExecutionFinalization
     report: AttemptReport
+    retried_for: int | None = None
 
 
 @dataclass
@@ -283,14 +303,21 @@ class _PlanSlot:
             A ``threading.Event``, because the engine reads it from the worker
             thread and signal handlers may set it.
         task: The coordination task.
+        started: Whether the coordination task has begun running. Until it
+            has, only the task's completion callback can release the slot.
         next_result: Result of the next cycle, if a request arrived while the
             current cycle was running; every such request shares it.
+        attempted: Plan generation and run token of the last request this
+            slot ran an attempt for, so that a request arriving during that
+            attempt cannot run the same request again.
     """
 
     claim: ExecutionClaim
     cancel_event: threading.Event = field(default_factory=threading.Event)
     task: asyncio.Task[None] | None = None
+    started: bool = False
     next_result: asyncio.Future[ExecutionResult] | None = None
+    attempted: tuple[str, int] | None = None
 
 
 class _CycleStopped(Exception):
@@ -310,6 +337,21 @@ def _resolve(future: asyncio.Future[ExecutionResult], result: ExecutionResult) -
     """Set a result future unless it is already done."""
     if not future.done():
         future.set_result(result)
+
+
+def _cancellation_requested_of_current_task() -> bool:
+    """Whether the running task has been asked to cancel.
+
+    Tells a cancellation of this task apart from a CancelledError that some
+    other code raised, such as a worker's: only ``Task.cancel()`` counts here.
+    The count is never withdrawn, so once cancelled, a task stays cancelled
+    for this check, which is what its coordination needs.
+
+    Returns:
+        bool: True if ``cancel()`` has been called on the current task.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def _describe_attempt(report: AttemptReport) -> str:
@@ -334,6 +376,7 @@ _LOG_LEVELS: dict[ExecutionStatus, int] = {
     ExecutionStatus.NOT_FOUND: logging.ERROR,
     ExecutionStatus.NOT_AUTHORIZED: logging.INFO,
     ExecutionStatus.NOT_ELIGIBLE: logging.INFO,
+    ExecutionStatus.DUPLICATE: logging.INFO,
     ExecutionStatus.INVALID_DOCUMENT: logging.ERROR,
     ExecutionStatus.ADMISSION_FAILED: logging.ERROR,
     ExecutionStatus.UNFINISHED: logging.ERROR,
@@ -451,6 +494,9 @@ class PlanExecutionCoordinator:
             self._coordinate(plan_doc_id, slot, result),
             name=f"plan-execution:{plan_doc_id}",
         )
+        slot.task.add_done_callback(
+            functools.partial(self._release_if_never_started, plan_doc_id, slot, result)
+        )
         return result
 
     async def execute(self, plan_doc_id: str, claim: ExecutionClaim) -> ExecutionResult:
@@ -564,11 +610,11 @@ class PlanExecutionCoordinator:
             slot: The plan's registry slot.
             result: Future for the first cycle's result.
         """
+        # From here on this body owns the slot, and its cleanup releases it.
+        slot.started = True
         try:
             while True:
-                outcome = await self._run_cycle(
-                    plan_doc_id, slot.claim, slot.cancel_event
-                )
+                outcome = await self._run_cycle(plan_doc_id, slot)
                 self._log_result(outcome)
                 _resolve(result, outcome)
                 # The next result stays on the slot until it is handed over, so
@@ -603,26 +649,74 @@ class PlanExecutionCoordinator:
             if self._slots.get(plan_doc_id) is slot:
                 del self._slots[plan_doc_id]
 
-    async def _run_cycle(
-        self, plan_doc_id: str, claim: ExecutionClaim, cancel_event: threading.Event
-    ) -> ExecutionResult:
+    def _release_if_never_started(
+        self,
+        plan_doc_id: str,
+        slot: _PlanSlot,
+        result: asyncio.Future[ExecutionResult],
+        task: asyncio.Task[None],
+    ) -> None:
+        """Release a plan whose coordination task ended before it began running.
+
+        A task cancelled before its first step never runs its coroutine at all,
+        so the cleanup :meth:`_coordinate` would do never happens either. This
+        completion callback does it instead: the waiting requests resolve as
+        cancelled, since nothing ran, and the slot is removed. A coordination
+        that did start is left entirely to its own cleanup, which releases the
+        plan only once its last result is recorded or retained.
+
+        Args:
+            plan_doc_id: The plan document.
+            slot: The slot the task was created for.
+            result: Future for the first cycle's result.
+            task: The finished coordination task.
+        """
+        if slot.started:
+            return
+        skipped = ExecutionResult(
+            plan_doc_id,
+            ExecutionStatus.CANCELLED,
+            f"Plan '{plan_doc_id}' was not executed: its coordination was "
+            "cancelled before it started",
+        )
+        self._log_result(skipped)
+        for waiting in (result, slot.next_result):
+            if waiting is not None:
+                _resolve(waiting, skipped)
+        slot.next_result = None
+        if self._slots.get(plan_doc_id) is slot:
+            del self._slots[plan_doc_id]
+
+    async def _run_cycle(self, plan_doc_id: str, slot: _PlanSlot) -> ExecutionResult:
         """Admit, execute and finalize one request for a plan.
 
         Args:
             plan_doc_id: The plan document.
-            claim: Which plans the caller may execute.
-            cancel_event: The slot's cooperative cancellation signal.
+            slot: The plan's registry slot, whose claim the request is admitted
+                under.
 
         Returns:
             ExecutionResult: How the request was resolved.
         """
+        cancel_event = slot.cancel_event
         try:
             doc = await self._read_snapshot(plan_doc_id, cancel_event)
             if plan_doc_id in self._pending:
                 await self._settle_pending(plan_doc_id, doc, cancel_event)
                 # Settling may have written the plan; admit from a fresh read.
                 doc = await self._read_snapshot(plan_doc_id, cancel_event)
-            admission = self._admit(plan_doc_id, doc, claim)
+            admission = self._admit(plan_doc_id, doc, slot.claim)
+            request = (admission.plan_generation, admission.run_token)
+            if request == slot.attempted:
+                raise _CycleStopped(
+                    ExecutionResult(
+                        plan_doc_id,
+                        ExecutionStatus.DUPLICATE,
+                        f"Plan '{plan_doc_id}': run_token {admission.run_token} "
+                        "was being attempted when this request arrived, so it "
+                        "is not run again",
+                    )
+                )
             if cancel_event.is_set():
                 raise _CycleStopped(
                     ExecutionResult(
@@ -632,6 +726,7 @@ class PlanExecutionCoordinator:
                         "requested before its attempt started",
                     )
                 )
+            slot.attempted = request
             return await self._execute(plan_doc_id, admission, cancel_event)
         except _CycleStopped as stopped:
             return stopped.result
@@ -907,10 +1002,12 @@ class PlanExecutionCoordinator:
 
         Reading the plan is enough to settle it when the plan was deleted or
         regenerated, its authority changed, or the result turns out to be
-        recorded after all. A request for the same run token leaves it
-        pending, untouched. A newer run token in the same generation retries
+        recorded after all. A newer run token in the same generation retries
         the pending finalization first: that newer request is the explicit
-        action that pending results wait for.
+        action that pending results wait for, and it buys exactly one bounded
+        retry cycle. Any other request, for the pending run token or for one
+        that already had its cycle, leaves the pending result untouched and
+        retries nothing, however often it is repeated.
 
         Args:
             plan_doc_id: The plan document.
@@ -963,6 +1060,11 @@ class PlanExecutionCoordinator:
                 "not executing the plan again; a newer run request retries the "
                 "finalization first"
             )
+        if pending.retried_for is not None and requested_token <= pending.retried_for:
+            raise still_pending(
+                f"run_token {requested_token} already had its retry, which "
+                "failed; only a newer run request retries it again"
+            )
 
         self._logger.info(
             "Plan '%s' has a newer run request (run_token %d); recording the "
@@ -971,10 +1073,14 @@ class PlanExecutionCoordinator:
             requested_token,
             request.run_token,
         )
+        # Spent before the cycle starts, so this request buys one cycle however
+        # the cycle ends.
+        self._pending[plan_doc_id] = replace(pending, retried_for=requested_token)
         final = await self._finalize(request, cancel_event)
         if final is None:
             raise still_pending(
-                f"recording it failed again, so run_token {requested_token} waits"
+                f"recording it failed again, so run_token {requested_token} "
+                "waits; only a newer run request retries it again"
             )
         del self._pending[plan_doc_id]
 
@@ -1070,13 +1176,21 @@ class PlanExecutionCoordinator:
     async def _outlast_cancellation(
         self, future: asyncio.Future[T], cancel_event: threading.Event, what: str
     ) -> T:
-        """Wait for a worker thread's result, even if this task is cancelled.
+        """Wait for a worker thread's outcome, even if this task is cancelled.
 
         The future comes from ``run_in_executor``, not from a task, so shutdown
         routines that cancel every task never cancel it; and awaiting it through
         ``asyncio.shield`` means cancelling this task cannot cancel it either.
-        Cancellation is turned into a cooperative cancellation request, and the
-        wait goes on.
+
+        A CancelledError at the await means one of two things, and whether the
+        future has finished tells them apart. While it has not, this task was
+        cancelled and the worker is still running: that becomes a cooperative
+        cancellation request, and the wait goes on. Once it has, the worker's
+        own outcome is returned or raised unchanged, including a CancelledError
+        that the worker raised itself, which ends its attempt but cancels
+        nothing here. A finished future is never awaited again: that would
+        re-raise its exception without yielding, and a loop doing so would
+        stall the event loop.
 
         Args:
             future: The worker thread's future.
@@ -1087,22 +1201,18 @@ class PlanExecutionCoordinator:
             T: The worker's result.
 
         Raises:
-            asyncio.CancelledError: Only if the future itself was cancelled.
-            BaseException: Whatever the worker raised.
+            BaseException: Whatever the worker raised, CancelledError included.
         """
-        while True:
+        while not future.done():
             try:
-                return await asyncio.shield(future)
+                await asyncio.shield(future)
             except asyncio.CancelledError:
-                if future.cancelled():
-                    raise
-                if not cancel_event.is_set():
-                    cancel_event.set()
-                    self._logger.warning(
-                        "Cancelled while %s; no further steps will be started, and "
-                        "the result is still awaited and recorded",
-                        what,
-                    )
+                # Noted even when the worker finished at the same moment: its
+                # outcome still stands, but this coordination starts nothing
+                # further.
+                if _cancellation_requested_of_current_task():
+                    self._note_cancellation(cancel_event, what)
+        return future.result()
 
     async def _wait_before_retry(
         self, delay: float, cancel_event: threading.Event
@@ -1120,10 +1230,25 @@ class PlanExecutionCoordinator:
         try:
             await self._sleep(delay)
         except asyncio.CancelledError:
-            cancel_event.set()
-            self._logger.warning(
-                "Cancelled during a finalization backoff; retrying at once"
+            self._note_cancellation(
+                cancel_event, "waiting to retry a finalization, which is retried now"
             )
+
+    def _note_cancellation(self, cancel_event: threading.Event, what: str) -> None:
+        """Turn a cancellation of this task into a cooperative cancellation request.
+
+        Args:
+            cancel_event: The slot's cooperative cancellation signal.
+            what: What was being awaited, for the log.
+        """
+        if cancel_event.is_set():
+            return
+        cancel_event.set()
+        self._logger.warning(
+            "Cancelled while %s; no further steps or requests will be started, "
+            "and whatever the attempt reached is still awaited and recorded",
+            what,
+        )
 
     def _log_result(self, result: ExecutionResult) -> None:
         """Log a request's resolution at a level matching it."""
