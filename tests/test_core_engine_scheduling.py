@@ -27,7 +27,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from yggdrasil.core.engine import ATTEMPT_REPORT_EVENT, Engine
+from yggdrasil.core.engine import Engine
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.errors import (
     AttemptCancelledError,
@@ -37,6 +37,11 @@ from yggdrasil.flow.errors import (
     PreflightValidationError,
     StepError,
     TransientStepError,
+)
+from yggdrasil.flow.events.attempt_records import (
+    ATTEMPT_REPORT_EVENT,
+    ATTEMPT_STARTED_EVENT,
+    record_filename,
 )
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import (
@@ -366,6 +371,7 @@ class TestFailFastCompatibility(SchedulingTestCase):
         self.assertEqual(
             self.emitter.types(),
             [
+                ATTEMPT_STARTED_EVENT,
                 "step.started",
                 "step.failed",
                 "step.retry_unimplemented",
@@ -1008,17 +1014,27 @@ class TestAttemptReportPublication(SchedulingTestCase):
         first = engine.run(plan)
         second = engine.run(plan)
 
-        plan_level = sorted((spool / "test" / "sched_plan").glob("*.json"))
-        published = [json.loads(p.read_text(encoding="utf-8")) for p in plan_level]
-        self.assertEqual(len(published), 2)
-        self.assertEqual({p["type"] for p in published}, {ATTEMPT_REPORT_EVENT})
+        plan_dir = spool / "test" / "sched_plan"
         self.assertNotEqual(first.execution_id, second.execution_id)
+        # Each attempt keeps its own start record and report, side by side.
         self.assertEqual(
-            {p["execution_id"] for p in published},
-            {first.execution_id, second.execution_id},
+            sorted(p.name for p in plan_dir.glob("*.json")),
+            sorted(
+                record_filename(attempt.execution_id, event_type)
+                for attempt in (first, second)
+                for event_type in (ATTEMPT_STARTED_EVENT, ATTEMPT_REPORT_EVENT)
+            ),
         )
-        by_id = {p["execution_id"]: p["report"] for p in published}
-        self.assertEqual(by_id[second.execution_id]["step_outcomes"], {"a": "reused"})
+        reports = {
+            record["execution_id"]: record["report"]
+            for record in (
+                json.loads(p.read_text(encoding="utf-8"))
+                for p in plan_dir.glob("*.json")
+            )
+            if record["type"] == ATTEMPT_REPORT_EVENT
+        }
+        self.assertEqual(reports[first.execution_id], first.to_dict())
+        self.assertEqual(reports[second.execution_id]["step_outcomes"], {"a": "reused"})
 
     def assert_publication_failure_recorded(
         self, report: AttemptReport, *, superseded: str | None

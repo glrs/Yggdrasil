@@ -14,6 +14,7 @@ from typing import Any
 
 from lib.core_utils.logging_utils import custom_logger
 from lib.core_utils.runtime_paths import resolve_work_root
+from yggdrasil.core.execution_ids import ExecutionIdAllocator
 from yggdrasil.core.scheduler import DependencyScheduler
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.errors import (
@@ -25,6 +26,15 @@ from yggdrasil.flow.errors import (
     StepError,
     TransientStepError,
 )
+from yggdrasil.flow.events.attempt_records import (
+    ATTEMPT_REPORT_EVENT,
+    ATTEMPT_STARTED_EVENT,
+    STEP_BLOCKED_EVENT,
+    SpoolAttemptHistory,
+    is_record_key,
+    record_filename,
+)
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import (
     CONTINUE_INDEPENDENT_POLICY,
@@ -54,8 +64,8 @@ from yggdrasil.flow.utils.ygg_time import utcnow_compact, utcnow_iso
 
 logger = custom_logger(__name__)
 
-# Type of the one plan-level event published when an execution attempt ends.
-ATTEMPT_REPORT_EVENT = "plan.attempt_report"
+# The reason a step.skipped event gives: the step's earlier success was reused.
+CACHE_HIT_REASON = "cache_hit"
 
 # File in a step's work directory recording the fingerprint of its last
 # successful execution; what makes that success reusable.
@@ -77,19 +87,6 @@ def _short(h: str, n: int = 4) -> str:
 
 def _new_run_id() -> str:
     return f"run_{utcnow_compact()}_{uuid.uuid4().hex[:6]}"
-
-
-def _new_execution_id() -> str:
-    """Allocate an identifier for one execution attempt of a plan.
-
-    Timestamp-prefixed like run IDs, so identifiers sort chronologically while
-    the clock moves forward, with a full UUID suffix for uniqueness. Nothing
-    here protects that ordering against a clock that moves backwards.
-
-    Returns:
-        str: A new execution ID, e.g. "exec_20260916T101500123456Z_<uuid hex>".
-    """
-    return f"exec_{utcnow_compact()}_{uuid.uuid4().hex}"
 
 
 def _step_failure(step_id: str, exc: Exception) -> StepFailure:
@@ -492,11 +489,14 @@ class Engine:
       exists; otherwise its marker is invalidated before it runs again, and
       replaced atomically once it succeeds
     - event spool emission via StepContext (handled by @step decorator), plus
-      one plan-level attempt report per attempt
+      the engine's own records of each attempt: when it started, which steps
+      a failure blocked, and how it ended. Every event of an attempt carries
+      the attempt's execution ID, allocated by :attr:`execution_ids`.
 
     An Engine is long-lived and shared across plans, so it holds no attempt
     state: each attempt's outcomes live in its AttemptContext and a scheduler
-    built for that attempt alone.
+    built for that attempt alone. The one thing its attempts share is the
+    execution-ID allocator, which orders them.
     """
 
     def __init__(
@@ -504,20 +504,45 @@ class Engine:
         work_root: str | Path | None = None,
         emitter: EventEmitter | None = None,
         logger: logging.Logger | None = None,
+        execution_ids: ExecutionIdAllocator | None = None,
     ):
+        """Initialize the engine.
+
+        Args:
+            work_root: Root of the plan and step work directories; resolved
+                from ``$YGG_WORK_ROOT`` or the mode default when omitted.
+            emitter: Where events are published; a FileSpoolEmitter on the
+                resolved event spool when omitted.
+            logger: Logger; a class logger is created when omitted.
+            execution_ids: Allocates each attempt's execution ID. When omitted,
+                an allocator is built that reads back the attempts recorded in
+                the emitter's spool, if the emitter is a FileSpoolEmitter, and
+                keeps ordering within this engine only for any other emitter.
+                It never looks for a spool the emitter does not write to. Pass
+                one explicitly to choose its history, or to control its clock.
+        """
         self._logger = logger or custom_logger(f"{__name__}.{type(self).__name__}")
         # Default resolution ($YGG_WORK_ROOT → mode default) is centralized
         # in lib.core_utils.runtime_paths.
         self.work_root = Path(work_root) if work_root else resolve_work_root()
         self.emitter = emitter or FileSpoolEmitter()
+        if execution_ids is None:
+            history = (
+                SpoolAttemptHistory(self.emitter.root)
+                if isinstance(self.emitter, FileSpoolEmitter)
+                else None
+            )
+            execution_ids = ExecutionIdAllocator(history)
+        self.execution_ids = execution_ids
 
     def _emit_engine_event(self, description: str, event: dict[str, Any]) -> None:
         """Publish an engine-level event directly, classifying failure.
 
-        Some engine events have no StepContext to route through — the cache-hit
-        skip and the retry-unimplemented diagnostic are emitted from the engine
-        itself. They are the same reporting infrastructure as ctx.emit() and get
-        the same classification.
+        Some engine events have no StepContext to route through — the attempt
+        records, the cache-hit skip, the blocked-step record and the
+        retry-unimplemented diagnostic are emitted from the engine itself. They
+        are the same reporting infrastructure as ctx.emit() and get the same
+        classification.
 
         Args:
             description: What was being published, for the error message.
@@ -685,8 +710,14 @@ class Engine:
     def run(self, plan: Plan) -> AttemptReport | None:
         """Execute a plan's steps in dependency order.
 
-        Preflight runs before anything is written, so a rejected plan leaves
-        existing plan snapshots, artifacts and cache markers untouched.
+        Preflight runs before anything is written to the work root, so a
+        rejected plan leaves existing plan snapshots, artifacts and cache
+        markers untouched. The attempt is still recorded in the event spool.
+
+        The attempt's execution ID comes from :attr:`execution_ids`, the
+        allocator operational callers use too, so an attempt started here is
+        ordered against every other attempt at the plan. Allocating it reads
+        the plan's recorded attempts back, which blocks.
 
         The return contract depends on the plan's failure policy. Static typing
         cannot express that, so it is dispatched at runtime:
@@ -710,14 +741,20 @@ class Engine:
 
         Raises:
             PreflightValidationError: If the plan is rejected by preflight.
-            OrchestrationError: If engine bookkeeping or event publication fails.
+            OrchestrationError: If engine bookkeeping or event publication
+                fails, or no execution ID can be allocated. In the last case no
+                attempt starts, and nothing is published.
             StepError: If a step fails under ``fail_fast``. A TransientStepError
                 surfaces as a PermanentStepError, because retries are not
                 implemented.
             Exception: Any other exception a step raised under ``fail_fast``,
                 unchanged.
         """
-        context = AttemptContext.for_plan(plan, execution_id=_new_execution_id())
+        with _orchestration_boundary(
+            f"Allocating an execution ID for plan '{plan.plan_id}'"
+        ):
+            execution_id = self.execution_ids.allocate(plan.realm, plan.plan_id)
+        context = AttemptContext.for_plan(plan, execution_id=execution_id)
         report = self._run_attempt(plan, context=context)
         if report.failure_policy == CONTINUE_INDEPENDENT_POLICY:
             return report
@@ -744,6 +781,22 @@ class Engine:
         while runnable work remains, so it never interrupts a running step and a
         signal arriving after the last step does not undo a drained attempt.
 
+        What the attempt publishes, in order, all stamped with its correlation:
+
+        1. ``plan.attempt_started``, before preflight and before any step runs:
+           the attempt's identity and planned step inventory. An attempt that
+           runs no step at all — rejected, or with no steps — is still visible,
+           and the record is the history later execution IDs are ordered
+           against.
+        2. Each step's own events, as it is reused or executed.
+        3. One ``step.blocked`` per step a failure blocks, published as soon
+           as the scheduler blocks it and before another step starts, with the
+           blockers known at that moment. A later failure can add blockers to a
+           step already blocked; that is recorded only in the report, never by
+           a second ``step.blocked``.
+        4. ``plan.attempt_report``, once, on the way out: the closed report,
+           whose blocker diagnostics are the complete, authoritative ones.
+
         Args:
             plan: The plan to execute.
             context: A fresh context opened for ``plan``, used by no other attempt.
@@ -760,7 +813,7 @@ class Engine:
             OrchestrationError: If infrastructure failed or a scheduler invariant
                 was violated (ORCHESTRATION_ERROR); or if ``context`` does not
                 belong to a fresh attempt at ``plan``, in which case the report
-                is left untouched and nothing runs.
+                is left untouched and nothing runs or is published.
             EventPublicationError: If publishing the report itself failed. The
                 report then says ORCHESTRATION_ERROR, with the ending it was
                 closed with kept as context (see
@@ -782,12 +835,14 @@ class Engine:
         """
         self._check_attempt_context(plan, context)
         report = context.report
+        correlation = context.correlation
         scheduler: DependencyScheduler | None = None
         # Set immediately before each deliberate early exit. An exception that
         # escapes with this still unset is an unplanned abort.
         stop_reason: TerminationReason | None = None
 
         try:
+            self._publish_attempt_started(plan, context)
             try:
                 resolved = self._preflight(plan)
             except PreflightValidationError:
@@ -797,6 +852,8 @@ class Engine:
             plan_dir = self._plan_dir(plan)
             self._write_plan_file(plan, plan_dir)
             scheduler = DependencyScheduler(plan.steps, report)
+            # Preflight has established that step IDs are unique.
+            specs = {spec.step_id: spec for spec in plan.steps}
 
             while scheduler.has_runnable():
                 if context.cancellation_requested:
@@ -809,7 +866,7 @@ class Engine:
                 spec = scheduler.start_next()
                 try:
                     outcome = self._execute_step(
-                        plan, spec, resolved[spec.step_id], plan_dir
+                        plan, spec, resolved[spec.step_id], plan_dir, correlation
                     )
                 except OrchestrationError:
                     raise
@@ -823,15 +880,10 @@ class Engine:
                                 f"Retry not implemented for transient failure: {exc}"
                             ) from exc
                         raise
-                    blocked = scheduler.block_dependents(spec.step_id)
-                    self._logger.warning(
-                        "Step '%s' of plan '%s' failed (%s: %s); continuing "
-                        "independent work. Blocked dependents: %s",
-                        spec.step_id,
-                        plan.plan_id,
-                        type(exc).__name__,
-                        exc,
-                        blocked or "none",
+                    # Still inside the handler, so if publishing a blocked step
+                    # fails, this step failure stays reachable as its context.
+                    self._contain_failure(
+                        plan, scheduler, report, specs, spec.step_id, exc
                     )
                     continue
 
@@ -861,16 +913,24 @@ class Engine:
         something that never happened. Such a context is a caller defect, so it
         is refused before anything runs and left exactly as it was.
 
+        An execution ID also names the attempt's records in the event spool, so
+        one that cannot name a file there is refused too.
+
         Args:
             plan: The plan about to be executed.
             context: The context the caller supplied.
 
         Raises:
             OrchestrationError: If the context's report was opened for another
-                plan, step inventory or failure policy, or has already been used.
+                plan, step inventory or failure policy, has already been used,
+                or has an execution ID that cannot name spool records.
         """
         report = context.report
         problems: list[str] = []
+        if not is_record_key(report.execution_id):
+            problems.append(
+                f"its execution ID {report.execution_id!r} cannot name spool records"
+            )
         if report.plan_id != plan.plan_id:
             problems.append(f"its report was opened for plan '{report.plan_id}'")
         if report.step_ids != [spec.step_id for spec in plan.steps]:
@@ -888,12 +948,65 @@ class Engine:
                 f"'{plan.plan_id}': {'; '.join(problems)}."
             )
 
+    def _contain_failure(
+        self,
+        plan: Plan,
+        scheduler: DependencyScheduler,
+        report: AttemptReport,
+        specs: dict[str, StepSpec],
+        failed_step_id: str,
+        exc: Exception,
+    ) -> None:
+        """Block every step that depends on a failed step, and publish each block.
+
+        Only under ``continue_independent``. A failed step's dependents can
+        never run in this attempt, so each is blocked at once, and its
+        ``step.blocked`` is published before another step starts: a reader sees
+        the blocking while the rest of the attempt is still running, not only
+        once it ends.
+
+        The blockers each event names are those known now. The blocker
+        diagnostics are settled first, so a step blocked through a chain of
+        blocked steps already names the failure at its root. A step that is
+        already blocked is not published again when a later failure adds to its
+        blockers; the report's final diagnostics record that.
+
+        Args:
+            plan: The plan being executed.
+            scheduler: The attempt's scheduler; the failed step is recorded.
+            report: The attempt's report.
+            specs: The plan's steps by ID.
+            failed_step_id: The step that just failed.
+            exc: Its failure, for the log.
+
+        Raises:
+            OrchestrationError: If the scheduler or the report rejects the
+                blocking.
+            EventPublicationError: If a ``step.blocked`` cannot be published.
+        """
+        blocked = scheduler.block_dependents(failed_step_id)
+        self._logger.warning(
+            "Step '%s' of plan '%s' failed (%s: %s); continuing independent "
+            "work. Blocked dependents: %s",
+            failed_step_id,
+            plan.plan_id,
+            type(exc).__name__,
+            exc,
+            blocked or "none",
+        )
+        if not blocked:
+            return
+        scheduler.record_blocker_diagnostics()
+        for step_id in blocked:
+            self._emit_step_blocked(plan, specs[step_id], report)
+
     def _execute_step(
         self,
         plan: Plan,
         spec: StepSpec,
         fn: Callable[..., Any],
         plan_dir: Path,
+        correlation: ExecutionCorrelation,
     ) -> StepOutcome:
         """Reuse or execute one step whose prerequisites have all been satisfied.
 
@@ -922,6 +1035,7 @@ class Engine:
             spec: The step to reuse or execute.
             fn: The step's callable, resolved during preflight.
             plan_dir: Directory for this plan's execution state.
+            correlation: The attempt's identity, stamped onto the step's events.
 
         Returns:
             StepOutcome: REUSED on a cache hit, SUCCEEDED after execution.
@@ -952,7 +1066,7 @@ class Engine:
         required_outputs = resolve_declared_outputs(spec.outputs, step_dir)
 
         if self._can_reuse(plan, spec, marker, fingerprint, required_outputs):
-            self._emit_step_skipped(plan, spec, fingerprint, run_id)
+            self._emit_step_skipped(plan, spec, fingerprint, run_id, correlation)
             return StepOutcome.REUSED
 
         # Building the context loads Yggdrasil's own external-systems
@@ -962,7 +1076,14 @@ class Engine:
             f"Preparing the execution context for step '{spec.step_id}'"
         ):
             ctx = self._step_context(
-                plan, spec, plan_dir, step_dir, fingerprint, run_id, required_outputs
+                plan,
+                spec,
+                plan_dir,
+                step_dir,
+                fingerprint,
+                run_id,
+                required_outputs,
+                correlation,
             )
 
         # The marker is invalidated before the call rather than after a failure,
@@ -983,7 +1104,7 @@ class Engine:
             # The @step wrapper has already emitted "step.failed".
             # Add a precise diagnostic so operators know retry isn't wired yet.
             # TODO: Implement retry.
-            self._emit_retry_unimplemented(plan, spec, run_id, exc)
+            self._emit_retry_unimplemented(plan, spec, run_id, exc, correlation)
             raise
 
         if result is not None and not isinstance(result, StepResult):
@@ -1078,6 +1199,7 @@ class Engine:
         fingerprint: str,
         run_id: str,
         required_outputs: dict[str, Path],
+        correlation: ExecutionCorrelation,
     ) -> StepContext:
         """Build the context one step invocation executes with.
 
@@ -1090,6 +1212,8 @@ class Engine:
             run_id: The ID of this invocation.
             required_outputs: The step's resolved declared outputs, which the
                 @step wrapper verifies before reporting success.
+            correlation: The attempt's identity, stamped onto every event the
+                step and its DataAccess publish.
 
         Returns:
             StepContext: The context passed to the step function.
@@ -1105,6 +1229,7 @@ class Engine:
             step_name=spec.name,
             scope=spec.scope or plan.scope,
             emitter=self.emitter,
+            correlation=correlation,
         )
 
         return StepContext(
@@ -1120,6 +1245,7 @@ class Engine:
             fingerprint=fingerprint,
             run_id=run_id,
             required_outputs=required_outputs,
+            correlation=correlation,
             data=DataAccess(
                 plan.realm,
                 phase="execution",
@@ -1128,15 +1254,25 @@ class Engine:
         )
 
     def _emit_step_skipped(
-        self, plan: Plan, spec: StepSpec, fingerprint: str, run_id: str
+        self,
+        plan: Plan,
+        spec: StepSpec,
+        fingerprint: str,
+        run_id: str,
+        correlation: ExecutionCorrelation,
     ) -> None:
         """Publish the cache-hit event for a reused step.
+
+        ``step.skipped`` means only that an earlier success was reused; its
+        ``reason`` says so. It never describes a step that could not run: that
+        is ``step.blocked``.
 
         Args:
             plan: The plan being executed.
             spec: The reused step.
             fingerprint: The fingerprint its cache marker matched.
             run_id: The ID allocated for this evaluation of the step.
+            correlation: The attempt's identity.
 
         Raises:
             EventPublicationError: If the emitter fails to publish.
@@ -1151,7 +1287,9 @@ class Engine:
                 "step_id": spec.step_id,
                 "step_name": spec.name,
                 "fingerprint": fingerprint,
+                "reason": CACHE_HIT_REASON,
                 "seq": 1,
+                **correlation.event_fields(),
                 "eid": str(uuid.uuid4()),
                 "ts": utcnow_iso(),
                 "_spool_path": {
@@ -1165,7 +1303,12 @@ class Engine:
         )
 
     def _emit_retry_unimplemented(
-        self, plan: Plan, spec: StepSpec, run_id: str, exc: TransientStepError
+        self,
+        plan: Plan,
+        spec: StepSpec,
+        run_id: str,
+        exc: TransientStepError,
+        correlation: ExecutionCorrelation,
     ) -> None:
         """Publish the diagnostic that a transient failure was not retried.
 
@@ -1174,6 +1317,7 @@ class Engine:
             spec: The step that failed transiently.
             run_id: The ID of the failed invocation.
             exc: The transient failure.
+            correlation: The attempt's identity.
 
         Raises:
             EventPublicationError: If the emitter fails to publish.
@@ -1188,12 +1332,105 @@ class Engine:
                 "step_id": spec.step_id,
                 "error": str(exc),
                 "kind": "transient",
+                **correlation.event_fields(),
                 "_spool_path": {
                     "realm": plan.realm,
                     "plan_id": plan.plan_id,
                     "step_id": spec.step_id,
                     "run_id": run_id,
                     "filename": "retry_unimplemented.json",
+                },
+            },
+        )
+
+    def _emit_step_blocked(
+        self, plan: Plan, spec: StepSpec, report: AttemptReport
+    ) -> None:
+        """Publish the one ``step.blocked`` event of a step a failure blocked.
+
+        The step never ran, so the event names no run: the spool files it
+        directly under the step's directory, named after the attempt so that
+        different attempts' records never overwrite each other.
+
+        Args:
+            plan: The plan being executed.
+            spec: The blocked step.
+            report: The attempt's report, holding the blockers known now.
+
+        Raises:
+            EventPublicationError: If the emitter fails to publish.
+        """
+        self._emit_engine_event(
+            f"step.blocked for step '{spec.step_id}'",
+            {
+                "type": STEP_BLOCKED_EVENT,
+                "realm": plan.realm,
+                "scope": spec.scope or plan.scope,
+                "plan_id": plan.plan_id,
+                "step_id": spec.step_id,
+                "step_name": spec.name,
+                "direct_blockers": list(report.direct_blockers.get(spec.step_id, [])),
+                "failed_ancestors": list(report.failed_ancestors.get(spec.step_id, [])),
+                **report.correlation.event_fields(),
+                "eid": str(uuid.uuid4()),
+                "ts": utcnow_iso(),
+                "_spool_path": {
+                    "realm": plan.realm,
+                    "plan_id": plan.plan_id,
+                    "step_id": spec.step_id,
+                    "filename": record_filename(
+                        report.execution_id, STEP_BLOCKED_EVENT
+                    ),
+                },
+            },
+        )
+
+    def _publish_attempt_started(self, plan: Plan, context: AttemptContext) -> None:
+        """Publish the record that an attempt was admitted.
+
+        Published before preflight and before any step runs, so every attempt
+        leaves a record, including one that is rejected or has no steps, and
+        the record carries the planned inventory a reader needs to show work
+        that has not started. It is also the history later execution IDs for
+        the plan are ordered against, so it must exist before the attempt does
+        anything else.
+
+        Args:
+            plan: The plan being attempted.
+            context: The attempt's context.
+
+        Raises:
+            EventPublicationError: If the emitter fails to publish.
+        """
+        report = context.report
+        self._emit_engine_event(
+            f"the start of attempt '{report.execution_id}' for plan '{plan.plan_id}'",
+            {
+                "type": ATTEMPT_STARTED_EVENT,
+                "realm": plan.realm,
+                "scope": plan.scope,
+                "plan_id": plan.plan_id,
+                **context.correlation.event_fields(),
+                "execution_authority": context.execution_authority,
+                "execution_owner": context.execution_owner,
+                "failure_policy": report.failure_policy,
+                "started_at": report.started_at,
+                "steps": [
+                    {
+                        "step_id": spec.step_id,
+                        "step_name": spec.name,
+                        "deps": list(spec.deps),
+                    }
+                    for spec in plan.steps
+                ],
+                "eid": str(uuid.uuid4()),
+                "ts": utcnow_iso(),
+                "_spool_path": {
+                    "realm": plan.realm,
+                    "plan_id": plan.plan_id,
+                    "filename": record_filename(
+                        report.execution_id, ATTEMPT_STARTED_EVENT
+                    ),
                 },
             },
         )
@@ -1251,9 +1488,9 @@ class Engine:
         """Publish an attempt's closed report as its one plan-level event.
 
         Published on every ending, so no attempt is left looking as if it were
-        still running. The event names no step and no filename: the spool files
-        it directly under the plan, named after its unique event ID, so reports
-        from different attempts of one plan never overwrite each other.
+        still running. The event names no step, so the spool files it directly
+        under the plan, named after the attempt's execution ID: reports from
+        different attempts at one plan never overwrite each other.
 
         Publication is part of the attempt's exit, not an afterthought to it. If
         it fails, or has to be skipped, the report the caller holds records that
@@ -1300,11 +1537,15 @@ class Engine:
             "realm": plan.realm,
             "scope": plan.scope,
             "plan_id": plan.plan_id,
-            "execution_id": report.execution_id,
+            **report.correlation.event_fields(),
             "report": report.to_dict(),
             "eid": str(uuid.uuid4()),
             "ts": utcnow_iso(),
-            "_spool_path": {"realm": plan.realm, "plan_id": plan.plan_id},
+            "_spool_path": {
+                "realm": plan.realm,
+                "plan_id": plan.plan_id,
+                "filename": record_filename(report.execution_id, ATTEMPT_REPORT_EVENT),
+            },
         }
         try:
             self._emit_engine_event(

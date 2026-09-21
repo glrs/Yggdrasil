@@ -700,7 +700,8 @@ class TestBlockedDescendantIgnoresItsMarker(ReuseTestCase):
         self.assertIsNone(exc)
         self.assertEqual(self.steps.calls, ["demux"])
         self.assertIs(report.step_outcomes["upload"], StepOutcome.BLOCKED)
-        self.assertEqual(self.emitter.step_types("upload"), [])
+        # Its one event says it was blocked; nothing reports it run or reused.
+        self.assertEqual(self.emitter.step_types("upload"), ["step.blocked"])
         # Never evaluated, so never invalidated either.
         self.assertEqual(
             self.marker("upload").read_text(encoding="utf-8"), upload_marker

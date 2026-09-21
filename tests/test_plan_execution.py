@@ -27,6 +27,9 @@ import asyncio
 import logging
 import threading
 import unittest
+from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from lib.core_utils.plan_eligibility import is_plan_eligible
 from lib.core_utils.plan_execution import (
@@ -35,6 +38,7 @@ from lib.core_utils.plan_execution import (
     ExecutionStatus,
     PlanExecutionCoordinator,
 )
+from lib.ops.consumer import build_plan_snapshot
 from lib.storage.errors import PlanStoreError
 from lib.storage.plan_documents import build_plan_document
 from lib.storage.plan_updates import FinalizationStatus, SupersessionReason
@@ -44,6 +48,8 @@ from tests.execution_support import (
     RETRYABLE,
     SCOPE,
     WAIT,
+    CapturingEngine,
+    Clock,
     CouchBackend,
     ExecutionTestCase,
     Gate,
@@ -53,12 +59,18 @@ from tests.execution_support import (
     run_bounded,
     spec,
 )
+from yggdrasil.core.execution_ids import ExecutionIdAllocator, execution_timestamp
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.errors import (
     AttemptCancelledError,
     OrchestrationError,
     PreflightValidationError,
 )
+from yggdrasil.flow.events.attempt_records import (
+    ATTEMPT_REPORT_EVENT,
+    ATTEMPT_STARTED_EVENT,
+)
+from yggdrasil.flow.events.emitter import FileSpoolEmitter
 from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, FAIL_FAST_POLICY, Plan
 from yggdrasil.flow.outcomes import (
     AttemptReport,
@@ -70,6 +82,8 @@ from yggdrasil.flow.outcomes import (
 CONTINUE = CONTINUE_INDEPENDENT_POLICY
 FAIL_FAST = FAIL_FAST_POLICY
 POLICIES = (FAIL_FAST, CONTINUE)
+
+T0 = datetime(2026, 9, 21, 12, 5, tzinfo=UTC)
 
 COORDINATOR_LOGGER = "lib.core_utils.plan_execution.PlanExecutionCoordinator"
 
@@ -925,11 +939,213 @@ class TestFinalizationRetries(ExecutionTestCase):
         self.assert_recorded(pending)
 
 
+class TestAttemptReporting(ExecutionTestCase):
+    """Each coordinated attempt is identified by the engine and reported once."""
+
+    def events_of_type(self, event_type: str) -> list[dict]:
+        """Published events of one type."""
+        return [e for e in self.emitter.events if e.get("type") == event_type]
+
+    def test_execution_id_is_allocated_off_the_event_loop(self):
+        threads: list[int] = []
+
+        class RecordingThread:
+            def recorded_execution_ids(self, realm: str, plan_id: str) -> list[str]:
+                threads.append(threading.get_ident())
+                return []
+
+        coordinator = PlanExecutionCoordinator(
+            engine=self.engine,
+            plan_store=self.store,  # type: ignore[arg-type]
+            sleep=self.record_delay,
+            execution_ids=ExecutionIdAllocator(RecordingThread()),
+        )
+        self.save()
+
+        async def scenario():
+            loop_thread = threading.get_ident()
+            return loop_thread, await coordinator.execute(PLAN_ID, DAEMON_CLAIM)
+
+        loop_thread, result = run_bounded(scenario())
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], loop_thread)
+
+    def test_coordinated_and_direct_attempts_share_one_order(self):
+        # With the clock held still, only a shared allocator can keep them
+        # apart and in order.
+        self.engine.execution_ids = ExecutionIdAllocator(clock=Clock(T0))
+        coordinator = PlanExecutionCoordinator(
+            engine=self.engine,
+            plan_store=self.store,  # type: ignore[arg-type]
+            sleep=self.record_delay,
+        )
+        self.save()
+
+        coordinated = run_bounded(coordinator.execute(PLAN_ID, DAEMON_CLAIM))
+        direct = self.engine.run(chain_plan())
+
+        assert coordinated.report is not None
+        self.assertIsNone(direct)
+        (direct_start,) = self.events_of_type(ATTEMPT_STARTED_EVENT)[1:]
+        self.assertEqual(execution_timestamp(coordinated.report.execution_id), T0)
+        self.assertGreater(
+            direct_start["execution_id"], coordinated.report.execution_id
+        )
+
+    def test_failed_allocation_runs_nothing_and_leaves_the_plan_eligible(self):
+        class Unreadable:
+            def recorded_execution_ids(self, realm: str, plan_id: str) -> list[str]:
+                raise PermissionError("spool unreadable")
+
+        self.engine.execution_ids = ExecutionIdAllocator(Unreadable())
+        coordinator = PlanExecutionCoordinator(
+            engine=self.engine,
+            plan_store=self.store,  # type: ignore[arg-type]
+            sleep=self.record_delay,
+        )
+        self.save()
+
+        result = run_bounded(coordinator.execute(PLAN_ID, DAEMON_CLAIM))
+
+        self.assertEqual(result.status, ExecutionStatus.ADMISSION_FAILED)
+        self.assertIn("PermissionError", result.message)
+        self.assertEqual(self.engine.contexts, [])
+        self.assertEqual(self.emitter.events, [])
+        self.assert_unconsumed()
+        self.assertFalse(coordinator.is_in_flight(PLAN_ID))
+
+    def held_allocation(self) -> tuple[Gate, PlanExecutionCoordinator]:
+        """A coordinator whose execution-ID allocation waits at a gate."""
+        gate = Gate()
+
+        class Held:
+            def recorded_execution_ids(self, realm: str, plan_id: str) -> list[str]:
+                gate.pass_through()
+                return []
+
+        coordinator = PlanExecutionCoordinator(
+            engine=self.engine,
+            plan_store=self.store,  # type: ignore[arg-type]
+            sleep=self.record_delay,
+            execution_ids=ExecutionIdAllocator(Held()),
+        )
+        return gate, coordinator
+
+    def test_cancellation_during_allocation_starts_no_attempt(self):
+        gate, coordinator = self.held_allocation()
+        self.save()
+
+        async def scenario():
+            first = coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+            await gate.reached()
+            coordinator.request_cancellation(PLAN_ID)
+            gate.release()
+            return await first
+
+        result = run_bounded(scenario())
+
+        self.assertEqual(result.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(self.engine.contexts, [])
+        self.assertEqual(self.emitter.events, [])
+        self.assert_unconsumed()
+
+    def test_shutdown_during_allocation_waits_for_it_and_starts_nothing(self):
+        # asyncio.run cancels the coordination task while the allocation's
+        # worker thread is still reading the plan's history.
+        gate, coordinator = self.held_allocation()
+        self.save()
+        submitted = []
+
+        def release_once_cancellation_is_requested():
+            if gate.entered.wait(WAIT):
+                coordinator._slots[PLAN_ID].cancel_event.wait(WAIT)
+            gate.release()
+
+        releaser = threading.Thread(target=release_once_cancellation_is_requested)
+        releaser.start()
+
+        async def main():
+            submitted.append(coordinator.submit(PLAN_ID, DAEMON_CLAIM))
+            await gate.reached()
+
+        run_bounded(main())
+        releaser.join(WAIT)
+
+        self.assertEqual(submitted[0].result().status, ExecutionStatus.CANCELLED)
+        self.assertEqual(self.engine.contexts, [])
+        self.assertEqual(self.emitter.events, [])
+        self.assertFalse(coordinator.is_in_flight(PLAN_ID))
+        self.assert_unconsumed()
+
+    def test_each_attempt_publishes_exactly_one_report(self):
+        self.save()
+
+        result = self.execute()
+
+        self.assertEqual(result.status, ExecutionStatus.FINALIZED)
+        assert result.report is not None
+        (started,) = self.events_of_type(ATTEMPT_STARTED_EVENT)
+        (published,) = self.events_of_type(ATTEMPT_REPORT_EVENT)
+        self.assertEqual(published["report"], result.report.to_dict())
+        self.assertEqual(
+            {key: started[key] for key in ("plan_generation", "run_token")},
+            {
+                "plan_generation": self.stored()["plan_generation"],
+                "run_token": 0,
+            },
+        )
+
+    def test_duplicate_request_leaves_no_trace_in_reporting(self):
+        with TemporaryDirectory() as temp_dir:
+            spool = Path(temp_dir) / "spool"
+            engine = CapturingEngine(
+                work_root=Path(temp_dir) / "work",
+                emitter=FileSpoolEmitter(spool),
+                journal=self.journal,
+            )
+            coordinator = PlanExecutionCoordinator(
+                engine=engine,
+                plan_store=self.store,  # type: ignore[arg-type]
+                sleep=self.record_delay,
+            )
+            gate = Gate()
+
+            def fail_at_gate(ctx):
+                gate.pass_through()
+                raise RuntimeError("boom")
+
+            self.steps.behaviors["a"] = fail_at_gate
+            self.save()
+
+            async def scenario():
+                first = coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+                await gate.reached()
+                duplicate = coordinator.submit(PLAN_ID, DAEMON_CLAIM)
+                gate.release()
+                return await first, await duplicate
+
+            first, duplicate = run_bounded(scenario())
+
+            self.assertEqual(duplicate.status, ExecutionStatus.DUPLICATE)
+            assert first.report is not None
+            plan_dir = spool / REALM / PLAN_ID
+            self.assertEqual(len(list(plan_dir.glob("*.json"))), 2)
+            snapshot = build_plan_snapshot(plan_dir, REALM, PLAN_ID)
+            self.assertEqual(
+                snapshot["attempt"]["execution_id"], first.report.execution_id
+            )
+            self.assertEqual(snapshot["attempt"]["termination_reason"], "failed_fast")
+            self.assertEqual(snapshot["steps"]["a"]["state"], "step.failed")
+
+
 class _ReturnsNothingEngine:
     """Runs the real attempt, then returns None instead of its report."""
 
     def __init__(self, engine):
         self.engine = engine
+        self.execution_ids = engine.execution_ids
 
     def _run_attempt(self, plan: Plan, *, context: AttemptContext) -> None:
         self.engine._run_attempt(plan, context=context)
@@ -937,6 +1153,8 @@ class _ReturnsNothingEngine:
 
 class _RefusingEngine:
     """Raises before recording anything, leaving the report open."""
+
+    execution_ids = ExecutionIdAllocator()
 
     def _run_attempt(self, plan: Plan, *, context: AttemptContext) -> AttemptReport:
         raise OrchestrationError("attempt context refused")

@@ -12,7 +12,12 @@ recorded":
    stale event cannot combine an old approval or token with a newer plan.
 2. **Execution.** The attempt runs in a worker thread through
    ``Engine._run_attempt``, with an AttemptContext the coordinator owns, so the
-   attempt's report is readable however the attempt ends.
+   attempt's report is readable however the attempt ends. Its execution ID is
+   allocated just before, by the engine's own allocator, the one direct
+   ``Engine.run`` calls use as well, so attempts at a plan are ordered however
+   they were started. Allocation reads the plan's recorded attempts back, so
+   it runs in a worker thread too. A request that is not going to run, such as
+   a duplicate, gets no execution ID and leaves no trace in reporting.
 3. **Interpretation.** The report's termination reason decides whether the
    request finished (see ``finishes_request`` in
    ``lib/storage/plan_updates.py``); the type of any exception does not, since
@@ -104,7 +109,8 @@ from lib.storage.plan_updates import (
     finishes_request,
 )
 from lib.storage.protocols import PlanStore
-from yggdrasil.core.engine import Engine, _new_execution_id
+from yggdrasil.core.engine import Engine
+from yggdrasil.core.execution_ids import ExecutionIdAllocator
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.model import Plan
 from yggdrasil.flow.outcomes import AttemptReport, ExecutionOutcome, TerminationReason
@@ -183,7 +189,8 @@ class ExecutionStatus(str, Enum):
         INVALID_DOCUMENT: The plan document is eligible but does not describe
             an executable request. Nothing ran; the plan stays eligible.
         ADMISSION_FAILED: The plan store could not provide the snapshot to
-            admit the request from. Nothing ran; the plan stays eligible.
+            admit the request from, or no execution ID could be allocated for
+            it. Nothing ran; the plan stays eligible.
         FINALIZED: The attempt finished its request and the result is
             recorded, consuming the token. The report's outcome says whether it
             succeeded.
@@ -403,7 +410,7 @@ class PlanExecutionCoordinator:
         finalization_attempts: int = FINALIZATION_ATTEMPTS,
         finalization_backoff: Sequence[float] = FINALIZATION_BACKOFF_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        new_execution_id: Callable[[], str] = _new_execution_id,
+        execution_ids: ExecutionIdAllocator | None = None,
         store_executor: Executor | None = None,
     ) -> None:
         """Initialize the coordinator.
@@ -418,9 +425,10 @@ class PlanExecutionCoordinator:
                 attempt after the first.
             sleep: Awaitable sleep used for that backoff; replaceable so tests
                 can observe the delays without waiting them out.
-            new_execution_id: Allocates each attempt's execution ID. Defaults
-                to the allocator ``Engine.run`` uses, so coordinated and direct
-                attempts are identified the same way.
+            execution_ids: Allocates each attempt's execution ID. Defaults to
+                the engine's allocator, which ``Engine.run`` uses too, so
+                coordinated and direct attempts at a plan are ordered against
+                each other.
             store_executor: Executor for blocking plan-store calls; a small
                 dedicated thread pool when omitted.
 
@@ -443,7 +451,7 @@ class PlanExecutionCoordinator:
         self._attempts = finalization_attempts
         self._backoff = tuple(finalization_backoff)
         self._sleep = sleep
-        self._new_execution_id = new_execution_id
+        self._execution_ids = execution_ids or engine.execution_ids
         self._store_executor = store_executor or ThreadPoolExecutor(
             max_workers=PLAN_STORE_WORKERS, thread_name_prefix="ygg-plan-store"
         )
@@ -717,6 +725,9 @@ class PlanExecutionCoordinator:
                         "is not run again",
                     )
                 )
+            execution_id = await self._allocate_execution_id(
+                plan_doc_id, admission.plan, cancel_event
+            )
             if cancel_event.is_set():
                 raise _CycleStopped(
                     ExecutionResult(
@@ -727,7 +738,9 @@ class PlanExecutionCoordinator:
                     )
                 )
             slot.attempted = request
-            return await self._execute(plan_doc_id, admission, cancel_event)
+            return await self._execute(
+                plan_doc_id, admission, execution_id, cancel_event
+            )
         except _CycleStopped as stopped:
             return stopped.result
 
@@ -766,6 +779,45 @@ class PlanExecutionCoordinator:
                     ExecutionStatus.ADMISSION_FAILED,
                     f"Could not read plan '{plan_doc_id}' to admit it for "
                     f"execution ({type(exc).__name__}: {exc}); it stays eligible",
+                )
+            ) from exc
+
+    async def _allocate_execution_id(
+        self, plan_doc_id: str, plan: Plan, cancel_event: threading.Event
+    ) -> str:
+        """Allocate the execution ID of the attempt about to be made.
+
+        Allocation reads the plan's recorded attempts, so it runs in a worker
+        thread, never on the event loop.
+
+        Args:
+            plan_doc_id: The plan document.
+            plan: The admitted plan.
+            cancel_event: The slot's cooperative cancellation signal.
+
+        Returns:
+            str: The new execution ID.
+
+        Raises:
+            _CycleStopped: ADMISSION_FAILED, if no execution ID can be allocated.
+        """
+        loop = asyncio.get_running_loop()
+        allocation = loop.run_in_executor(
+            None, self._execution_ids.allocate, plan.realm, plan.plan_id
+        )
+        try:
+            return await self._outlast_cancellation(
+                allocation,
+                cancel_event,
+                f"allocating an execution ID for plan '{plan_doc_id}'",
+            )
+        except Exception as exc:
+            raise _CycleStopped(
+                ExecutionResult(
+                    plan_doc_id,
+                    ExecutionStatus.ADMISSION_FAILED,
+                    f"Could not allocate an execution ID for plan '{plan_doc_id}' "
+                    f"({type(exc).__name__}: {exc}); nothing ran, it stays eligible",
                 )
             ) from exc
 
@@ -839,13 +891,18 @@ class PlanExecutionCoordinator:
         )
 
     async def _execute(
-        self, plan_doc_id: str, admission: _Admission, cancel_event: threading.Event
+        self,
+        plan_doc_id: str,
+        admission: _Admission,
+        execution_id: str,
+        cancel_event: threading.Event,
     ) -> ExecutionResult:
         """Run one attempt for an admitted request, then resolve the request.
 
         Args:
             plan_doc_id: The plan document.
             admission: The captured request.
+            execution_id: The execution ID allocated for the attempt.
             cancel_event: The slot's cooperative cancellation signal, handed to
                 the attempt.
 
@@ -855,7 +912,7 @@ class PlanExecutionCoordinator:
         plan = admission.plan
         context = AttemptContext.for_plan(
             plan,
-            execution_id=self._new_execution_id(),
+            execution_id=execution_id,
             plan_generation=admission.plan_generation,
             run_token=admission.run_token,
             execution_authority=admission.execution_authority,
