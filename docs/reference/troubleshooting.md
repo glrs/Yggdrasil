@@ -250,8 +250,9 @@ A daemon with no checkpoint can miss a plan approved before it started.
 After confirming PlanWatcher is running, the operator-provided storage
 integration can re-emit an observable change for that plan. Re-emitting a
 plan that is already executing does not start a second attempt: the daemon
-runs one attempt per plan at a time, and checks the plan again once the
-running attempt is finished, so an already-served request is not rerun.
+runs one attempt per plan at a time, and once the running attempt is finished
+it checks the plan again, running it only if a newer run was requested
+meanwhile.
 
 ---
 
