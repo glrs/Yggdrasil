@@ -9,23 +9,33 @@ re-delivering an old attempt's events cannot reorder attempts.
 
 A clock is not monotonic, so the timestamp is allocated rather than read:
 
-- It is never lower than one microsecond above the timestamp this allocator
-  allocated last, for any plan. Allocations in one process are therefore
+- It is never lower than one microsecond above the timestamp the same
+  allocator allocated last, for any plan. One allocator's IDs are therefore
   strictly increasing even when the clock stands still or moves backwards.
+  That floor lives in the allocator instance: each engine has its own
+  allocator, and two allocators share only what their common history records.
 - It is never lower than one microsecond above any attempt already recorded
-  for the plan. The allocator's history is read on every allocation, so this
-  holds across restarts, including a restart after which the clock is behind
-  the last recorded attempt, and across allocators that share one spool.
+  for the plan: every attempt record the ops consumer would select among,
+  including reports whose start record is missing. The history is read on
+  every allocation, so this holds across restarts, including a restart after
+  which the clock is behind the last recorded attempt, and across sequential
+  allocators that share one spool. The price is that each allocation parses
+  every attempt record retained for the plan, a cost that grows with the
+  plan's history.
 - The full UUID suffix keeps two IDs distinct. It supplies uniqueness, not
   order: order comes from the timestamp alone.
 
-Attempts made concurrently by independent processes are not ordered against
-each other: each reads the history before the other has recorded anything.
-Without a history (see :class:`ExecutionIdAllocator`), only the first
-guarantee holds, so a clock that is behind after a restart can order a new
-attempt below an old one. A missing or pruned history therefore degrades
-ordering to "correct while the clock moves forward", never to IDs that
-collide.
+Attempts made concurrently by independent processes, or by two allocators at
+once, are not ordered against each other: each reads the history before the
+other has recorded anything. Without a history (see
+:class:`ExecutionIdAllocator`), only the first guarantee holds, so a clock
+that is behind after a restart can order a new attempt below an old one. A
+missing or pruned history therefore degrades ordering to "correct while the
+clock moves forward", never to IDs that collide.
+
+An ID without the allocated shape, which only a caller-built attempt context
+can carry, orders below every allocated ID (see :func:`execution_order_key`).
+It can therefore never hide an allocated attempt, and needs no floor.
 
 The timestamp in an ID is an ordering key, not a record of when the attempt
 started; the attempt's report carries that.
@@ -95,6 +105,22 @@ def execution_timestamp(execution_id: str) -> datetime | None:
         return None
 
 
+def execution_order_key(execution_id: str) -> tuple[bool, str]:
+    """Return the key attempts at a plan are ordered by.
+
+    Allocated IDs order by their timestamp, which for their fixed-width shape
+    is the same as their name order. Any other ID orders below every allocated
+    one, then by name.
+
+    Args:
+        execution_id: The execution ID.
+
+    Returns:
+        tuple[bool, str]: Whether the ID has the allocated shape, and the ID.
+    """
+    return (execution_timestamp(execution_id) is not None, execution_id)
+
+
 def _utc_now() -> datetime:
     """Return the current time in UTC."""
     return datetime.now(UTC)
@@ -108,10 +134,10 @@ def _new_suffix() -> str:
 class ExecutionIdAllocator:
     """Allocates execution IDs for every attempt made through one engine.
 
-    One allocator must serve every way an attempt can start in a process, both
-    the operational callers and direct ``Engine.run`` calls, which is why the
-    engine owns it and callers use the engine's. Two allocators share only what
-    their common history records.
+    One allocator must serve every way an attempt can start through an engine,
+    both the operational callers and direct ``Engine.run`` calls, which is why
+    the engine owns it and callers use the engine's. Two allocators share only
+    what their common history records.
 
     Safe to call from several threads at once.
     """
@@ -156,8 +182,8 @@ class ExecutionIdAllocator:
             plan_id: The plan.
 
         Returns:
-            str: A new execution ID that sorts above every ID this allocator
-            has returned and every well-formed ID recorded for the plan.
+            str: A new execution ID that orders above every ID this allocator
+            has returned and every ID recorded for the plan.
 
         Raises:
             ValueError: If the clock returns a timezone-naive datetime.

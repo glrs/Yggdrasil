@@ -20,10 +20,12 @@ from tempfile import TemporaryDirectory
 from tests.execution_support import Clock
 from yggdrasil.core.execution_ids import (
     ExecutionIdAllocator,
+    execution_order_key,
     execution_timestamp,
     format_execution_id,
 )
 from yggdrasil.flow.events.attempt_records import (
+    ATTEMPT_REPORT_EVENT,
     ATTEMPT_STARTED_EVENT,
     SpoolAttemptHistory,
     record_filename,
@@ -40,18 +42,24 @@ ID_SHAPE = re.compile(r"^exec_\d{8}T\d{12}Z_[0-9a-f]{32}$")
 WAIT = 5.0
 
 
-def record_attempt(spool: Path, execution_id: str, plan_id: str = PLAN_ID) -> None:
-    """Record an attempt start in a spool, as the engine does."""
+def record_attempt(
+    spool: Path,
+    execution_id: str,
+    plan_id: str = PLAN_ID,
+    event_type: str = ATTEMPT_STARTED_EVENT,
+    filename: str | None = None,
+) -> None:
+    """Record an attempt in a spool, as the engine does unless told otherwise."""
     FileSpoolEmitter(spool).emit(
         {
-            "type": ATTEMPT_STARTED_EVENT,
+            "type": event_type,
             "realm": REALM,
             "plan_id": plan_id,
             "execution_id": execution_id,
             "_spool_path": {
                 "realm": REALM,
                 "plan_id": plan_id,
-                "filename": record_filename(execution_id, ATTEMPT_STARTED_EVENT),
+                "filename": filename or record_filename(execution_id, event_type),
             },
         }
     )
@@ -117,6 +125,17 @@ class TestExecutionIdShape(unittest.TestCase):
         ):
             with self.subTest(execution_id=execution_id):
                 self.assertIsNone(execution_timestamp(execution_id))
+
+    def test_order_key_puts_every_allocated_id_above_any_other(self):
+        allocated = [
+            format_execution_id(T0 + timedelta(seconds=s), "0") for s in (2, 0, 1)
+        ]
+        others = ["exec_sched_plan", "zzz", "exec_2099"]
+
+        ordered = sorted(allocated + others, key=execution_order_key)
+
+        self.assertEqual(ordered[:3], sorted(others))
+        self.assertEqual(ordered[3:], sorted(allocated))
 
     def test_timestamp_is_converted_to_utc(self):
         plus_two = datetime(2026, 9, 21, 16, 5, tzinfo=timezone(timedelta(hours=2)))
@@ -186,6 +205,31 @@ class TestClockSafety(SpoolTestCase):
         # Without the read-back, the same restart orders the attempt below.
         forgetful = ExecutionIdAllocator(clock=behind)
         self.assertLess(forgetful.allocate(REALM, PLAN_ID), recorded)
+
+    def test_report_named_after_its_event_id_orders_a_restarted_allocator(self):
+        # A report published before attempt-start records existed: the only
+        # trace of that attempt, named after its event ID.
+        provisional = format_execution_id(T0, "a" * 32)
+        record_attempt(
+            self.spool,
+            provisional,
+            event_type=ATTEMPT_REPORT_EVENT,
+            filename="3f2b9c1e-5a6d-4f1e-9b2a-0c7d8e9f1a2b.json",
+        )
+        behind = Clock(T0 - timedelta(hours=1))
+
+        after = ExecutionIdAllocator(SpoolAttemptHistory(self.spool), clock=behind)
+
+        self.assertGreater(after.allocate(REALM, PLAN_ID), provisional)
+
+    def test_report_that_outlived_its_start_record_still_orders(self):
+        recorded = format_execution_id(T0, "b" * 32)
+        record_attempt(self.spool, recorded, event_type=ATTEMPT_REPORT_EVENT)
+        behind = Clock(T0 - timedelta(hours=1))
+
+        after = ExecutionIdAllocator(SpoolAttemptHistory(self.spool), clock=behind)
+
+        self.assertGreater(after.allocate(REALM, PLAN_ID), recorded)
 
     def test_history_is_read_on_every_allocation(self):
         # Another allocator on the same spool records a later attempt after

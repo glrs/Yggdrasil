@@ -11,7 +11,9 @@ from yggdrasil.flow.events.attempt_records import (
     ATTEMPT_REPORT_EVENT,
     ATTEMPT_STARTED_EVENT,
     SpoolAttemptHistory,
+    attempt_record,
     is_record_key,
+    read_attempt_records,
     record_filename,
 )
 from yggdrasil.flow.events.emitter import FileSpoolEmitter
@@ -43,8 +45,30 @@ class TestRecordNames(unittest.TestCase):
                 self.assertFalse(is_record_key(key))
 
 
+class TestAttemptRecordRecognition(unittest.TestCase):
+    """An attempt record is recognized by its content alone."""
+
+    def test_attempt_events_with_a_usable_execution_id_are_records(self):
+        for event_type in (ATTEMPT_STARTED_EVENT, ATTEMPT_REPORT_EVENT):
+            with self.subTest(type=event_type):
+                event = {"type": event_type, "execution_id": FIRST}
+                self.assertIs(attempt_record(event), event)
+
+    def test_anything_else_is_not(self):
+        for event in (
+            {"type": "plan.draft", "execution_id": FIRST},
+            {"type": "step.started", "execution_id": FIRST},
+            {"type": ATTEMPT_STARTED_EVENT},
+            {"type": ATTEMPT_REPORT_EVENT, "execution_id": "a/b"},
+            [ATTEMPT_STARTED_EVENT, FIRST],
+            None,
+        ):
+            with self.subTest(event=event):
+                self.assertIsNone(attempt_record(event))
+
+
 class TestSpoolAttemptHistory(unittest.TestCase):
-    """Only attempt-start records count, and only in the spool given."""
+    """Attempt records count by content, and only in the spool given."""
 
     def setUp(self) -> None:
         temp_dir = TemporaryDirectory()
@@ -73,39 +97,58 @@ class TestSpoolAttemptHistory(unittest.TestCase):
     def test_plan_without_a_spool_directory_has_no_history(self):
         self.assertEqual(self.history.recorded_execution_ids(REALM, PLAN_ID), [])
 
-    def test_reads_every_attempt_start_of_the_plan(self):
+    def write(self, name: str, content: object) -> Path:
+        """Write a file into the plan's spool directory directly."""
+        self.plan_dir.mkdir(parents=True, exist_ok=True)
+        path = self.plan_dir / name
+        text = content if isinstance(content, str) else json.dumps(content)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_reads_every_attempt_record_of_the_plan(self):
         self.record(SECOND)
         self.record(FIRST)
         self.record(SECOND, ATTEMPT_REPORT_EVENT)
 
         self.assertEqual(
-            self.history.recorded_execution_ids(REALM, PLAN_ID), [FIRST, SECOND]
+            self.history.recorded_execution_ids(REALM, PLAN_ID), [FIRST, SECOND, SECOND]
+        )
+
+    def test_records_count_by_content_whatever_their_file_is_called(self):
+        # Reports published before attempt-start records existed were named
+        # after their event ID, and a report can outlive its start record.
+        self.write(
+            "3f2b9c1e-5a6d-4f1e-9b2a-0c7d8e9f1a2b.json",
+            {"type": ATTEMPT_REPORT_EVENT, "execution_id": FIRST},
+        )
+        self.record(SECOND, ATTEMPT_REPORT_EVENT)
+
+        self.assertEqual(
+            sorted(self.history.recorded_execution_ids(REALM, PLAN_ID)),
+            [FIRST, SECOND],
         )
 
     def test_records_that_establish_nothing_are_skipped_with_a_warning(self):
         self.record(FIRST)
-        self.plan_dir.joinpath(
-            record_filename("broken", ATTEMPT_STARTED_EVENT)
-        ).write_text("{not json", encoding="utf-8")
-        # Named like an attempt start, but something else.
-        self.plan_dir.joinpath(
-            record_filename("other", ATTEMPT_STARTED_EVENT)
-        ).write_text(
-            json.dumps({"type": "plan.draft", "execution_id": SECOND}),
-            encoding="utf-8",
+        self.write("broken.json", "{not json")
+        self.write(
+            "bad_id.json", {"type": ATTEMPT_STARTED_EVENT, "execution_id": "../x"}
         )
-        self.plan_dir.joinpath(
-            record_filename("bad_id", ATTEMPT_STARTED_EVENT)
-        ).write_text(
-            json.dumps({"type": ATTEMPT_STARTED_EVENT, "execution_id": "../x"}),
-            encoding="utf-8",
-        )
+        # Not an attempt record at all, so not worth a warning either.
+        self.write("draft.json", {"type": "plan.draft", "execution_id": SECOND})
+        self.write("notes.txt", "not an event")
 
         with self.assertLogs(level="WARNING") as logs:
             ids = self.history.recorded_execution_ids(REALM, PLAN_ID)
 
         self.assertEqual(ids, [FIRST])
-        self.assertEqual(len(logs.records), 3)
+        self.assertEqual(len(logs.records), 2)
+        self.assertEqual(
+            sorted(
+                path.name for path, _ in read_attempt_records(self.plan_dir).problems
+            ),
+            ["bad_id.json", "broken.json"],
+        )
 
     def test_unreadable_plan_directory_is_raised(self):
         self.record(FIRST)
@@ -116,6 +159,36 @@ class TestSpoolAttemptHistory(unittest.TestCase):
         ):
             with self.assertRaises(PermissionError):
                 self.history.recorded_execution_ids(REALM, PLAN_ID)
+
+    def test_unreadable_record_is_raised(self):
+        self.record(FIRST)
+        unreadable = self.plan_dir / record_filename(FIRST, ATTEMPT_STARTED_EVENT)
+        original = Path.read_text
+
+        def read_text(path: Path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("denied")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read_text):
+            with self.assertRaises(PermissionError):
+                self.history.recorded_execution_ids(REALM, PLAN_ID)
+
+    def test_record_pruned_while_being_read_is_skipped(self):
+        self.record(FIRST)
+        self.record(SECOND)
+        pruned = self.plan_dir / record_filename(FIRST, ATTEMPT_STARTED_EVENT)
+        original = Path.read_text
+
+        def read_text(path: Path, *args, **kwargs):
+            if path == pruned:
+                raise FileNotFoundError(str(path))
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read_text):
+            self.assertEqual(
+                self.history.recorded_execution_ids(REALM, PLAN_ID), [SECOND]
+            )
 
     def test_reads_only_the_spool_it_was_given(self):
         elsewhere = self.spool.parent / "default_spool"

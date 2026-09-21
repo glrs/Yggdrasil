@@ -786,8 +786,8 @@ class Engine:
         1. ``plan.attempt_started``, before preflight and before any step runs:
            the attempt's identity and planned step inventory. An attempt that
            runs no step at all — rejected, or with no steps — is still visible,
-           and the record is the history later execution IDs are ordered
-           against.
+           and the record puts the attempt into the history later execution
+           IDs are ordered against.
         2. Each step's own events, as it is reused or executed.
         3. One ``step.blocked`` per step a failure blocks, published as soon
            as the scheduler blocks it and before another step starts, with the
@@ -1391,9 +1391,9 @@ class Engine:
         Published before preflight and before any step runs, so every attempt
         leaves a record, including one that is rejected or has no steps, and
         the record carries the planned inventory a reader needs to show work
-        that has not started. It is also the history later execution IDs for
-        the plan are ordered against, so it must exist before the attempt does
-        anything else.
+        that has not started. It also puts the attempt into the history later
+        execution IDs for the plan are ordered against, so it must exist before
+        the attempt does anything else.
 
         Args:
             plan: The plan being attempted.
