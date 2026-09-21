@@ -10,11 +10,13 @@ test stand-ins. Each test states a guarantee of the callers:
   that prompted it, and duplicate events run one attempt, rechecking the plan
   afterwards;
 - daemon shutdown, by ``asyncio.run`` or by ``stop()``, stops new steps, waits
-  for the running one, and leaves an interrupted plan eligible;
-- run-once exits nonzero for a continuation that finished with failures, and
-  for a result it could not record, after finishing the healthy work;
-- run-once Ctrl+C stops between steps, and its timeout never interrupts a
-  running plan.
+  for the running one, and leaves an interrupted plan eligible; ``stop()``
+  asks for that before it waits for the watchers;
+- run-once exits nonzero for a continuation that finished with failures, for
+  a result it could not record, and for an attempt cancelled without Ctrl+C,
+  after finishing the healthy work;
+- run-once Ctrl+C stops between steps, and its timeout neither interrupts a
+  running plan nor abandons plans already eligible.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from tests.execution_support import (
     ObservedStore,
     RecordingEmitter,
     ScriptedSteps,
+    Watchdog,
     chain_plan,
     lanes_plan,
     make_plan,
@@ -196,6 +199,11 @@ class CallerTestCase(unittest.TestCase):
         self.assertEqual(doc["executed_run_token"], -1)
         self.assertNotIn("last_finalized_execution", doc)
         self.assertTrue(is_plan_eligible(doc))
+
+    def assert_unconsumed_draft(self, plan_id: str) -> None:
+        doc = self.stored(plan_id)
+        self.assertEqual(doc["executed_run_token"], -1)
+        self.assertNotIn("last_finalized_execution", doc)
 
     def spy_on_submissions(self) -> list[asyncio.Future]:
         """Collect the result future of every request the core submits."""
@@ -351,6 +359,33 @@ class TestDaemonExecution(CallerTestCase):
         self.assertEqual(self.steps.calls, ["a"])
         self.assert_unconsumed()
 
+    def test_stop_asks_attempts_to_stop_before_waiting_for_watchers(self):
+        # A watcher can take its time to stop; no step may start meanwhile.
+        gate = self.steps.block("a")
+        doc = self.save()
+        self.release_once_cancellation_is_requested(gate)
+        requested_when_watcher_stopped: list[bool] = []
+
+        class SlowToStopWatcher:
+            async def stop(watcher) -> None:
+                requested_when_watcher_stopped.append(
+                    self.engine.contexts[0].cancellation_requested
+                )
+
+        self.core.register_watcher(SlowToStopWatcher())
+
+        async def main():
+            self.core._running = True
+            self.core._handle_plan_execution_event(plan_event(doc))
+            await gate.reached()
+            await self.core.stop()
+
+        run_bounded(main())
+
+        self.assertEqual(requested_when_watcher_stopped, [True])
+        self.assertEqual(self.steps.calls, ["a"])
+        self.assert_unconsumed()
+
 
 class TestRunOnceExecution(CallerTestCase):
     """``run_once_with_watcher`` and its watcher loop."""
@@ -365,15 +400,30 @@ class TestRunOnceExecution(CallerTestCase):
         self.core.subscriptions[EventType.PROJECT_CHANGE] = [handler]
         return self.core.run_once_with_watcher("P1", timeout_seconds=30)
 
-    def watch(self, *, timeout_seconds: float = 30) -> asyncio.Task[int]:
-        """Start the run-once watcher loop over PLAN_ID as a task."""
+    def watch(self, *plan_ids: str, timeout_seconds: float = 30) -> asyncio.Task[int]:
+        """Start the run-once watcher loop over plan_ids (PLAN_ID) as a task."""
         return asyncio.create_task(
             self.core._run_once_watcher_loop(
-                pending_plan_ids=[PLAN_ID],
+                pending_plan_ids=list(plan_ids or [PLAN_ID]),
                 execution_owner=self.OWNER,
                 timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
             )
         )
+
+    def flag_when_logged(self, text: str) -> threading.Event:
+        """An event set once the core logs a message containing text."""
+        logged = threading.Event()
+
+        class Flag(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if text in record.getMessage():
+                    logged.set()
+
+        flag = Flag()
+        logger = logging.getLogger(CORE_LOGGER)
+        logger.addHandler(flag)
+        self.addCleanup(logger.removeHandler, flag)
+        return logged
 
     def test_failed_continuation_finishes_healthy_work_and_exits_nonzero(self):
         self.steps.fail("lane1_demux", RuntimeError("bad sample sheet"))
@@ -435,16 +485,7 @@ class TestRunOnceExecution(CallerTestCase):
     def test_timeout_never_interrupts_a_running_plan(self):
         gate = self.steps.block("a")
         self.save(authority="run_once", owner=self.OWNER)
-        timed_out = threading.Event()
-
-        class TimeoutFlag(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                if "Timeout after" in record.getMessage():
-                    timed_out.set()
-
-        flag = TimeoutFlag()
-        logging.getLogger(CORE_LOGGER).addHandler(flag)
-        self.addCleanup(logging.getLogger(CORE_LOGGER).removeHandler, flag)
+        timed_out = self.flag_when_logged("Timeout after")
 
         async def scenario():
             loop = self.watch(timeout_seconds=0.01)
@@ -460,6 +501,66 @@ class TestRunOnceExecution(CallerTestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(self.steps.calls, ["a", "b"])
         self.assertEqual(self.stored()["executed_run_token"], 0)
+
+    def test_timeout_still_executes_plans_already_eligible(self):
+        # The timeout bounds the wait for approval. A plan approved and queued
+        # behind a long-running one was never waiting for approval.
+        gate = self.steps.block("a")
+        self.save(authority="run_once", owner=self.OWNER)
+        self.save(
+            make_plan(spec("x"), plan_id="pln_second"),
+            authority="run_once",
+            owner=self.OWNER,
+        )
+        timed_out = self.flag_when_logged("Timeout after")
+
+        async def scenario():
+            loop = self.watch(PLAN_ID, "pln_second", timeout_seconds=0.01)
+            await gate.reached()
+            await asyncio.to_thread(timed_out.wait, WAIT)
+            gate.release()
+            return await loop
+
+        exit_code = run_bounded(scenario())
+
+        self.assertTrue(timed_out.is_set())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self.steps.calls, ["a", "b", "x"])
+        for plan_id in (PLAN_ID, "pln_second"):
+            self.assertEqual(self.stored(plan_id)["executed_run_token"], 0)
+
+    def test_plan_still_unapproved_at_the_timeout_exits_nonzero(self):
+        self.save(authority="run_once", owner=self.OWNER)
+        self.save(
+            make_plan(spec("x"), plan_id="pln_draft"),
+            auto_run=False,
+            authority="run_once",
+            owner=self.OWNER,
+        )
+
+        async def scenario():
+            return await self.watch(PLAN_ID, "pln_draft", timeout_seconds=0.01)
+
+        exit_code = run_bounded(scenario())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(self.stored()["executed_run_token"], 0)
+        self.assertNotIn("x", self.steps.calls)
+        self.assertEqual(self.stored("pln_draft")["status"], "draft")
+        self.assert_unconsumed_draft("pln_draft")
+
+    def test_step_raising_cancelled_error_ends_the_session_with_an_error(self):
+        # Without Ctrl+C, a cancelled attempt is this session's failure: the
+        # session must not wait for its timeout as if the plan were pending.
+        self.steps.fail("a", asyncio.CancelledError("subwork was cancelled"))
+
+        with Watchdog(WAIT) as watchdog:
+            exit_code = self.run_once(chain_plan())
+
+        self.assertFalse(watchdog.expired)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(self.steps.calls, ["a"])
+        self.assert_unconsumed()
 
 
 if __name__ == "__main__":

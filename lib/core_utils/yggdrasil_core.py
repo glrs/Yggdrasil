@@ -791,17 +791,22 @@ class YggdrasilCore:
         Stop all watchers gracefully. This sets _running=False, so watchers that
         poll or wait in loops will naturally exit. Then we wait for them to finish.
 
-        Plan executions still in flight are then asked to stop starting new
-        steps, and awaited until their running step has finished and their
-        result is recorded or retained. The ops consumer stops last, so it can
-        still pick up the events those executions publish.
+        Plan executions in flight are asked to stop starting new steps before
+        anything else, since stopping the watchers can take a while. Once the
+        watchers have stopped, every execution still in flight, including one
+        a watcher started meanwhile, is asked again and awaited until its
+        running step has finished and its result is recorded or retained. The
+        ops consumer stops last, so it can still pick up the events those
+        executions publish.
         """
         if not self._running:
             self._logger.debug("YggdrasilCore stop called, but not running.")
             return
 
-        self._logger.info("Stopping all watchers...")
         self._running = False
+        self.plan_executions.request_cancellation()
+
+        self._logger.info("Stopping all watchers...")
 
         # Stop legacy watchers
         stop_tasks = [asyncio.create_task(w.stop()) for w in self.watchers]
@@ -1241,12 +1246,17 @@ class YggdrasilCore:
         that finished its request with failures, and a result that could not
         be recorded.
 
-        Ctrl+C stops the session from starting further plans and asks the plan
-        in flight to stop starting further steps; its running step still
-        finishes, and the plan stays eligible. The timeout bounds the wait for
-        plans to become executable, such as waiting for approval. It never
-        interrupts an execution in progress, which is awaited before the
-        session ends.
+        Ctrl+C stops the session from starting further plans, queued ones
+        included, and asks the plan in flight to stop starting further steps;
+        its running step still finishes, and the plan stays eligible. An
+        attempt cancelled without Ctrl+C, by a step raising its own
+        ``CancelledError`` for instance, is an error like any other failure.
+
+        The timeout bounds the wait for plans to become executable, such as
+        waiting for approval. Once it expires, no newly eligible plan is taken
+        on, but plans that are already eligible are still executed, whether
+        running or queued behind a running one; none of those was waiting for
+        approval. An execution in progress is never interrupted by it.
 
         Args:
             pending_plan_ids: List of plan doc IDs to track
@@ -1270,6 +1280,8 @@ class YggdrasilCore:
         requested: asyncio.Queue[str | None] = asyncio.Queue()
         queued: set[str] = set()
         executing_plan: str | None = None
+        # Newly eligible plans are queued only while accepting; the timeout and
+        # Ctrl+C both end that. Only Ctrl+C also abandons plans already queued.
         accepting = True
         interrupted = False
         error_occurred = False
@@ -1281,9 +1293,8 @@ class YggdrasilCore:
             Queues the plan for execution. Ownership and eligibility are
             checked again, from the plan document, when it is executed.
             """
-            # Stop launching new plans once interrupted or timed out. The plan
-            # already running (if any) finishes; subsequent recovered/live
-            # plans are skipped and left pending in the DB for manual handling.
+            # Take on no newly eligible plan once interrupted or timed out;
+            # it is left pending in the DB for manual handling.
             if not accepting:
                 return
 
@@ -1310,14 +1321,17 @@ class YggdrasilCore:
             nonlocal error_occurred
             plan_doc_id = result.plan_doc_id
 
-            if result.status is ExecutionStatus.NOT_ELIGIBLE:
+            if result.status in (
+                ExecutionStatus.NOT_ELIGIBLE,
+                ExecutionStatus.DUPLICATE,
+            ):
                 self._logger.debug(
                     "Plan '%s' no longer eligible; will retry on next poll",
                     plan_doc_id,
                 )
                 return
-            if result.status is ExecutionStatus.CANCELLED:
-                # Interrupted before it finished: left eligible in the DB.
+            if result.status is ExecutionStatus.CANCELLED and interrupted:
+                # Stopped by Ctrl+C before it finished: left eligible in the DB.
                 return
 
             completion_status[plan_doc_id] = True
@@ -1343,7 +1357,7 @@ class YggdrasilCore:
             nonlocal executing_plan
             while (plan_doc_id := await requested.get()) is not None:
                 queued.discard(plan_doc_id)
-                if not accepting or completion_status[plan_doc_id]:
+                if interrupted or completion_status[plan_doc_id]:
                     continue
                 self._logger.info("Executing plan '%s' via Engine...", plan_doc_id)
                 executing_plan = plan_doc_id
@@ -1398,12 +1412,18 @@ class YggdrasilCore:
                 )
             except TimeoutError:
                 accepting = False
-                if executing_plan is not None:
+                ready = [
+                    pid
+                    for pid in pending_plan_ids
+                    if pid == executing_plan or pid in queued
+                ]
+                if ready:
                     self._logger.warning(
-                        "Timeout after %ds; waiting for plan '%s', which is "
-                        "executing, before stopping",
+                        "Timeout after %ds waiting for plans to become "
+                        "executable; executing those already eligible before "
+                        "stopping: %s",
                         timeout_seconds,
-                        executing_plan,
+                        ", ".join(ready),
                     )
 
             # Stop watcher
@@ -1415,9 +1435,10 @@ class YggdrasilCore:
                 pass
 
         finally:
-            # Start nothing new, but let the plan in flight, if any, end: in
-            # full, or after its running step when interrupted. Plans still
-            # queued are left pending in the DB for manual handling.
+            # Take on nothing new. Plans already queued are still executed,
+            # unless interrupted, in which case they are left pending in the DB
+            # for manual handling. The plan in flight, if any, ends in full, or
+            # after its running step when interrupted.
             accepting = False
             requested.put_nowait(None)
             await executing
