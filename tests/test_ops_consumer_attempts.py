@@ -11,17 +11,20 @@ import json
 import shutil
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import Mock, patch
 
+import lib.ops.consumer as consumer_module
 from lib.ops.consumer import FileSpoolConsumer, build_plan_snapshot
 from lib.ops.snapshot import (
     ATTEMPT_FINISHED,
     ATTEMPT_RUNNING,
     PROJECTION_ATTEMPT,
     PROJECTION_LEGACY,
+    STATE_INTERRUPTED,
     STATE_PENDING,
     STATE_UNREACHED,
 )
@@ -29,16 +32,20 @@ from tests.execution_support import (
     REALM,
     SCOPE,
     WAIT,
+    Clock,
     ScriptedSteps,
     make_plan,
     spec,
 )
 from yggdrasil.core.engine import Engine
+from yggdrasil.core.execution_ids import ExecutionIdAllocator, format_execution_id
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.errors import PermanentStepError
 from yggdrasil.flow.events.attempt_records import (
     ATTEMPT_REPORT_EVENT,
     ATTEMPT_STARTED_EVENT,
+    STEP_BLOCKED_EVENT,
+    SpoolAttemptHistory,
     record_filename,
 )
 from yggdrasil.flow.events.emitter import FileSpoolEmitter
@@ -48,6 +55,7 @@ from yggdrasil.flow.outcomes import AttemptReport, TerminationReason
 CONTINUE = CONTINUE_INDEPENDENT_POLICY
 FAIL_FAST = FAIL_FAST_POLICY
 PLAN_ID = "pln_snapshots"
+T0 = datetime(2026, 9, 21, 12, 5, tzinfo=UTC)
 
 
 def plan_of(*specs, policy: str = CONTINUE) -> Plan:
@@ -306,6 +314,56 @@ class TestAttemptEndings(SnapshotTestCase):
             {"a": (STATE_UNREACHED, None), "b": (STATE_UNREACHED, None)},
         )
 
+    def test_step_failing_before_its_wrapper_ran_is_shown_failed(self):
+        # Hashing a declared input is realm-controlled work done before the
+        # @step wrapper runs, so the failure publishes no step event at all.
+        data = self.spool.parent / "input.txt"
+        data.write_text("reads", encoding="utf-8")
+        unhashable = spec("a")
+        unhashable.inputs = {"data": str(data)}
+        with patch(
+            "yggdrasil.core.engine.sha256_file",
+            side_effect=PermissionError("input unreadable"),
+        ):
+            context = self.attempt(plan_of(unhashable, spec("b")))
+
+        snapshot = self.snapshot()
+
+        self.assert_shows(snapshot, context.report)
+        self.assertFalse((self.plan_dir / "a").exists(), "a published an event")
+        self.assertEqual(
+            self.states(snapshot),
+            {"a": ("step.failed", "failed"), "b": ("step.succeeded", "succeeded")},
+        )
+        self.assertEqual(
+            snapshot["steps"]["a"]["error"], context.report.failures["a"].to_dict()
+        )
+        self.assertIsNone(snapshot["steps"]["a"]["run_id"])
+
+    def test_success_event_the_engine_never_confirmed_is_not_shown_as_success(self):
+        # a's wrapper publishes step.succeeded; writing its cache marker then
+        # fails, which aborts the attempt with no outcome recorded for a.
+        with patch(
+            "yggdrasil.core.engine._replace_marker",
+            side_effect=OSError("disk full"),
+        ):
+            context = self.attempt(plan_of(spec("a"), spec("b")))
+
+        snapshot = self.snapshot()
+
+        self.assert_shows(snapshot, context.report)
+        self.assertEqual(
+            snapshot["attempt"]["termination_reason"],
+            TerminationReason.ORCHESTRATION_ERROR.value,
+        )
+        (run_dir,) = (self.plan_dir / "a").iterdir()
+        self.assertTrue(any(run_dir.glob("*_step_succeeded.json")))
+        self.assertEqual(
+            self.states(snapshot),
+            {"a": (STATE_INTERRUPTED, None), "b": (STATE_UNREACHED, None)},
+        )
+        self.assertEqual(snapshot["steps"]["a"]["run_id"], run_dir.name)
+
     def test_consumer_writes_the_snapshot_of_an_attempt_that_ran_no_step(self):
         self.attempt(plan_of(spec("a", "b"), spec("b", "a")))
         writer = Mock()
@@ -366,6 +424,194 @@ class TestAttemptOrder(SnapshotTestCase):
             if any("step_skipped" in p.name for p in run.iterdir())
         )
         self.assertEqual(snapshot["steps"]["a"]["run_id"], retry_run.name)
+
+
+class TestReadingStaysProportional(SnapshotTestCase):
+    """A snapshot reads what its attempt can have left behind, not all history.
+
+    Reads are counted where the consumer opens every step-level file, so each
+    test states exactly which files a snapshot may open.
+    """
+
+    def count_reads(self) -> list[Path]:
+        """Record every step-level file the consumer opens from now on."""
+        reads: list[Path] = []
+        original = consumer_module._safe_load
+
+        def counting(path: Path) -> dict[str, Any]:
+            reads.append(path)
+            return original(path)
+
+        patcher = patch.object(consumer_module, "_safe_load", counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return reads
+
+    def history(self, *step_ids: str, attempts: int = 3) -> None:
+        """Run attempts that each execute every step afresh."""
+        for version in range(attempts):
+            self.attempt(plan_of(*(spec(s, version=version) for s in step_ids)))
+
+    def test_rejected_attempt_reads_no_step_file(self):
+        self.history("a", "b")
+        self.attempt(plan_of(spec("a", "b"), spec("b", "a")))
+        reads = self.count_reads()
+
+        snapshot = self.snapshot()
+
+        self.assertEqual(
+            snapshot["attempt"]["termination_reason"],
+            TerminationReason.PREFLIGHT_REJECTED.value,
+        )
+        self.assertEqual(reads, [])
+
+    def test_blocked_steps_are_never_searched(self):
+        self.history("a", "b", "c")
+        self.steps.fail("a", PermanentStepError("broken"))
+        context = self.attempt(
+            plan_of(spec("a", version=9), spec("b", "a"), spec("c", "b"))
+        )
+        reads = self.count_reads()
+
+        snapshot = self.snapshot()
+
+        self.assertEqual(self.states(snapshot)["c"], ("step.blocked", "blocked"))
+        # Each opens its blocked record only, none of its three earlier runs.
+        blocked_name = record_filename(context.report.execution_id, STEP_BLOCKED_EVENT)
+        for step_id in ("b", "c"):
+            with self.subTest(step=step_id):
+                step_dir = self.plan_dir / step_id
+                self.assertEqual(
+                    [p for p in reads if p.is_relative_to(step_dir)],
+                    [step_dir / blocked_name],
+                )
+
+    def test_steps_outside_the_attempt_are_never_read(self):
+        self.history("a", "retired")
+        self.attempt(plan_of(spec("a", version=9)))
+        reads = self.count_reads()
+
+        snapshot = self.snapshot()
+
+        self.assertEqual(set(snapshot["steps"]), {"a"})
+        self.assertFalse(
+            [p for p in reads if p.is_relative_to(self.plan_dir / "retired")]
+        )
+
+    def test_each_run_directory_is_opened_once_across_cycles(self):
+        # a fails before its wrapper runs, so it has no run in the attempt,
+        # and its search goes through every earlier run of a.
+        self.history("a")
+        data = self.spool.parent / "input.txt"
+        data.write_text("reads", encoding="utf-8")
+        unhashable = spec("a", version=9)
+        unhashable.inputs = {"data": str(data)}
+        with patch(
+            "yggdrasil.core.engine.sha256_file", side_effect=PermissionError("denied")
+        ):
+            self.attempt(plan_of(unhashable))
+        consumer = FileSpoolConsumer(spool_root=self.spool, writer=Mock())
+        reads = self.count_reads()
+
+        consumer.consume()
+        first_cycle = [p for p in reads if p.is_relative_to(self.plan_dir / "a")]
+        del reads[:]
+        consumer.consume()
+        second_cycle = [p for p in reads if p.is_relative_to(self.plan_dir / "a")]
+
+        self.assertEqual(len(first_cycle), 3, "one first event per earlier run")
+        self.assertEqual(second_cycle, [])
+
+
+class TestHistoryAgreement(SnapshotTestCase):
+    """The allocator orders new attempts against exactly what the consumer shows."""
+
+    def write(self, name: str, content: object) -> None:
+        """Write a file into the plan's spool directory directly."""
+        self.plan_dir.mkdir(parents=True, exist_ok=True)
+        text = content if isinstance(content, str) else json.dumps(content)
+        (self.plan_dir / name).write_text(text, encoding="utf-8")
+
+    def test_both_read_the_same_records(self):
+        started = format_execution_id(T0, "a" * 32)
+        report_only = format_execution_id(T0 + timedelta(minutes=1), "b" * 32)
+        provisional = format_execution_id(T0 + timedelta(minutes=2), "c" * 32)
+        self.write(
+            record_filename(started, ATTEMPT_STARTED_EVENT),
+            {"type": ATTEMPT_STARTED_EVENT, "execution_id": started},
+        )
+        self.write(
+            record_filename(report_only, ATTEMPT_REPORT_EVENT),
+            {"type": ATTEMPT_REPORT_EVENT, "execution_id": report_only},
+        )
+        self.write(
+            "0e8f0c1d-uuid-named.json",
+            {"type": ATTEMPT_REPORT_EVENT, "execution_id": provisional},
+        )
+        # Neither is an attempt record, for either reader.
+        later = format_execution_id(T0 + timedelta(days=1), "d" * 32)
+        self.write("draft.json", {"type": "plan.draft", "execution_id": later})
+        self.write("bad.json", {"type": ATTEMPT_REPORT_EVENT, "execution_id": "a/b"})
+        self.write("broken.json", "{not json")
+
+        with self.assertLogs(level="WARNING"):
+            history = SpoolAttemptHistory(self.spool).recorded_execution_ids(
+                REALM, PLAN_ID
+            )
+        shown = self.snapshot()["attempt"]["execution_id"]
+
+        self.assertEqual(set(history), {started, report_only, provisional})
+        self.assertEqual(shown, provisional)
+
+    def test_new_attempt_after_an_upgrade_is_shown_despite_a_clock_behind(self):
+        # History from before attempt-start records: one report, named after
+        # its event ID, and the uncorrelated step events of the time.
+        provisional = format_execution_id(T0, "a" * 32)
+        self.write(
+            "3f2b9c1e-5a6d-4f1e-9b2a-0c7d8e9f1a2b.json",
+            {
+                "type": ATTEMPT_REPORT_EVENT,
+                "execution_id": provisional,
+                "scope": SCOPE,
+                "report": {
+                    "execution_id": provisional,
+                    "step_ids": ["a"],
+                    "step_outcomes": {"a": "succeeded"},
+                    "termination_reason": "completed",
+                },
+            },
+        )
+        self.assertEqual(self.snapshot()["attempt"]["execution_id"], provisional)
+        # The first engine of the upgraded version, started with its clock
+        # behind that report.
+        self.engine = Engine(
+            work_root=self.spool.parent / "work",
+            emitter=FileSpoolEmitter(self.spool),
+            execution_ids=ExecutionIdAllocator(
+                SpoolAttemptHistory(self.spool),
+                clock=Clock(T0 - timedelta(hours=1)),
+            ),
+        )
+        self.steps.fail("a", PermanentStepError("broken"))
+
+        context = self.attempt(plan_of(spec("a")))
+
+        self.assertGreater(context.report.execution_id, provisional)
+        snapshot = self.snapshot()
+        self.assert_shows(snapshot, context.report)
+        self.assertEqual(self.states(snapshot), {"a": ("step.failed", "failed")})
+
+    def test_attempt_with_a_caller_built_id_never_hides_an_allocated_one(self):
+        # "exec_sched_plan" sorts above any allocated ID by name alone.
+        plan = plan_of(spec("a"))
+        custom = AttemptContext.for_plan(plan, execution_id="exec_sched_plan")
+        self.engine._run_attempt(plan, context=custom)
+
+        allocated = self.attempt(plan)
+
+        self.assertEqual(
+            self.snapshot()["attempt"]["execution_id"], allocated.report.execution_id
+        )
 
 
 class TestLegacyHistories(SnapshotTestCase):
