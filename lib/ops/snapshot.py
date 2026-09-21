@@ -5,24 +5,34 @@ Pure functions over events that have already been read; walking the spool is
 precedence rules below be checked without a filesystem.
 
 **One attempt per snapshot.** A snapshot describes a single execution attempt:
-the one with the highest execution ID among the plan's attempt records,
-whether or not it has finished. Execution IDs are allocated in order at
-admission (``yggdrasil.core.execution_ids``), so this is the most recently
-admitted attempt, and replaying or re-delivering an old attempt's events
-cannot change which one is selected. Every step's state comes from that
-attempt's own events. A step the attempt has not reached is shown as not
-reached, never with an earlier attempt's result. Plan generations are opaque
-and run tokens reset on regeneration, so neither is compared to order
-attempts.
+the one whose execution ID orders highest among the plan's attempt records
+(:func:`~yggdrasil.core.execution_ids.execution_order_key`), whether or not it
+has finished. Execution IDs are allocated in order at admission
+(``yggdrasil.core.execution_ids``), so this is the most recently admitted
+attempt, and replaying or re-delivering an old attempt's events cannot change
+which one is selected. Every step's state comes from that attempt's own events
+and report. A step the attempt has not reached is shown as not reached, never
+with an earlier attempt's result. Plan generations are opaque and run tokens
+reset on regeneration, so neither is compared to order attempts.
 
-**Precedence within the attempt.** Once the attempt's report exists, it is
-authoritative for step outcomes, failures and blocker diagnostics: a
-``step.blocked`` event carries only the blockers known when it was published,
-and a delayed or replayed one never narrows the report's lists. Within one
-step run, a terminal event (succeeded, skipped, failed) is never replaced by a
-later non-terminal one, such as a late progress or artifact event; only a
-failure can replace an earlier success. Copies of one event (same ``eid``)
-count once.
+**Precedence within the attempt.** While the attempt runs, its events are all
+there is. Within one step run, a terminal event (succeeded, skipped, failed)
+is never replaced by a later non-terminal one, such as a late progress or
+artifact event; only a failure can replace an earlier success. Copies of one
+event (same ``eid``) count once. Once the attempt's report exists, it decides
+each step's outcome, and a step's state follows from its outcome whatever its
+events say: a step can fail before its ``@step`` wrapper publishes anything,
+and a terminal event can be published for a step whose success the engine then
+never established. A ``step.blocked`` event carries only the blockers known
+when it was published; the report's lists are the complete ones, and a delayed
+or replayed event never narrows them. Metadata the events carry (run, name,
+fingerprint, job, time) is kept whenever it does not contradict the report.
+
+**Step states.** A step's ``state`` is the event type that records its
+outcome (``step.succeeded``, ``step.skipped``, ``step.failed``,
+``step.blocked``), or its latest lifecycle event while it runs. A step with no
+outcome is ``pending`` while the attempt runs, ``interrupted`` once the
+attempt has ended if it had started, and ``unreached`` if it never started.
 
 **Legacy histories.** Events published before attempts were correlated carry
 no execution ID, and which of them belonged to the same attempt was never
@@ -42,10 +52,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from yggdrasil.flow.events.attempt_records import (
-    ATTEMPT_RECORD_EVENTS,
-    STEP_BLOCKED_EVENT,
-)
+from yggdrasil.core.execution_ids import execution_order_key
+from yggdrasil.flow.events.attempt_records import STEP_BLOCKED_EVENT, attempt_record
 from yggdrasil.flow.outcomes import StepOutcome
 
 # What a snapshot projects.
@@ -56,9 +64,11 @@ PROJECTION_LEGACY = "legacy"
 ATTEMPT_RUNNING = "running"
 ATTEMPT_FINISHED = "finished"
 
-# The state of a step with no events in the projected attempt: still to come
-# while the attempt runs, never reached once it has ended.
+# The state of a step with no outcome in the projected attempt: still to come
+# while the attempt runs; once it has ended, cut short if it had started, and
+# never reached if it had not.
 STATE_PENDING = "pending"
+STATE_INTERRUPTED = "interrupted"
 STATE_UNREACHED = "unreached"
 
 # The state of a legacy step run with no step lifecycle event at all.
@@ -71,6 +81,20 @@ _TERMINAL_OUTCOMES: dict[str, StepOutcome] = {
     "step.failed": StepOutcome.FAILED,
 }
 _FAILED_EVENT = "step.failed"
+
+# The state each outcome is shown with: the event type that records it.
+_OUTCOME_STATES: dict[StepOutcome, str] = {
+    **{outcome: event_type for event_type, outcome in _TERMINAL_OUTCOMES.items()},
+    StepOutcome.BLOCKED: STEP_BLOCKED_EVENT,
+}
+
+# Outcomes a step can only reach by being evaluated, so only these leave a run.
+_RUN_OUTCOMES = frozenset(
+    {StepOutcome.SUCCEEDED, StepOutcome.REUSED, StepOutcome.FAILED}
+)
+
+# Fields that identify a step's run rather than describe its outcome.
+_IDENTITY_FIELDS = ("step_name", "fingerprint", "job", "ts")
 
 
 @dataclass(frozen=True)
@@ -124,9 +148,9 @@ class StepStatus:
 
     Attributes:
         step_name: The step's name.
-        state: The step's latest lifecycle event type (e.g. ``step.started``,
-            ``step.failed``, ``step.blocked``), or ``pending``/``unreached``
-            when the attempt has no event for it; None until resolved.
+        state: The event type recording the step's outcome, its latest
+            lifecycle event while it runs, or ``pending``, ``interrupted`` or
+            ``unreached`` when it has no outcome; None until resolved.
         outcome: The step's terminal outcome in the attempt (a
             :class:`~yggdrasil.flow.outcomes.StepOutcome` value), or None if
             it has none (yet).
@@ -136,7 +160,7 @@ class StepStatus:
         artifacts: The artifact manifest the step reported on success.
         metrics: The metrics the step reported on success.
         job: Job details, when the run reported any.
-        ts: Timestamp of the event the state was read from.
+        ts: Timestamp of the event the entry was read from.
         error: How the step failed, for a failed step.
         direct_blockers: For a blocked step, the failed or blocked
             prerequisites that blocked it.
@@ -203,16 +227,15 @@ def select_execution(records: Iterable[Mapping[str, Any]]) -> str | None:
         records: The plan-level events in the plan's spool directory.
 
     Returns:
-        str | None: The highest execution ID among the attempt records,
-        finished or not; None if there are no attempt records.
+        str | None: The execution ID ordering highest among the attempt
+        records, finished or not; None if there are no attempt records.
     """
     execution_ids = {
-        execution_id
+        record["execution_id"]
         for record in records
-        if record.get("type") in ATTEMPT_RECORD_EVENTS
-        and (execution_id := execution_of(record)) is not None
+        if attempt_record(record) is not None
     }
-    return max(execution_ids, default=None)
+    return max(execution_ids, key=execution_order_key, default=None)
 
 
 # ----- one step run -----
@@ -250,8 +273,32 @@ def order_events(events: Iterable[SpooledEvent]) -> list[dict[str, Any]]:
     return ordered
 
 
-def _effective_event(events: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the event a run's state is read from.
+def _run_events(run: StepRun | None, execution_id: str | None) -> list[dict[str, Any]]:
+    """Return a run's events of one attempt, in publication order.
+
+    Only events of ``execution_id`` count, so a foreign event copied into the
+    run changes nothing.
+
+    Args:
+        run: The run, if the step has one.
+        execution_id: The attempt; None for uncorrelated (legacy) events.
+
+    Returns:
+        list[dict[str, Any]]: The events; none if there is no run.
+    """
+    if run is None:
+        return []
+    return [
+        event
+        for event in order_events(run.events)
+        if execution_of(event) == execution_id
+    ]
+
+
+def _effective_index(
+    events: Sequence[Mapping[str, Any]], *, terminal: bool = True
+) -> int | None:
+    """Return the position of the event a run's state is read from.
 
     That is its terminal event once it has one, and its latest step lifecycle
     event before that. Events that are not ``step.*`` events, such as
@@ -259,30 +306,88 @@ def _effective_event(events: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
 
     Args:
         events: The run's events, in publication order.
+        terminal: False to ignore terminal events altogether, for a step whose
+            outcome was never established however its events end.
 
     Returns:
-        dict[str, Any] | None: The effective event; None if the run has no
-        step lifecycle event.
+        int | None: The effective event's position; None if the run has no
+        (non-terminal, if so asked) step lifecycle event.
     """
-    effective: dict[str, Any] | None = None
-    for event in events:
+    effective: int | None = None
+    for position, event in enumerate(events):
         event_type = event.get("type")
         if not isinstance(event_type, str) or not event_type.startswith("step."):
             continue
-        if effective is not None and effective["type"] in _TERMINAL_OUTCOMES:
-            # A terminal outcome stands; only a failure replaces a success.
-            if event_type == _FAILED_EVENT and effective["type"] != _FAILED_EVENT:
-                effective = event
+        if event_type in _TERMINAL_OUTCOMES and not terminal:
             continue
-        effective = event
+        if effective is not None and events[effective]["type"] in _TERMINAL_OUTCOMES:
+            # A terminal outcome stands; only a failure replaces a success.
+            if event_type == _FAILED_EVENT and (
+                events[effective]["type"] != _FAILED_EVENT
+            ):
+                effective = position
+            continue
+        effective = position
     return effective
 
 
-def fold_run(run: StepRun, execution_id: str | None) -> StepStatus:
-    """Reduce one step run to its snapshot entry.
+def _identity(run_id: str | None, events: Sequence[Mapping[str, Any]]) -> StepStatus:
+    """Start an entry with what identifies a step's run, and nothing else.
 
-    Only events of ``execution_id`` count, so a foreign event copied into the
-    run changes nothing.
+    Args:
+        run_id: The step's run, if it has one.
+        events: Events of the step, in order; each identifying field (name,
+            fingerprint, job, time) is read from the latest that carries it.
+
+    Returns:
+        StepStatus: An entry without state, outcome or results.
+    """
+    known: dict[str, Any] = {}
+    for event in events:
+        for key in _IDENTITY_FIELDS:
+            if event.get(key) not in (None, ""):
+                known[key] = event[key]
+    status = StepStatus(run_id=run_id)
+    status.step_name = str(known.get("step_name", ""))
+    status.fingerprint = known.get("fingerprint")
+    status.job = known.get("job")
+    status.ts = known.get("ts")
+    return status
+
+
+def _entry(
+    run_id: str | None, events: Sequence[Mapping[str, Any]], position: int
+) -> StepStatus:
+    """Build an entry from the event a step's state is read from.
+
+    Args:
+        run_id: The step's run, if it has one.
+        events: The run's events of the attempt, in order.
+        position: The position of the effective event among them. Nothing
+            published after it is read.
+
+    Returns:
+        StepStatus: The entry the event describes.
+    """
+    event = events[position]
+    status = _identity(run_id, events[: position + 1])
+    event_type = str(event["type"])
+    outcome = _TERMINAL_OUTCOMES.get(event_type)
+    status.state = event_type
+    status.outcome = outcome.value if outcome is not None else None
+    completed = outcome is not None and outcome.satisfies_dependency()
+    status.progress = event.get("progress", 100 if completed else 0)
+    status.artifacts = event.get("artifacts", [])
+    status.metrics = event.get("metrics", {})
+    if outcome is StepOutcome.FAILED:
+        status.error = {
+            key: event.get(key) for key in ("error", "kind", "code", "advice")
+        }
+    return status
+
+
+def fold_run(run: StepRun, execution_id: str | None) -> StepStatus:
+    """Reduce one step run to its snapshot entry, from its events alone.
 
     Args:
         run: The run.
@@ -293,33 +398,11 @@ def fold_run(run: StepRun, execution_id: str | None) -> StepStatus:
         StepStatus: The run's entry; its state is None if the run has no step
         lifecycle event of that attempt.
     """
-    events = [
-        event
-        for event in order_events(run.events)
-        if execution_of(event) == execution_id
-    ]
-    status = StepStatus(run_id=run.run_id)
-    effective = _effective_event(events)
-    if effective is None:
-        return status
-
-    event_type = effective["type"]
-    outcome = _TERMINAL_OUTCOMES.get(event_type)
-    status.state = event_type
-    status.outcome = outcome.value if outcome is not None else None
-    status.step_name = str(effective.get("step_name") or "")
-    status.fingerprint = effective.get("fingerprint")
-    completed = outcome is not None and outcome.satisfies_dependency()
-    status.progress = effective.get("progress", 100 if completed else 0)
-    status.artifacts = effective.get("artifacts", [])
-    status.metrics = effective.get("metrics", {})
-    status.job = effective.get("job")
-    status.ts = effective.get("ts")
-    if outcome is StepOutcome.FAILED:
-        status.error = {
-            key: effective.get(key) for key in ("error", "kind", "code", "advice")
-        }
-    return status
+    events = _run_events(run, execution_id)
+    position = _effective_index(events)
+    if position is None:
+        return StepStatus(run_id=run.run_id)
+    return _entry(run.run_id, events, position)
 
 
 # ----- one attempt -----
@@ -338,80 +421,208 @@ def _string_list(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
-def _planned_steps(
-    attempt: AttemptEvents, report: Mapping[str, Any] | None
-) -> dict[str, str]:
-    """Return every step the attempt planned, with its name, in plan order.
+def _report_of(attempt: AttemptEvents) -> Mapping[str, Any] | None:
+    """Return the attempt's closed report, if it has been published."""
+    report = attempt.report.get("report") if attempt.report is not None else None
+    return report if isinstance(report, Mapping) else None
 
-    The attempt-start record's inventory, or the report's when the record is
-    missing, followed by any other step the attempt published events for.
+
+def _outcome_of(report: Mapping[str, Any], step_id: str) -> StepOutcome | None:
+    """Return the outcome a report records for a step, if a valid one."""
+    value = _mapping(report, "step_outcomes").get(step_id)
+    try:
+        return StepOutcome(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def _running_step_of(report: Mapping[str, Any]) -> str | None:
+    """Return the step a report says was running when the attempt ended."""
+    running = _mapping(_mapping(report, "diagnostic"), "details").get("running_step_id")
+    return running if isinstance(running, str) else None
+
+
+def _planned_steps(attempt: AttemptEvents) -> dict[str, str] | None:
+    """Return the steps the attempt planned, with their names, in plan order.
 
     Args:
         attempt: The attempt's events.
-        report: Its closed report, if published.
 
     Returns:
-        dict[str, str]: Step names by step ID; a name is empty when only the
-        report or the step's events name the step.
+        dict[str, str] | None: Step names by step ID, from the attempt-start
+        record or, when it is missing, from the report (names then empty);
+        None if neither lists the attempt's steps.
     """
-    planned: dict[str, str] = {}
     steps = attempt.started.get("steps") if attempt.started else None
     if isinstance(steps, list):
+        planned: dict[str, str] = {}
         for entry in steps:
             if isinstance(entry, Mapping) and isinstance(entry.get("step_id"), str):
                 planned.setdefault(entry["step_id"], str(entry.get("step_name") or ""))
-    elif report is not None:
-        planned = dict.fromkeys(_string_list(report.get("step_ids")), "")
-    for step_id in (*attempt.runs, *attempt.blocked):
-        planned.setdefault(step_id, "")
-    return planned
+        return planned
+    report = _report_of(attempt)
+    if report is not None and isinstance(report.get("step_ids"), list):
+        return dict.fromkeys(_string_list(report.get("step_ids")), "")
+    return None
 
 
-def _step_status(
-    step_id: str,
-    attempt: AttemptEvents,
-    report: Mapping[str, Any] | None,
+def planned_step_ids(attempt: AttemptEvents) -> list[str] | None:
+    """Return the steps the attempt planned, in plan order.
+
+    No other step can have run in the attempt, so these are the only step
+    directories worth reading for it.
+
+    Args:
+        attempt: The attempt's records; its runs and blocked events are not
+            needed.
+
+    Returns:
+        list[str] | None: The planned step IDs; None if no record lists them.
+    """
+    planned = _planned_steps(attempt)
+    return list(planned) if planned is not None else None
+
+
+def blocked_steps_to_read(attempt: AttemptEvents, step_ids: Iterable[str]) -> list[str]:
+    """Return the steps that may have a ``step.blocked`` event in the attempt.
+
+    Args:
+        attempt: The attempt's records.
+        step_ids: The steps to consider.
+
+    Returns:
+        list[str]: Every one of them while the attempt runs; once it has
+        ended, only those its report records as blocked.
+    """
+    report = _report_of(attempt)
+    if report is None:
+        return list(step_ids)
+    return [
+        step_id
+        for step_id in step_ids
+        if _outcome_of(report, step_id) is StepOutcome.BLOCKED
+    ]
+
+
+def steps_to_search_for_runs(
+    attempt: AttemptEvents, step_ids: Iterable[str]
+) -> list[str]:
+    """Return the steps that may have a run in the attempt.
+
+    Finding a step's run of one attempt means looking through that step's run
+    directories, all of them if it has none. That search is skipped wherever
+    the attempt's own records rule a run out: a blocked step was never
+    evaluated, and once the report exists, only a step it records as
+    succeeded, reused or failed, or as running when the attempt ended, can
+    have been. A preflight rejection records neither, so it searches nothing.
+
+    Args:
+        attempt: The attempt's records and blocked-step events.
+        step_ids: The steps to consider.
+
+    Returns:
+        list[str]: The steps whose runs are worth searching, in the given
+        order.
+    """
+    report = _report_of(attempt)
+    if report is None:
+        return [step_id for step_id in step_ids if step_id not in attempt.blocked]
+    running = _running_step_of(report)
+    return [
+        step_id
+        for step_id in step_ids
+        if _outcome_of(report, step_id) in _RUN_OUTCOMES or step_id == running
+    ]
+
+
+def _live_status(
+    run_id: str | None,
+    events: Sequence[Mapping[str, Any]],
+    blocked: Mapping[str, Any] | None,
 ) -> StepStatus:
-    """Build one step's entry from the attempt's events, then its report.
+    """Build a step's entry while its attempt is still running.
+
+    Args:
+        run_id: The step's run in the attempt, if it has one.
+        events: That run's events of the attempt, in order.
+        blocked: The step's ``step.blocked`` event, if it has one.
+
+    Returns:
+        StepStatus: The step's entry, as its events describe it.
+    """
+    position = _effective_index(events)
+    if position is not None:
+        return _entry(run_id, events, position)
+    if blocked is not None:
+        status = _identity(None, [blocked])
+        status.state = STEP_BLOCKED_EVENT
+        status.outcome = StepOutcome.BLOCKED.value
+        status.direct_blockers = _string_list(blocked.get("direct_blockers"))
+        status.failed_ancestors = _string_list(blocked.get("failed_ancestors"))
+        return status
+    status = StepStatus(run_id=run_id)
+    status.state = STATE_PENDING
+    return status
+
+
+def _settled_status(
+    step_id: str,
+    run_id: str | None,
+    events: Sequence[Mapping[str, Any]],
+    blocked: Mapping[str, Any] | None,
+    report: Mapping[str, Any],
+) -> StepStatus:
+    """Build a step's entry once its attempt has ended, from the report first.
 
     Args:
         step_id: The step.
-        attempt: The attempt's events.
-        report: Its closed report, if published.
+        run_id: The step's run in the attempt, if it has one.
+        events: That run's events of the attempt, in order.
+        blocked: The step's ``step.blocked`` event, if it has one.
+        report: The attempt's closed report.
 
     Returns:
-        StepStatus: The step's entry.
+        StepStatus: The step's entry, as the report decides it.
     """
-    run = attempt.runs.get(step_id)
-    status = fold_run(run, attempt.execution_id) if run is not None else StepStatus()
+    outcome = _outcome_of(report, step_id)
+    if outcome is None:
+        # No outcome was established, whatever the events claim: a terminal
+        # event can outlive an attempt that failed before recording it.
+        latest = _effective_index(events, terminal=False)
+        status = (
+            _entry(run_id, events, latest)
+            if latest is not None
+            else _identity(run_id, events)
+        )
+        reached = bool(events) or step_id == _running_step_of(report)
+        status.state = STATE_INTERRUPTED if reached else STATE_UNREACHED
+        return status
 
-    blocked = attempt.blocked.get(step_id)
-    if blocked is not None and status.state is None:
-        status.state = STEP_BLOCKED_EVENT
-        status.outcome = StepOutcome.BLOCKED.value
-        status.step_name = str(blocked.get("step_name") or "")
-        status.ts = blocked.get("ts")
-        status.direct_blockers = _string_list(blocked.get("direct_blockers"))
-        status.failed_ancestors = _string_list(blocked.get("failed_ancestors"))
-
-    if report is not None:
-        # The report is the attempt's own account and supersedes its events.
-        outcome = _mapping(report, "step_outcomes").get(step_id)
-        status.outcome = outcome if isinstance(outcome, str) else None
-        if outcome == StepOutcome.BLOCKED.value:
-            status.state = STEP_BLOCKED_EVENT
-            status.direct_blockers = _string_list(
-                _mapping(report, "direct_blockers").get(step_id)
-            )
-            status.failed_ancestors = _string_list(
-                _mapping(report, "failed_ancestors").get(step_id)
-            )
-        failure = _mapping(report, "failures").get(step_id)
-        if isinstance(failure, Mapping):
-            status.error = dict(failure)
-
-    if status.state is None:
-        status.state = STATE_UNREACHED if report is not None else STATE_PENDING
+    state = _OUTCOME_STATES[outcome]
+    position = _effective_index(events)
+    if position is not None and events[position]["type"] == state:
+        status = _entry(run_id, events, position)
+    else:
+        # The events do not record this outcome: the step failed before its
+        # @step wrapper published anything, its terminal event is missing, or
+        # only the report survives. Keep what identifies the run.
+        identifying: Sequence[Mapping[str, Any]] = events or (
+            [blocked] if blocked is not None else []
+        )
+        status = _identity(run_id, identifying)
+        status.state = state
+        status.progress = 100 if outcome.satisfies_dependency() else 0
+    status.outcome = outcome.value
+    if outcome is StepOutcome.BLOCKED:
+        status.direct_blockers = _string_list(
+            _mapping(report, "direct_blockers").get(step_id)
+        )
+        status.failed_ancestors = _string_list(
+            _mapping(report, "failed_ancestors").get(step_id)
+        )
+    failure = _mapping(report, "failures").get(step_id)
+    if isinstance(failure, Mapping):
+        status.error = dict(failure)
     return status
 
 
@@ -430,14 +641,22 @@ def project_attempt(
     Returns:
         tuple: The attempt summary and the step entries by step ID.
     """
-    report_event = attempt.report
-    report: Mapping[str, Any] | None = None
-    if report_event is not None and isinstance(report_event.get("report"), Mapping):
-        report = report_event["report"]
+    report = _report_of(attempt)
+    planned = _planned_steps(attempt) or {}
+    for step_id in (*attempt.runs, *attempt.blocked):
+        planned.setdefault(step_id, "")
 
     steps: dict[str, dict[str, Any]] = {}
-    for step_id, step_name in _planned_steps(attempt, report).items():
-        status = _step_status(step_id, attempt, report)
+    for step_id, step_name in planned.items():
+        run = attempt.runs.get(step_id)
+        run_id = run.run_id if run is not None else None
+        events = _run_events(run, attempt.execution_id)
+        blocked = attempt.blocked.get(step_id)
+        status = (
+            _live_status(run_id, events, blocked)
+            if report is None
+            else _settled_status(step_id, run_id, events, blocked, report)
+        )
         status.step_name = status.step_name or step_name
         steps[step_id] = status.to_dict()
 

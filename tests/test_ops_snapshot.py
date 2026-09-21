@@ -11,6 +11,7 @@ from typing import Any
 from lib.ops.snapshot import (
     ATTEMPT_FINISHED,
     ATTEMPT_RUNNING,
+    STATE_INTERRUPTED,
     STATE_PENDING,
     STATE_UNKNOWN,
     STATE_UNREACHED,
@@ -252,31 +253,152 @@ class TestAttemptProjection(unittest.TestCase):
         self.assertEqual(steps["j"]["direct_blockers"], ["a", "b"])
         self.assertEqual(steps["j"]["failed_ancestors"], ["a", "b"])
 
-    def test_report_decides_outcomes_and_names_work_never_reached(self):
+    def test_unconfirmed_terminal_event_does_not_make_an_outcome(self):
         # The attempt aborted after a's success event but before a's success
         # was finalized; b was never reached.
         attempt = AttemptEvents(
             execution_id=NEWER,
             started=started(NEWER, "a", "b"),
             runs={
-                "a": run("run_a", event("step.succeeded", seq=2, execution_id=NEWER))
+                "a": run(
+                    "run_a",
+                    event("step.started", seq=1, execution_id=NEWER, fingerprint="f"),
+                    event(
+                        "step.succeeded",
+                        seq=2,
+                        execution_id=NEWER,
+                        artifacts=[{"key": "x"}],
+                    ),
+                )
             },
             report=report_event(
                 NEWER,
                 termination_reason="orchestration_error",
                 outcome="failed",
                 step_outcomes={},
-                diagnostic={"message": "marker write failed"},
+                diagnostic={
+                    "message": "marker write failed",
+                    "details": {"running_step_id": "a"},
+                },
             ),
         )
 
         summary, steps = project_attempt(attempt)
 
         self.assertEqual(summary["termination_reason"], "orchestration_error")
-        self.assertEqual(summary["diagnostic"], {"message": "marker write failed"})
-        self.assertEqual(steps["a"]["state"], "step.succeeded")
-        self.assertIsNone(steps["a"]["outcome"])
+        self.assertEqual(
+            (steps["a"]["state"], steps["a"]["outcome"]), (STATE_INTERRUPTED, None)
+        )
+        # What the run had reached is kept; the unconfirmed success is not.
+        self.assertEqual(steps["a"]["run_id"], "run_a")
+        self.assertEqual(steps["a"]["fingerprint"], "f")
+        self.assertEqual(steps["a"]["artifacts"], [])
+        self.assertEqual(steps["a"]["progress"], 0)
         self.assertEqual(steps["b"]["state"], STATE_UNREACHED)
+
+    def test_step_running_when_the_attempt_ended_is_interrupted_without_events(self):
+        # Preparing a's execution context failed: it was running, but its
+        # @step wrapper never published anything.
+        attempt = AttemptEvents(
+            execution_id=NEWER,
+            started=started(NEWER, "a", "b"),
+            report=report_event(
+                NEWER,
+                termination_reason="orchestration_error",
+                step_outcomes={},
+                diagnostic={"details": {"running_step_id": "a"}},
+            ),
+        )
+
+        _, steps = project_attempt(attempt)
+
+        self.assertEqual(steps["a"]["state"], STATE_INTERRUPTED)
+        self.assertEqual(steps["b"]["state"], STATE_UNREACHED)
+
+    def test_report_decides_the_state_of_every_step_with_an_outcome(self):
+        # Only the report survives: no start record, no step events.
+        attempt = AttemptEvents(
+            execution_id=NEWER,
+            report=report_event(
+                NEWER,
+                step_ids=["ok", "cached", "bad", "stuck", "never"],
+                step_outcomes={
+                    "ok": "succeeded",
+                    "cached": "reused",
+                    "bad": "failed",
+                    "stuck": "blocked",
+                },
+                failures={"bad": {"step_id": "bad", "error": "boom"}},
+                direct_blockers={"stuck": ["bad"]},
+                failed_ancestors={"stuck": ["bad"]},
+            ),
+        )
+
+        _, steps = project_attempt(attempt)
+
+        self.assertEqual(
+            {
+                sid: (e["state"], e["outcome"], e["progress"])
+                for sid, e in steps.items()
+            },
+            {
+                "ok": ("step.succeeded", "succeeded", 100),
+                "cached": ("step.skipped", "reused", 100),
+                "bad": ("step.failed", "failed", 0),
+                "stuck": (STEP_BLOCKED_EVENT, "blocked", 0),
+                "never": (STATE_UNREACHED, None, 0),
+            },
+        )
+        self.assertEqual(steps["bad"]["error"], {"step_id": "bad", "error": "boom"})
+        self.assertEqual(steps["stuck"]["direct_blockers"], ["bad"])
+        self.assertIsNone(steps["ok"]["run_id"])
+
+    def test_report_failure_overrides_a_run_left_without_its_terminal_event(self):
+        attempt = AttemptEvents(
+            execution_id=NEWER,
+            started=started(NEWER, "a", "b"),
+            runs={
+                "a": run(
+                    "run_a",
+                    event(
+                        "step.started",
+                        seq=1,
+                        execution_id=NEWER,
+                        fingerprint="fa",
+                        step_name="A",
+                        ts="t1",
+                    ),
+                    event("step.progress", seq=2, execution_id=NEWER, progress=60),
+                ),
+                "b": run(
+                    "run_b",
+                    event("step.started", seq=1, execution_id=NEWER, fingerprint="fb"),
+                ),
+            },
+            report=report_event(
+                NEWER,
+                step_outcomes={"a": "failed", "b": "succeeded"},
+                failures={"a": {"step_id": "a", "error": "lost"}},
+            ),
+        )
+
+        _, steps = project_attempt(attempt)
+
+        self.assertEqual(
+            {k: steps["a"][k] for k in ("state", "outcome", "run_id", "fingerprint")},
+            {
+                "state": "step.failed",
+                "outcome": "failed",
+                "run_id": "run_a",
+                "fingerprint": "fa",
+            },
+        )
+        self.assertEqual(steps["a"]["progress"], 0)
+        self.assertEqual(steps["a"]["error"], {"step_id": "a", "error": "lost"})
+        self.assertEqual(
+            (steps["b"]["state"], steps["b"]["progress"], steps["b"]["run_id"]),
+            ("step.succeeded", 100, "run_b"),
+        )
 
     def test_report_without_a_start_record_still_describes_the_attempt(self):
         attempt = AttemptEvents(
