@@ -19,6 +19,7 @@ import threading
 import unittest
 from collections import Counter
 from collections.abc import Callable, Coroutine
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeVar
@@ -72,6 +73,20 @@ SCOPE = {"kind": "project", "id": "P1"}
 RETRYABLE = PlanStoreError("database is locked", retryable=True)
 
 T = TypeVar("T")
+
+
+class Clock:
+    """A clock for execution-ID allocators that stays where a test puts it.
+
+    Attributes:
+        now: The time it returns; timezone-aware.
+    """
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
 class EventLoopStalled(Exception):
