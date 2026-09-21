@@ -650,6 +650,8 @@ class CouchDBExecutionClient:
 
         Emission failures are caught and logged; they never propagate to the caller.
         The backend write result is authoritative regardless of emission outcome.
+        Within an execution attempt, the event carries the attempt's correlation
+        fields like every other event of the step.
         """
         if self._trace is None or self._trace.emitter is None:
             return
@@ -672,6 +674,8 @@ class CouchDBExecutionClient:
             },
             **extra,
         }
+        if self._trace.correlation is not None:
+            event.update(self._trace.correlation.event_fields())
         try:
             self._trace.emitter.emit(event)
         except Exception:

@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any
 
 from yggdrasil.flow.errors import OrchestrationError
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 from yggdrasil.flow.utils.ygg_time import utcnow_iso
 
 
@@ -468,6 +469,20 @@ class AttemptReport:
         )
 
     # ----- derived views -----
+
+    @property
+    def correlation(self) -> ExecutionCorrelation:
+        """The identity every event of this attempt is stamped with.
+
+        Returns:
+            ExecutionCorrelation: The execution ID with the captured plan
+            generation and run token.
+        """
+        return ExecutionCorrelation(
+            execution_id=self.execution_id,
+            plan_generation=self.plan_generation,
+            run_token=self.run_token,
+        )
 
     @property
     def unreached_step_ids(self) -> list[str]:

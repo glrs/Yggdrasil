@@ -17,6 +17,7 @@ from yggdrasil.flow.errors import (
     PermanentStepError,
     TransientStepError,
 )
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
 from yggdrasil.flow.outputs import MISSING_REQUIRED_OUTPUTS_CODE, find_missing_outputs
@@ -108,6 +109,10 @@ class StepContext:
     # declared outputs (injected by Engine). The @step wrapper will not report
     # success while any of them is missing.
     required_outputs: dict[str, Path] = field(default_factory=dict)
+    # The execution attempt this invocation belongs to (injected by Engine).
+    # Stamped onto every event, so one attempt's events can be told apart from
+    # another attempt's events for the same step.
+    correlation: ExecutionCorrelation | None = None
     _seq: int = 0  # private counter, starts at 0
     _artifacts: list[Artifact] = field(default_factory=list)
 
@@ -121,6 +126,11 @@ class StepContext:
 
     def emit(self, type_: str, **payload: Any) -> None:
         """Publish one step lifecycle event.
+
+        When the context belongs to an execution attempt, the event carries the
+        attempt's correlation fields (``execution_id``, ``plan_generation``,
+        ``run_token``). They are applied after the payload, so a payload field
+        cannot move the event into a different attempt.
 
         Args:
             type_: Event type, e.g. "step.started".
@@ -141,6 +151,8 @@ class StepContext:
             "fingerprint": self.fingerprint,
             **payload,
         }
+        if self.correlation is not None:
+            event.update(self.correlation.event_fields())
         # Route into nested dirs for readability
         # NOTE: We let the `emitter` decide final path; pass hints in the event
         event["_spool_path"] = {

@@ -23,6 +23,7 @@ from yggdrasil.flow.data_access.models import (
     DataAccessTraceContext,
     DataAccessWriteResult,
 )
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 
 # ---------------------------------------------------------------------------
 # Setup helpers
@@ -525,6 +526,33 @@ class TestCouchDBExecutionClientEvents(unittest.TestCase):
         self.assertEqual(sp["realm"], trace.realm)
         self.assertEqual(sp["plan_id"], trace.plan_id)
         self.assertEqual(sp["step_id"], trace.step_id)
+
+    def test_events_carry_the_attempt_the_step_belongs_to(self):
+        mock_emitter = MagicMock()
+        trace = self._make_trace(mock_emitter)
+        trace.correlation = ExecutionCorrelation(
+            execution_id="exec_1", plan_generation="gen", run_token=2
+        )
+        handler = make_handler_mock(put_result={"rev": "1-abc"})
+        client = make_execution_client(handler, trace_context=trace)
+        client.save({}, doc_id="x", mode="create")
+        event = mock_emitter.emit.call_args[0][0]
+        self.assertEqual(
+            {
+                key: event[key]
+                for key in ("execution_id", "plan_generation", "run_token")
+            },
+            {"execution_id": "exec_1", "plan_generation": "gen", "run_token": 2},
+        )
+
+    def test_events_outside_an_attempt_are_uncorrelated(self):
+        mock_emitter = MagicMock()
+        handler = make_handler_mock(put_result={"rev": "1-abc"})
+        client = make_execution_client(
+            handler, trace_context=self._make_trace(mock_emitter)
+        )
+        client.save({}, doc_id="x", mode="create")
+        self.assertNotIn("execution_id", mock_emitter.emit.call_args[0][0])
 
     def test_write_events_have_unique_filenames(self):
         """Two save() calls in the same step produce unique _spool_path filenames."""

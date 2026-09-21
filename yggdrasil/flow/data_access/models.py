@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from yggdrasil.flow.events.correlation import ExecutionCorrelation
     from yggdrasil.flow.events.emitter import EventEmitter
 
 
@@ -22,6 +23,8 @@ class DataAccessTraceContext:
         step_name: Human-readable step name.
         scope: Step scope dict.
         emitter: Event emitter for write trace events. None if not configured.
+        correlation: The execution attempt the step belongs to, stamped onto
+            write trace events. None outside an execution attempt.
     """
 
     realm: str
@@ -32,6 +35,7 @@ class DataAccessTraceContext:
     step_name: str | None = None
     scope: dict[str, Any] = field(default_factory=dict)
     emitter: EventEmitter | None = None
+    correlation: ExecutionCorrelation | None = None
 
 
 @dataclass(frozen=True)

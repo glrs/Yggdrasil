@@ -10,6 +10,7 @@ from yggdrasil.flow.errors import (
     PermanentStepError,
     TransientStepError,
 )
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 from yggdrasil.flow.events.emitter import EventEmitter, FileSpoolEmitter
 from yggdrasil.flow.model import Artifact, StepResult
 from yggdrasil.flow.outputs import MISSING_REQUIRED_OUTPUTS_CODE
@@ -554,6 +555,40 @@ class TestStepContext(unittest.TestCase):
         calls = self.mock_emitter.emit.call_args_list
         actual_pcts = [call[0][0]["progress"] for call in calls]
         self.assertEqual(actual_pcts, percentages)
+
+    # =====================================================
+    # EXECUTION CORRELATION TESTS
+    # =====================================================
+
+    def test_context_outside_an_attempt_publishes_uncorrelated_events(self):
+        self.ctx.emit("test.event")
+
+        emitted = self.mock_emitter.emit.call_args[0][0]
+        for key in ("execution_id", "plan_generation", "run_token"):
+            self.assertNotIn(key, emitted)
+
+    def test_context_in_an_attempt_stamps_every_event_it_publishes(self):
+        correlation = ExecutionCorrelation(
+            execution_id="exec_1", plan_generation="gen", run_token=4
+        )
+        self.ctx.correlation = correlation
+        (self.workdir / "out.txt").write_text("x", encoding="utf-8")
+
+        self.ctx.emit("test.event")
+        self.ctx.progress(50)
+        self.ctx.record_artifact(
+            SimpleArtifactRef(key_name="out", folder=".", filename="out.txt"),
+            path=self.workdir / "out.txt",
+        )
+
+        events = [call[0][0] for call in self.mock_emitter.emit.call_args_list]
+        self.assertEqual(len(events), 3)
+        for emitted in events:
+            with self.subTest(type=emitted["type"]):
+                self.assertEqual(
+                    {key: emitted[key] for key in correlation.event_fields()},
+                    correlation.event_fields(),
+                )
 
 
 class TestStepDecorator(unittest.TestCase):

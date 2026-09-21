@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 
+from yggdrasil.flow.events.correlation import ExecutionCorrelation
 from yggdrasil.flow.model import Plan
 from yggdrasil.flow.outcomes import AttemptReport
 
@@ -116,6 +117,11 @@ class AttemptContext:
     def run_token(self) -> int | None:
         """Captured execution request token, if the caller supplied one."""
         return self.report.run_token
+
+    @property
+    def correlation(self) -> ExecutionCorrelation:
+        """The identity every event of this attempt is stamped with."""
+        return self.report.correlation
 
     # ----- cancellation -----
 
