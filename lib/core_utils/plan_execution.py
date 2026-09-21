@@ -95,6 +95,7 @@ from typing import Any, TypeVar
 
 from lib.core_utils.logging_utils import custom_logger
 from lib.core_utils.plan_eligibility import get_eligibility_reason, is_plan_eligible
+from lib.core_utils.worker_futures import outlast_cancellation
 from lib.storage.errors import PlanStoreError
 from lib.storage.plan_documents import (
     plan_generation_of,
@@ -110,7 +111,6 @@ from lib.storage.plan_updates import (
 )
 from lib.storage.protocols import PlanStore
 from yggdrasil.core.engine import Engine
-from yggdrasil.core.execution_ids import ExecutionIdAllocator
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.model import Plan
 from yggdrasil.flow.outcomes import AttemptReport, ExecutionOutcome, TerminationReason
@@ -346,21 +346,6 @@ def _resolve(future: asyncio.Future[ExecutionResult], result: ExecutionResult) -
         future.set_result(result)
 
 
-def _cancellation_requested_of_current_task() -> bool:
-    """Whether the running task has been asked to cancel.
-
-    Tells a cancellation of this task apart from a CancelledError that some
-    other code raised, such as a worker's: only ``Task.cancel()`` counts here.
-    The count is never withdrawn, so once cancelled, a task stays cancelled
-    for this check, which is what its coordination needs.
-
-    Returns:
-        bool: True if ``cancel()`` has been called on the current task.
-    """
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
 def _describe_attempt(report: AttemptReport) -> str:
     """Summarize an attempt's report for log messages.
 
@@ -410,7 +395,6 @@ class PlanExecutionCoordinator:
         finalization_attempts: int = FINALIZATION_ATTEMPTS,
         finalization_backoff: Sequence[float] = FINALIZATION_BACKOFF_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        execution_ids: ExecutionIdAllocator | None = None,
         store_executor: Executor | None = None,
     ) -> None:
         """Initialize the coordinator.
@@ -425,10 +409,6 @@ class PlanExecutionCoordinator:
                 attempt after the first.
             sleep: Awaitable sleep used for that backoff; replaceable so tests
                 can observe the delays without waiting them out.
-            execution_ids: Allocates each attempt's execution ID. Defaults to
-                the engine's allocator, which ``Engine.run`` uses too, so
-                coordinated and direct attempts at a plan are ordered against
-                each other.
             store_executor: Executor for blocking plan-store calls; a small
                 dedicated thread pool when omitted.
 
@@ -451,7 +431,6 @@ class PlanExecutionCoordinator:
         self._attempts = finalization_attempts
         self._backoff = tuple(finalization_backoff)
         self._sleep = sleep
-        self._execution_ids = execution_ids or engine.execution_ids
         self._store_executor = store_executor or ThreadPoolExecutor(
             max_workers=PLAN_STORE_WORKERS, thread_name_prefix="ygg-plan-store"
         )
@@ -787,8 +766,12 @@ class PlanExecutionCoordinator:
     ) -> str:
         """Allocate the execution ID of the attempt about to be made.
 
-        Allocation reads the plan's recorded attempts, so it runs in a worker
-        thread, never on the event loop.
+        The engine's allocator is the only one: the coordinator holds none of
+        its own, and reads the engine's at every allocation, so coordinated
+        and direct ``Engine.run`` attempts are always ordered by the same
+        allocator, however it was injected. Allocation reads the plan's
+        recorded attempts, so it runs in a worker thread, never on the event
+        loop.
 
         Args:
             plan_doc_id: The plan document.
@@ -803,7 +786,7 @@ class PlanExecutionCoordinator:
         """
         loop = asyncio.get_running_loop()
         allocation = loop.run_in_executor(
-            None, self._execution_ids.allocate, plan.realm, plan.plan_id
+            None, self._engine.execution_ids.allocate, plan.realm, plan.plan_id
         )
         try:
             return await self._outlast_cancellation(
@@ -1235,19 +1218,11 @@ class PlanExecutionCoordinator:
     ) -> T:
         """Wait for a worker thread's outcome, even if this task is cancelled.
 
-        The future comes from ``run_in_executor``, not from a task, so shutdown
-        routines that cancel every task never cancel it; and awaiting it through
-        ``asyncio.shield`` means cancelling this task cannot cancel it either.
-
-        A CancelledError at the await means one of two things, and whether the
-        future has finished tells them apart. While it has not, this task was
-        cancelled and the worker is still running: that becomes a cooperative
-        cancellation request, and the wait goes on. Once it has, the worker's
-        own outcome is returned or raised unchanged, including a CancelledError
-        that the worker raised itself, which ends its attempt but cancels
-        nothing here. A finished future is never awaited again: that would
-        re-raise its exception without yielding, and a loop doing so would
-        stall the event loop.
+        See :func:`~lib.core_utils.worker_futures.outlast_cancellation`. A
+        cancellation of this task becomes a cooperative cancellation request
+        for the slot, so the attempt starts no further step and the cycle no
+        further request; a CancelledError the worker raised itself ends its
+        attempt but cancels nothing here.
 
         Args:
             future: The worker thread's future.
@@ -1260,16 +1235,9 @@ class PlanExecutionCoordinator:
         Raises:
             BaseException: Whatever the worker raised, CancelledError included.
         """
-        while not future.done():
-            try:
-                await asyncio.shield(future)
-            except asyncio.CancelledError:
-                # Noted even when the worker finished at the same moment: its
-                # outcome still stands, but this coordination starts nothing
-                # further.
-                if _cancellation_requested_of_current_task():
-                    self._note_cancellation(cancel_event, what)
-        return future.result()
+        return await outlast_cancellation(
+            future, functools.partial(self._note_cancellation, cancel_event, what)
+        )
 
     async def _wait_before_retry(
         self, delay: float, cancel_event: threading.Event

@@ -954,17 +954,12 @@ class TestAttemptReporting(ExecutionTestCase):
                 threads.append(threading.get_ident())
                 return []
 
-        coordinator = PlanExecutionCoordinator(
-            engine=self.engine,
-            plan_store=self.store,  # type: ignore[arg-type]
-            sleep=self.record_delay,
-            execution_ids=ExecutionIdAllocator(RecordingThread()),
-        )
+        self.engine.execution_ids = ExecutionIdAllocator(RecordingThread())
         self.save()
 
         async def scenario():
             loop_thread = threading.get_ident()
-            return loop_thread, await coordinator.execute(PLAN_ID, DAEMON_CLAIM)
+            return loop_thread, await self.coordinator.execute(PLAN_ID, DAEMON_CLAIM)
 
         loop_thread, result = run_bounded(scenario())
 
@@ -972,18 +967,22 @@ class TestAttemptReporting(ExecutionTestCase):
         self.assertEqual(len(threads), 1)
         self.assertNotEqual(threads[0], loop_thread)
 
-    def test_coordinated_and_direct_attempts_share_one_order(self):
-        # With the clock held still, only a shared allocator can keep them
-        # apart and in order.
+    def test_the_coordinator_has_no_allocator_of_its_own(self):
+        with self.assertRaises(TypeError):
+            PlanExecutionCoordinator(  # type: ignore[call-arg]
+                engine=self.engine,
+                plan_store=self.store,  # type: ignore[arg-type]
+                execution_ids=ExecutionIdAllocator(),
+            )
+
+    def test_coordinated_and_direct_attempts_share_the_engines_allocator(self):
+        # Replaced after the coordinator was built: it still follows the
+        # engine. With the clock held still, only one shared allocator can
+        # keep the two attempts apart and in order.
         self.engine.execution_ids = ExecutionIdAllocator(clock=Clock(T0))
-        coordinator = PlanExecutionCoordinator(
-            engine=self.engine,
-            plan_store=self.store,  # type: ignore[arg-type]
-            sleep=self.record_delay,
-        )
         self.save()
 
-        coordinated = run_bounded(coordinator.execute(PLAN_ID, DAEMON_CLAIM))
+        coordinated = self.execute()
         direct = self.engine.run(chain_plan())
 
         assert coordinated.report is not None
@@ -1000,24 +999,19 @@ class TestAttemptReporting(ExecutionTestCase):
                 raise PermissionError("spool unreadable")
 
         self.engine.execution_ids = ExecutionIdAllocator(Unreadable())
-        coordinator = PlanExecutionCoordinator(
-            engine=self.engine,
-            plan_store=self.store,  # type: ignore[arg-type]
-            sleep=self.record_delay,
-        )
         self.save()
 
-        result = run_bounded(coordinator.execute(PLAN_ID, DAEMON_CLAIM))
+        result = self.execute()
 
         self.assertEqual(result.status, ExecutionStatus.ADMISSION_FAILED)
         self.assertIn("PermissionError", result.message)
         self.assertEqual(self.engine.contexts, [])
         self.assertEqual(self.emitter.events, [])
         self.assert_unconsumed()
-        self.assertFalse(coordinator.is_in_flight(PLAN_ID))
+        self.assertFalse(self.coordinator.is_in_flight(PLAN_ID))
 
     def held_allocation(self) -> tuple[Gate, PlanExecutionCoordinator]:
-        """A coordinator whose execution-ID allocation waits at a gate."""
+        """The coordinator, with execution-ID allocation waiting at a gate."""
         gate = Gate()
 
         class Held:
@@ -1025,13 +1019,8 @@ class TestAttemptReporting(ExecutionTestCase):
                 gate.pass_through()
                 return []
 
-        coordinator = PlanExecutionCoordinator(
-            engine=self.engine,
-            plan_store=self.store,  # type: ignore[arg-type]
-            sleep=self.record_delay,
-            execution_ids=ExecutionIdAllocator(Held()),
-        )
-        return gate, coordinator
+        self.engine.execution_ids = ExecutionIdAllocator(Held())
+        return gate, self.coordinator
 
     def test_cancellation_during_allocation_starts_no_attempt(self):
         gate, coordinator = self.held_allocation()
