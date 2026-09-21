@@ -11,7 +11,8 @@ test stand-ins. Each test states a guarantee of the callers:
   afterwards;
 - daemon shutdown, by ``asyncio.run`` or by ``stop()``, stops new steps, waits
   for the running one, and leaves an interrupted plan eligible; ``stop()``
-  asks for that before it waits for the watchers;
+  asks for that before it waits for the watchers, and starts nothing for a
+  plan event that arrives while it is stopping;
 - run-once exits nonzero for a continuation that finished with failures, for
   a result it could not record, and for an attempt cancelled without Ctrl+C,
   after finishing the healthy work;
@@ -385,6 +386,74 @@ class TestDaemonExecution(CallerTestCase):
         self.assertEqual(requested_when_watcher_stopped, [True])
         self.assertEqual(self.steps.calls, ["a"])
         self.assert_unconsumed()
+
+    def test_plan_arriving_while_stopping_is_not_started(self):
+        # Shutdown can wait a while for a watcher, which may deliver an event
+        # meanwhile. Stopping cancels only the attempts that already exist, so
+        # an attempt started for that event would run unhindered, all of it.
+        doc = self.save()
+        submitted = self.spy_on_submissions()
+
+        class HeldOpenWatcher:
+            # Created inside the scenario, on the event loop that uses them.
+            stopping: asyncio.Event
+            release: asyncio.Event
+
+            async def stop(watcher) -> None:
+                watcher.stopping.set()
+                await watcher.release.wait()
+
+        watcher = HeldOpenWatcher()
+        self.core.register_watcher(watcher)
+
+        async def main():
+            watcher.stopping = asyncio.Event()
+            watcher.release = asyncio.Event()
+            self.core._running = True
+            stopping = asyncio.create_task(self.core.stop())
+            await watcher.stopping.wait()
+            self.core._handle_plan_execution_event(plan_event(doc))
+            # Let whatever that event started run its course before shutdown
+            # moves on, so nothing but the handler's decision is tested.
+            for future in submitted:
+                await future
+            watcher.release.set()
+            await stopping
+
+        with self.assertLogs(CORE_LOGGER, level=logging.INFO) as logs:
+            run_bounded(main())
+
+        self.assertEqual(self.steps.calls, [])
+        self.assertEqual(self.journal, [])
+        self.assertEqual(submitted, [])
+        self.assert_unconsumed()
+        warnings = [
+            record.getMessage()
+            for record in logs.records
+            if record.levelno == logging.WARNING
+        ]
+        self.assertTrue(
+            any(
+                "is stopping" in message and PLAN_ID in message for message in warnings
+            ),
+            warnings,
+        )
+
+    def test_daemon_started_again_executes_plans_again(self):
+        doc = self.save()
+        submitted = self.spy_on_submissions()
+
+        async def main():
+            self.core._running = True
+            await self.core.stop()
+            await self.core.start()  # no watchers: returns once they have
+            self.core._handle_plan_execution_event(plan_event(doc))
+            return await submitted[0]
+
+        result = run_bounded(main())
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(self.stored()["executed_run_token"], 0)
 
 
 class TestRunOnceExecution(CallerTestCase):

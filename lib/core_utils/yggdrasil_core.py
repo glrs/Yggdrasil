@@ -72,6 +72,10 @@ class YggdrasilCore:
         self.config_path = Path(config_path) if config_path is not None else None
         self._logger = logger or custom_logger(f"{__name__}.{type(self).__name__}")
         self._running = False
+        # Set from the moment stop() begins until start() runs again, so that
+        # plan events arriving during shutdown start no new execution. Kept
+        # apart from _running, which is also False before the first start().
+        self._stopping = False
 
         # Internal storage boundary (plans, plan changes, checkpoints, ops
         # snapshots). Resolved once; all internal persistence goes through it.
@@ -702,6 +706,9 @@ class YggdrasilCore:
         for a plan already in flight is checked again once that attempt is
         done rather than run alongside it.
 
+        While the daemon is stopping, an event starts nothing: its plan is left
+        eligible, with its run token untouched (see :meth:`stop`).
+
         Args:
             event: YggdrasilEvent with payload containing plan_doc_id
         """
@@ -723,6 +730,17 @@ class YggdrasilCore:
             plan_doc_id,
             event.source,
         )
+
+        if self._stopping:
+            # Stopping cancels only the executions that already exist; one
+            # started now would run unhindered while the shutdown waits.
+            self._logger.warning(
+                "Not starting plan '%s': the daemon is stopping. It stays "
+                "eligible, and runs once a running daemon observes another "
+                "change to it.",
+                plan_doc_id,
+            )
+            return
 
         # Non-blocking: the coordinator keeps the execution task, and logs how
         # the request was resolved.
@@ -767,6 +785,7 @@ class YggdrasilCore:
             return
 
         self._running = True
+        self._stopping = False
 
         self._logger.info("Starting operations consumer service...")
         self.ops_consumer.start()
@@ -791,18 +810,23 @@ class YggdrasilCore:
         Stop all watchers gracefully. This sets _running=False, so watchers that
         poll or wait in loops will naturally exit. Then we wait for them to finish.
 
-        Plan executions in flight are asked to stop starting new steps before
-        anything else, since stopping the watchers can take a while. Once the
-        watchers have stopped, every execution still in flight, including one
-        a watcher started meanwhile, is asked again and awaited until its
-        running step has finished and its result is recorded or retained. The
-        ops consumer stops last, so it can still pick up the events those
-        executions publish.
+        Execution winds down first, since stopping the watchers can take a
+        while. From the moment this begins, plan events start no new execution:
+        their plans stay eligible, with their run tokens untouched, and run
+        once a running daemon observes another change to them. Executions
+        already admitted are asked at once to stop starting new steps. Once the
+        watchers have stopped, those executions are awaited until their
+        running step has finished and their result is recorded or retained.
+        The ops consumer stops last, so it can still pick up the events they
+        publish.
         """
         if not self._running:
             self._logger.debug("YggdrasilCore stop called, but not running.")
             return
 
+        # Both before the first await: from here on nothing new may start, and
+        # nothing already admitted may start another step.
+        self._stopping = True
         self._running = False
         self.plan_executions.request_cancellation()
 
