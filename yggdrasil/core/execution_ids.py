@@ -2,10 +2,11 @@
 
 An execution ID is ``exec_<timestamp>_<uuid hex>``, with the timestamp in UTC
 at microsecond precision (``%Y%m%dT%H%M%S%fZ``), the shape run IDs already
-have. Its fixed width makes lexicographic order the same as timestamp order,
-which is what lets a reader pick the most recent attempt at a plan by comparing
-IDs alone. The ID is fixed at admission, before any step runs, so replaying or
-re-delivering an old attempt's events cannot reorder attempts.
+have, and the suffix a full UUID in lowercase hex. Its fixed width makes
+lexicographic order the same as timestamp order, which is what lets a reader
+pick the most recent attempt at a plan by comparing IDs alone. The ID is fixed
+at admission, before any step runs, so replaying or re-delivering an old
+attempt's events cannot reorder attempts.
 
 A clock is not monotonic, so the timestamp is allocated rather than read:
 
@@ -33,9 +34,12 @@ that is behind after a restart can order a new attempt below an old one. A
 missing or pruned history therefore degrades ordering to "correct while the
 clock moves forward", never to IDs that collide.
 
-An ID without the allocated shape, which only a caller-built attempt context
-can carry, orders below every allocated ID (see :func:`execution_order_key`).
-It can therefore never hide an allocated attempt, and needs no floor.
+An ID is *canonical* only if it has exactly that shape and its timestamp is a
+real date and time (see :func:`execution_timestamp`); the allocator produces
+nothing else. Only a caller-built attempt context can carry a non-canonical
+ID, and such an ID orders below every canonical one (see
+:func:`execution_order_key`), however closely it resembles one. It can
+therefore never hide an allocated attempt, and needs no floor.
 
 The timestamp in an ID is an ordering key, not a record of when the attempt
 started; the attempt's report carries that.
@@ -43,6 +47,7 @@ started; the attempt's report carries that.
 
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -52,8 +57,14 @@ from typing import Protocol
 EXECUTION_ID_PREFIX = "exec_"
 
 _TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S%fZ"
-_TIMESTAMP_LENGTH = len("20260101T000000000000Z")
 _RESOLUTION = timedelta(microseconds=1)
+
+# The whole shape of a canonical ID: the prefix, the timestamp at its fixed
+# width, and a full UUID in lowercase hex. ASCII digits only, since \d would
+# also match other scripts' digits.
+_CANONICAL_ID = re.compile(
+    re.escape(EXECUTION_ID_PREFIX) + r"([0-9]{8}T[0-9]{12}Z)_[0-9a-f]{32}"
+)
 
 
 class AttemptHistory(Protocol):
@@ -73,50 +84,76 @@ class AttemptHistory(Protocol):
 
 
 def format_execution_id(timestamp: datetime, suffix: str) -> str:
-    """Build an execution ID from its timestamp and uniqueness suffix.
+    """Build a canonical execution ID from its timestamp and uniqueness suffix.
 
     Args:
         timestamp: A timezone-aware timestamp; converted to UTC.
-        suffix: The uniqueness suffix, normally a full UUID in hex.
+        suffix: The uniqueness suffix: a full UUID in lowercase hex.
 
     Returns:
         str: The execution ID.
+
+    Raises:
+        ValueError: If the ID would not be canonical: the suffix is not a full
+            UUID in lowercase hex, or the year does not take four digits.
     """
     stamp = timestamp.astimezone(UTC).strftime(_TIMESTAMP_FORMAT)
-    return f"{EXECUTION_ID_PREFIX}{stamp}_{suffix}"
+    execution_id = f"{EXECUTION_ID_PREFIX}{stamp}_{suffix}"
+    if execution_timestamp(execution_id) is None:
+        raise ValueError(
+            f"{execution_id!r} is not a canonical execution ID: the suffix must "
+            f"be a full UUID in lowercase hex, and the year take four digits"
+        )
+    return execution_id
 
 
 def execution_timestamp(execution_id: str) -> datetime | None:
-    """Return the timestamp an execution ID was allocated with.
+    """Return the timestamp of a canonical execution ID.
+
+    An ID is canonical only if it has exactly the shape
+    :func:`format_execution_id` produces: the prefix, the timestamp at its
+    fixed width, an underscore and a full UUID in lowercase hex, with the
+    timestamp a real date and time. Parsing the timestamp alone is not enough:
+    the parser accepts fields without their padding, so
+    ``exec_2026111T000000000000Z`` would read as 1 November while sorting
+    above IDs allocated after that. The allocator's floor and the consumer's
+    ordering both go through this one check, so they cannot disagree about
+    which IDs are ordered by their timestamp.
 
     Args:
         execution_id: The execution ID.
 
     Returns:
-        datetime | None: The ID's timestamp, in UTC; None if the ID does not
-        have the allocated shape.
+        datetime | None: The ID's timestamp, in UTC; None if the ID is not
+        canonical.
     """
-    if not execution_id.startswith(EXECUTION_ID_PREFIX):
+    match = _CANONICAL_ID.fullmatch(execution_id)
+    if match is None:
         return None
-    stamp = execution_id[len(EXECUTION_ID_PREFIX) :][:_TIMESTAMP_LENGTH]
+    stamp = match.group(1)
     try:
-        return datetime.strptime(stamp, _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+        timestamp = datetime.strptime(stamp, _TIMESTAMP_FORMAT)
     except ValueError:
         return None
+    # The fixed widths leave the parser a single reading; requiring it to
+    # round-trip rules out any leniency the parser still has.
+    if timestamp.strftime(_TIMESTAMP_FORMAT) != stamp:
+        return None
+    return timestamp.replace(tzinfo=UTC)
 
 
 def execution_order_key(execution_id: str) -> tuple[bool, str]:
     """Return the key attempts at a plan are ordered by.
 
-    Allocated IDs order by their timestamp, which for their fixed-width shape
-    is the same as their name order. Any other ID orders below every allocated
-    one, then by name.
+    Canonical IDs (see :func:`execution_timestamp`) order by their timestamp,
+    which for their fixed-width shape is the same as their name order. Any
+    other ID orders below every canonical one, then by name.
 
     Args:
         execution_id: The execution ID.
 
     Returns:
-        tuple[bool, str]: Whether the ID has the allocated shape, and the ID.
+        tuple[bool, str]: Whether the ID is canonical, and the ID.
     """
     return (execution_timestamp(execution_id) is not None, execution_id)
 
@@ -157,7 +194,8 @@ class ExecutionIdAllocator:
                 None keeps ordering within this allocator only.
             clock: Returns the current time, timezone-aware; replaceable so
                 tests can hold or rewind it.
-            new_suffix: Returns a new uniqueness suffix; replaceable for tests.
+            new_suffix: Returns a new uniqueness suffix, a full UUID in
+                lowercase hex; replaceable for tests.
         """
         self._history = history
         self._clock = clock
@@ -182,11 +220,13 @@ class ExecutionIdAllocator:
             plan_id: The plan.
 
         Returns:
-            str: A new execution ID that orders above every ID this allocator
-            has returned and every ID recorded for the plan.
+            str: A new canonical execution ID that orders above every ID this
+            allocator has returned and every ID recorded for the plan.
 
         Raises:
-            ValueError: If the clock returns a timezone-naive datetime.
+            ValueError: If the clock returns a timezone-naive datetime, or the
+                suffix source returns something other than a full UUID in
+                lowercase hex.
             Exception: Whatever reading the history raised.
         """
         recorded = self._recorded_floor(realm, plan_id)
@@ -209,7 +249,8 @@ class ExecutionIdAllocator:
     def _recorded_floor(self, realm: str, plan_id: str) -> datetime | None:
         """Return the latest timestamp recorded for a plan, if any.
 
-        IDs that do not have the allocated shape order nothing and are ignored.
+        IDs that are not canonical order below every canonical ID anyway, so
+        they set no floor and are ignored.
 
         Args:
             realm: The plan's realm.

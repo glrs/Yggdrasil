@@ -41,6 +41,28 @@ ID_SHAPE = re.compile(r"^exec_\d{8}T\d{12}Z_[0-9a-f]{32}$")
 # Upper bound for cross-thread handshakes. Never slept on.
 WAIT = 5.0
 
+# IDs a caller could build that look allocated but are not canonical.
+UUID_HEX = "a" * 32
+NEAR_MISSES = (
+    "exec_2026111T000000000000Z",  # unpadded date, no suffix
+    "exec_2026111T0000000000000Z_" + UUID_HEX,  # unpadded date, padded time
+    "exec_20261101T000000000000Z",  # no suffix
+    "exec_20261101T000000000000Z_",  # empty suffix
+    "exec_20261101T000000000000Z_" + UUID_HEX[:-1],  # short suffix
+    "exec_20261101T000000000000Z_" + UUID_HEX + "a",  # long suffix
+    "exec_20261101T000000000000Z_" + UUID_HEX.upper(),  # not lowercase
+    "exec_20261101T000000000000Z_" + "g" * 32,  # not hex
+    "exec_20261101T00000000000Z_" + UUID_HEX,  # short time
+    "exec_20261301T000000000000Z_" + UUID_HEX,  # month 13
+    "exec_20260230T000000000000Z_" + UUID_HEX,  # 30 February
+    "exec_20261101T240000000000Z_" + UUID_HEX,  # hour 24
+    "exec_20261101T000000000000Z_" + UUID_HEX + "\n",  # trailing newline
+    " exec_20261101T000000000000Z_" + UUID_HEX,  # leading space
+    "EXEC_20261101T000000000000Z_" + UUID_HEX,  # prefix case
+    "exec_\u0662\u0660\u0662\u0666\u0661\u0661\u0660\u0661T000000000000Z_"
+    + UUID_HEX,  # non-ASCII digits
+)
+
 
 def record_attempt(
     spool: Path,
@@ -128,20 +150,31 @@ class TestExecutionIdShape(unittest.TestCase):
 
     def test_order_key_puts_every_allocated_id_above_any_other(self):
         allocated = [
-            format_execution_id(T0 + timedelta(seconds=s), "0") for s in (2, 0, 1)
+            format_execution_id(T0 + timedelta(seconds=s), "0" * 32) for s in (2, 0, 1)
         ]
-        others = ["exec_sched_plan", "zzz", "exec_2099"]
+        others = ["exec_sched_plan", "zzz", "exec_2099", *NEAR_MISSES]
 
         ordered = sorted(allocated + others, key=execution_order_key)
 
-        self.assertEqual(ordered[:3], sorted(others))
-        self.assertEqual(ordered[3:], sorted(allocated))
+        self.assertEqual(ordered[: len(others)], sorted(others))
+        self.assertEqual(ordered[len(others) :], sorted(allocated))
+
+    def test_ids_that_merely_resemble_the_canonical_shape_are_not_canonical(self):
+        for execution_id in NEAR_MISSES:
+            with self.subTest(execution_id=execution_id):
+                self.assertIsNone(execution_timestamp(execution_id))
+
+    def test_format_builds_only_canonical_ids(self):
+        for suffix in ("x", "", "a" * 31, "a" * 33, "A" * 32, "g" * 32, "a/" * 16):
+            with self.subTest(suffix=suffix):
+                with self.assertRaises(ValueError):
+                    format_execution_id(T0, suffix)
 
     def test_timestamp_is_converted_to_utc(self):
         plus_two = datetime(2026, 9, 21, 16, 5, tzinfo=timezone(timedelta(hours=2)))
 
         self.assertEqual(
-            execution_timestamp(format_execution_id(plus_two, "x")),
+            execution_timestamp(format_execution_id(plus_two, "a" * 32)),
             datetime(2026, 9, 21, 14, 5, tzinfo=UTC),
         )
 
@@ -270,6 +303,27 @@ class TestClockSafety(SpoolTestCase):
         allocator = ExecutionIdAllocator(history, clock=Clock(T0))
 
         self.assertEqual(execution_timestamp(allocator.allocate(REALM, PLAN_ID)), T0)
+
+    def test_id_resembling_an_allocated_one_sets_no_floor_and_orders_below(self):
+        # Parsed on its own, the unpadded timestamp reads as 1 November.
+        malformed = "exec_2026111T000000000000Z"
+        november = datetime(2026, 11, 1, tzinfo=UTC)
+        allocator = ExecutionIdAllocator(
+            HistoryStub([malformed]), clock=Clock(november)
+        )
+
+        allocated = allocator.allocate(REALM, PLAN_ID)
+
+        self.assertEqual(execution_timestamp(allocated), november)
+        self.assertEqual(
+            max([malformed, allocated], key=execution_order_key), allocated
+        )
+
+    def test_suffix_source_that_breaks_the_shape_is_refused(self):
+        allocator = ExecutionIdAllocator(clock=Clock(T0), new_suffix=lambda: "x")
+
+        with self.assertRaises(ValueError):
+            allocator.allocate(REALM, PLAN_ID)
 
     def test_failed_history_read_allocates_nothing(self):
         history = HistoryStub()

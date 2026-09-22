@@ -613,6 +613,40 @@ class TestHistoryAgreement(SnapshotTestCase):
             self.snapshot()["attempt"]["execution_id"], allocated.report.execution_id
         )
 
+    def test_id_resembling_an_allocated_one_never_hides_a_newer_attempt(self):
+        november = datetime(2026, 11, 1, tzinfo=UTC)
+        for index, malformed in enumerate(
+            (
+                # Read on its own, the unpadded date is 1 November, yet the ID
+                # sorts above every ID allocated on that day.
+                "exec_2026111T000000000000Z",
+                "exec_20991231T235959999999Z",  # no suffix
+                "exec_2026111T0000000000000Z_" + "f" * 32,  # timestamp widths off
+            )
+        ):
+            with self.subTest(malformed=malformed):
+                plan = make_plan(
+                    spec("a"), policy=CONTINUE, plan_id=f"pln_malformed_{index}"
+                )
+                self.engine._run_attempt(
+                    plan, context=AttemptContext.for_plan(plan, execution_id=malformed)
+                )
+                self.engine = Engine(
+                    work_root=self.spool.parent / "work",
+                    emitter=FileSpoolEmitter(self.spool),
+                    execution_ids=ExecutionIdAllocator(
+                        SpoolAttemptHistory(self.spool), clock=Clock(november)
+                    ),
+                )
+
+                allocated = self.attempt(plan)
+
+                plan_dir = self.spool / REALM / plan.plan_id
+                shown = build_plan_snapshot(plan_dir, REALM, plan.plan_id)
+                self.assertEqual(
+                    shown["attempt"]["execution_id"], allocated.report.execution_id
+                )
+
 
 class TestLegacyHistories(SnapshotTestCase):
     """Uncorrelated events are a labelled projection, never part of an attempt."""
