@@ -1,8 +1,9 @@
 """Shared builders for plan-store tests.
 
 Provides real plans, finished execution attempts for every way an attempt can
-end, and an in-memory stand-in for the Cloudant client, so the same storage
-scenarios can run against both plan-store backends.
+end, and an in-memory stand-in for the Cloudant client with builders that bind
+the CouchDB plan store and ops snapshot sink to it, so the same storage
+scenarios can run against both backends.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 from lib.couchdb.plan_db_manager import PlanDBManager
+from lib.ops.sinks.couch import OpsWriter
 from lib.storage.plan_updates import ExecutionFinalization
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.model import (
@@ -207,6 +209,7 @@ class FakeApiException(Exception):
 _API_EXCEPTION_BINDINGS = (
     "lib.couchdb.couchdb_connection.ApiException",
     "lib.couchdb.plan_db_manager.ApiException",
+    "lib.ops.sinks.couch.ApiException",
 )
 
 
@@ -272,7 +275,9 @@ class FakeCouchServer:
         return _Result(doc)
 
     def put_document(self, *, db: str, doc_id: str, document: Any) -> _Result:
-        body = copy.deepcopy(dict(document))
+        # The SDK accepts its own Document model as well as a plain mapping.
+        mapping = document.to_dict() if hasattr(document, "to_dict") else document
+        body = copy.deepcopy(dict(mapping))
         rev = body.pop("_rev", None)
         current = self._docs.get(doc_id)
         if rev != (current["_rev"] if current else None):
@@ -323,3 +328,29 @@ def plan_db_manager_on(server: FakeCouchServer) -> PlanDBManager:
         patch.dict(os.environ, {"FAKE_U": "user", "FAKE_P": "pass"}),
     ):
         return PlanDBManager()
+
+
+def ops_writer_on(server: FakeCouchServer) -> OpsWriter:
+    """Construct the CouchDB ops snapshot sink with server as its client.
+
+    Use a server of its own: FakeCouchServer does not keep databases apart.
+
+    Args:
+        server: The fake client to bind.
+
+    Returns:
+        OpsWriter: A snapshot sink that talks only to server.
+    """
+    with (
+        patch(
+            "lib.couchdb.couchdb_connection.CouchDBClientFactory.create_client",
+            return_value=server,
+        ),
+        patch.dict(os.environ, {"FAKE_U": "user", "FAKE_P": "pass"}),
+    ):
+        return OpsWriter(
+            db_name="yggdrasil_ops",
+            url="http://couch.invalid:5984",
+            user_env="FAKE_U",
+            pass_env="FAKE_P",
+        )
