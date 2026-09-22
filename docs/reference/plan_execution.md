@@ -26,7 +26,9 @@ When a plan becomes eligible, the executing process reads the plan document afre
 
 ## Approval status is not an execution outcome
 
-`status` says only whether a plan may run. It stays `"approved"` after a run, however the run went. The outcome of a finished request is recorded in `last_finalized_execution.outcome`, which is `"succeeded"` or `"failed"`. The ops snapshot and the plan summary (`last_finalized_outcome`) show the same outcome.
+`status` says only whether a plan may run. It stays `"approved"` after a run, however the run went. The outcome of a finished request is recorded in `last_finalized_execution.outcome`, which is `"succeeded"` or `"failed"`.
+
+The plan summary's `last_finalized_outcome` reflects `last_finalized_execution`. The ops snapshot reflects something else: the newest observed attempt, which may be newer than the last finalized request, or not finalized at all. For example, if request 0 succeeds and request 1 then fails under `fail_fast`, the snapshot shows request 1's failure, while `last_finalized_execution` still records request 0's success. To relate the two, compare their `execution_id`, `plan_generation` and `run_token`.
 
 `executed_run_token == run_token` means the latest request is **finished**, not that it succeeded. A `continue_independent` plan finishes its request even when steps failed, so it can have equal tokens and a failed outcome. To tell whether the latest request succeeded, check all three:
 
@@ -40,16 +42,18 @@ last_finalized_execution.outcome == "succeeded"
 
 ## Which endings finish a request
 
-Every attempt ends with a report, but only some endings finish the request, recording its result and its token together:
+Every attempt closes a report when it ends, but only some endings finish the request, recording its result and its token together:
 
 | How the attempt ended | `fail_fast` | `continue_independent` |
 |---|---|---|
 | Every step succeeded or was reused | Finished, `succeeded` | Finished, `succeeded` |
 | Every step that could run ran, with some failed or blocked | Not possible: the attempt stops at the first failure | Finished, `failed` |
 | A step failed and the attempt stopped (`failed_fast`) | **Not finished**: stays eligible | Not possible |
-| Rejected by preflight: invalid graph, unknown policy, bad step reference | **Not finished**: stays eligible | Finished, `failed`: rerunning an unchanged plan cannot help |
+| Rejected by preflight: invalid graph, malformed output declarations, or a step reference that is malformed or names a missing module or function | **Not finished**: stays eligible | Finished, `failed`: rerunning an unchanged plan cannot help |
 | Cancelled (daemon shutdown, Ctrl+C) before every step had run | Not finished: stays eligible | Not finished: stays eligible |
-| Aborted by an infrastructure failure, such as the event spool being unwritable | Not finished: stays eligible | Not finished: stays eligible |
+| Aborted by an infrastructure failure, such as the event spool being unwritable, or a step module that exists but fails to import | Not finished: stays eligible | Not finished: stays eligible |
+
+A plan whose `failure_policy` is unknown is rejected by preflight too, but belongs to neither column: it is not a valid `continue_independent` request, so its request stays eligible, like a rejected `fail_fast` one.
 
 A request that is not finished stays eligible. Nothing retries it on a timer: the daemon runs it again the next time it observes a change to the plan document. A `fail_fast` plan therefore keeps its established behavior: after a failure, it runs again on its next change.
 
@@ -61,7 +65,7 @@ Once an attempt has run every step it could, its result is recorded even if the 
 
 ## Requesting a rerun
 
-To run a plan again, raise `run_token` by one and leave `status` as `"approved"`. This is the only way to rerun a finished `continue_independent` request, and it works for any plan. Write the change conditionally on the document's revision (`_rev`), as an approval actor does. On the dev SQLite backend, `python tools/dev_plan_approval.py approve <plan_id>` does this for a plan whose request is finished.
+To run a plan again, raise `run_token` by one and leave `status` as `"approved"`. This is the only way to rerun a finished `continue_independent` request, and it works for any plan. Write the change conditionally on the document's revision (`_rev`), as an approval actor does: if the plan changed since it was read, reread it and decide again. On the dev SQLite backend, the write must also advance the plan-change sequence in the same transaction, or PlanWatcher never observes it (see **Manual plan approval** in [Configuration](../getting_started/configuration.md)).
 
 The new attempt runs in the same work directories as the previous one:
 
@@ -96,13 +100,15 @@ If recording is refused for good, because the plan was regenerated, deleted or r
 
 The ops consumer reads the event spool periodically in daemon mode, and once when `run-doc --run-once` exits. It writes one `plan_status` snapshot per plan to the operations store (`yggdrasil_ops` on CouchDB, or the dev SQLite file).
 
-A snapshot shows **one attempt**: the one with the highest execution ID, finished or not. That is the most recently admitted attempt, and replaying an old attempt's events cannot change the choice. Every step is shown as that attempt left it. A step never takes an earlier attempt's state.
+A snapshot shows **one attempt**: the one whose execution ID orders highest, finished or not. That is normally the most recently admitted attempt, and replaying an old attempt's events cannot change the choice. How far that ordering can be relied on, across restarts, clocks and concurrent processes, is described in [Execution IDs and attempt order](../flow_api/overview.md#execution-ids-and-attempt-order). Every step is shown as that attempt left it. A step never takes an earlier attempt's state.
+
+An attempt shows as `running` until its report is published. An attempt that ended without publishing one, because event publication failed or the process was killed, keeps showing as `running` until a newer attempt is admitted. It did not finish its request, so the plan document does not record it. See [Attempt reports](../flow_api/overview.md#attempt-reports).
 
 | Field | Content |
 |---|---|
 | `type`, `realm`, `plan_id`, `scope`, `updated_at` | Identity of the plan and time of the snapshot |
 | `projection` | `"attempt"`, or `"legacy"` for a plan whose spool has no attempt records (events published before attempts were recorded). A legacy projection shows each step's latest run, which need not belong to one attempt |
-| `attempt` | The attempt shown: `execution_id`, the `plan_generation` and `run_token` it captured, `failure_policy`, `execution_authority`, `execution_owner`, `started_at`, and `state` (`"running"` or `"finished"`). Once finished: `ended_at`, `termination_reason`, `outcome`, `is_drained`, `counts` per outcome plus `unreached`, and any attempt-level `diagnostic`, such as a preflight rejection. `null` for a legacy projection |
+| `attempt` | The attempt shown: `execution_id`, the `plan_generation` and `run_token` it captured, `failure_policy`, `execution_authority`, `execution_owner`, `started_at`, and `state` (`"running"` or `"finished"`). Once finished: `ended_at`, `termination_reason`, `outcome`, `is_drained`, `counts` per outcome plus `unreached` (every step without an outcome, interrupted ones included), and any attempt-level `diagnostic`, such as a preflight rejection. `null` for a legacy projection |
 | `steps` | One entry per planned step, keyed by step ID: `step_name`, `state`, `outcome`, `run_id`, `fingerprint`, `progress`, `artifacts`, `metrics`, `job`, `ts`, `error` for a failed step, and `direct_blockers` and `failed_ancestors` for a blocked one |
 
 A step's `state` is the event type that records its outcome: `step.succeeded`, `step.skipped` (reused), `step.failed` or `step.blocked`. While it runs, it is its latest lifecycle event. A step with no outcome is `pending` while the attempt runs. Once the attempt has ended, it is `interrupted` if it had started and `unreached` if it never did.

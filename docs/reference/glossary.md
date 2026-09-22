@@ -86,10 +86,10 @@ Plan executor. Validates the plan, then runs its steps one at a time in dependen
 A plan's `failure_policy`. `fail_fast` (the default) stops the attempt at the first step failure. `continue_independent` blocks the steps that depend on a failure, runs everything else, and ends the attempt failed.
 
 ### Step outcome
-How a step ended in one attempt: `succeeded`, `reused` (an earlier success was reused), `failed`, or `blocked` (never invoked, because a prerequisite failed or was blocked). A step without an outcome was never reached.
+How a step ended in one attempt: `succeeded`, `reused` (an earlier success was reused), `failed` (its evaluation failed, possibly before its function was called), or `blocked` (never invoked, because a prerequisite failed or was blocked). If the attempt ends before a step establishes an outcome, the snapshot shows it as `interrupted` if it had started and `unreached` otherwise. Neither state implies success or satisfies dependencies.
 
 ### Execution attempt
-One run of a plan, identified by an `execution_id` (`exec_<UTC timestamp>_<hex>`). Later attempts at a plan get higher IDs. Every event an attempt publishes carries its ID, and it ends with an attempt report.
+One run of a plan, identified by an `execution_id` (`exec_<UTC timestamp>_<hex>`), allocated when the attempt is admitted. IDs order a plan's attempts, within the limits described in [Execution IDs and attempt order](../flow_api/overview.md#execution-ids-and-attempt-order). Every event an attempt publishes carries its ID. When it ends, it publishes its report, unless event publication has already failed (see [Attempt reports](../flow_api/overview.md#attempt-reports)).
 
 ### Run token
 `run_token` on a plan document is its latest execution request. `executed_run_token` is the latest request that was finished, which for a `continue_independent` plan may have failed. Raising `run_token` requests a rerun. See [Plan Execution](plan_execution.md).
@@ -112,11 +112,11 @@ Structured JSON records emitted to the configured event spool during plan execut
 - `step.progress` — optional mid-step update
 - `step.artifact` — one artifact registered
 - `step.succeeded` — step completed
-- `step.failed` — step raised an exception, or did not produce a required output
+- `step.failed` — the step's function raised, or returned without a required output
 - `step.retry_unimplemented` — follows `step.failed` for a transient error
 - `step.skipped` — an earlier success was reused (`reason: "cache_hit"`)
 - `step.blocked` — a prerequisite failed or was blocked, so the step will not run
-- `plan.attempt_report` — the attempt ended; carries its full report
+- `plan.attempt_report` — the attempt ended; carries its full report. Not published if event publication already failed during the attempt
 
 Each record contains `type`, `ts`, `eid`, `realm`, `scope`, `plan_id`, and the attempt's `execution_id`, `plan_generation` and `run_token`. Events of a step's run also carry `seq`, `step_id`, `step_name` and `fingerprint`.
 

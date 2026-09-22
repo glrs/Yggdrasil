@@ -96,7 +96,7 @@ Executes one attempt at a `Plan`, a graph of `StepSpec`s:
 2. Creates `<work_root>/<plan_id>/` and writes `plan.json`
 3. Runs each step once its prerequisites (`deps`) have succeeded: creates a workdir, computes a fingerprint, reuses a still-valid earlier success, or else calls the `@step`-decorated function
 4. On a step failure, stops (`fail_fast`), or blocks the failure's dependents and keeps running the rest (`continue_independent`)
-5. Emits structured events to the configured event spool, stamped with the attempt's execution ID, from `plan.attempt_started` to `plan.attempt_report`
+5. Emits structured events to the configured event spool, stamped with the attempt's execution ID: `plan.attempt_started` first, then its steps' events, and `plan.attempt_report` when it ends (see [Attempt reports](../flow_api/overview.md#attempt-reports))
 
 See [Flow API](../flow_api/overview.md#engine-yggdrasilcoreengine).
 

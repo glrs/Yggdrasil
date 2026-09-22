@@ -55,7 +55,7 @@ sequenceDiagram
       end
     end
   end
-  note over Eng,Spool: event-publication or marker failure, or cancellation<br/>between steps, ends the attempt under either policy
+  note over Eng,Spool: event-publication or marker failure, or cancellation<br/>between steps, ends the attempt under either policy;<br/>its report is then published unless event publication is what failed
   Eng->>Emt: emit(plan.attempt_report, completed, with every outcome and blocker)
   Emt->>Spool: {execution_id}_plan_attempt_report.json
   Eng-->>Caller: drained report (outcome failed if any step failed or was blocked)

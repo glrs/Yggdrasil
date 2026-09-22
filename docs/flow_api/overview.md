@@ -153,7 +153,7 @@ A planner is a `BaseHandler` subclass — not just any object implementing `gene
 
 `Engine.run(plan)` runs one **attempt** at a plan. Steps run one at a time, in dependency order:
 
-1. **Preflight**, before anything is written to the work root. The plan is rejected if a step ID is empty or duplicated, a dependency names an unknown step or the step itself, the dependencies form a cycle, `failure_policy` is unknown, `outputs` are malformed, or a step's `fn_ref` cannot be resolved, is not `@step`-decorated, or cannot bind its `params`. A rejected plan raises `PreflightValidationError` (a `ValueError`), and no step runs.
+1. **Preflight**, before anything is written to the work root. The plan is rejected if a step ID is empty or duplicated, a dependency names an unknown step or the step itself, the dependencies form a cycle, `failure_policy` is unknown, `outputs` are malformed, or a step's `fn_ref` is malformed, names a module that does not exist or a function its module does not define, is not a `@step`-decorated callable, or cannot bind its `params`. A rejected plan raises `PreflightValidationError` (a `ValueError`), and no step runs. Only a confirmed defect of the plan is rejected. A step module that exists but fails to import, because one of its own dependencies is missing or it raises while being imported, is a broken environment: the attempt aborts with an `OrchestrationError` instead.
 2. Creates `<work_root>/<plan_id>/` and writes `plan.json`.
 3. Runs every step whose prerequisites are satisfied. A step is **ready** once every step in its `deps` has succeeded or been reused in this attempt. When several steps are ready, the one listed first in `plan.steps` runs first. For each step it:
     - creates its work directory, `<plan_dir>/<step_id>/`
@@ -178,18 +178,20 @@ A plan's `failure_policy` decides what an ordinary step failure does to the rest
 
 A plan without `failure_policy` runs under `fail_fast`, exactly as it did before failure policies existed.
 
-Whichever the policy, some failures stop the whole attempt rather than one step: event publication and cache-marker bookkeeping failures (`OrchestrationError`), and cancellation. `Engine.run` then raises under either policy. The attempt's published report (`plan.attempt_report`, below) still records what was established before it stopped.
+Whichever the policy, some failures stop the whole attempt rather than one step: infrastructure failures (`OrchestrationError`), such as failing to publish an event, to maintain a cache marker or to import a step's module, and cancellation. `Engine.run` then raises under either policy. The attempt's report still records what was established before it stopped, but it is not always published: see [Attempt reports](#attempt-reports).
 
-Each step in an attempt ends with one outcome:
+A step may establish one of four outcomes in an attempt:
 
 | Outcome | Meaning | Satisfies a dependent's `deps`? |
 |---|---|---|
 | `succeeded` | Executed and completed | Yes |
 | `reused` | An earlier success was still valid and was reused | Yes |
-| `failed` | Executed, and failed | No |
+| `failed` | Its evaluation failed. Usually its function raised or left a required output missing, but it can fail before its function is called, for example while its declared inputs are hashed | No |
 | `blocked` | Never invoked: a prerequisite failed or was blocked | No |
 
-A step without an outcome was never reached: a `fail_fast` failure, a cancellation or an infrastructure failure ended the attempt first. Blocked and unreached work are always told apart. A blocked step's report entry names its **direct blockers** (the failed or blocked prerequisites) and its **failed ancestors** (every failed step upstream of it).
+If the attempt ends before a step has established an outcome, because a `fail_fast` failure, a cancellation or an infrastructure failure ended it first, the snapshot shows the step as `interrupted` if it had started and `unreached` otherwise. Neither state implies success, and neither satisfies dependencies. The attempt report itself lists both kinds of step under `unreached_step_ids`, and names the step that was running when the attempt ended, if any, in its diagnostic.
+
+Blocked work is always told apart from work the attempt never got to. A blocked step's report entry names its **direct blockers** (the failed or blocked prerequisites) and its **failed ancestors** (every failed step upstream of it).
 
 Only dependencies decide what a failure blocks. The engine gives no step special treatment for its name or position. To make one step mandatory for another, such as a metadata update before a set of branches, list it in `deps`. A step left out of `deps` does not stop the branch when it fails; the attempt as a whole still ends failed. See [Realm authoring](../realm_authoring/guide.md#dependencies-and-failure-policy).
 
@@ -267,17 +269,46 @@ Plan-level records sit directly in the plan's directory. Every attempt writes it
 | `step.progress` | Optional mid-step progress update |
 | `step.artifact` | One artifact registered |
 | `step.succeeded` | Step finished successfully |
-| `step.failed` | Step raised an exception, or did not produce a required output |
+| `step.failed` | The step's function raised an exception, or returned without a required output. A step that fails before its function is called publishes no events; only the attempt report records its failure |
 | `step.retry_unimplemented` | Follows `step.failed` for a `TransientStepError`: retries are not implemented |
 | `step.skipped` | An earlier success was reused (`reason: "cache_hit"`) |
 | `step.blocked` | A prerequisite failed or was blocked, so the step will not run in this attempt. Published once, as soon as it is blocked, with the blockers known at that moment |
-| `plan.attempt_report` | Once, whenever the attempt ends, including by failure, cancellation or preflight rejection. Carries the full report: termination reason, outcome, every step's outcome, failures, and the complete blocker lists |
+| `plan.attempt_report` | Once, when the attempt ends, including by failure, cancellation or preflight rejection, unless event publication has already failed in it (see [Attempt reports](#attempt-reports)). Carries the full report: termination reason, outcome, every step's outcome, failures, and the complete blocker lists |
 
 Each event JSON record contains `type`, `ts`, `eid`, `realm`, `scope` and `plan_id`. The events of a step's run also carry `seq`, `step_id`, `step_name` and `fingerprint`. A `step.blocked` record carries `step_id`, `step_name`, `direct_blockers` and `failed_ancestors`.
 
-Every event an attempt publishes also carries the attempt's identity: `execution_id`, and the `plan_generation` and `run_token` the attempt captured from the plan document (both `null` for a direct `Engine.run` call). A step's `run_id` identifies one invocation of that step. The `execution_id` says which attempt at the whole plan it belonged to.
+Every event an attempt publishes also carries the attempt's identity: `execution_id`, and the `plan_generation` and `run_token` the attempt captured from the plan document (both `null` for a direct `Engine.run` call). A step's `run_id` identifies one invocation of that step. The `execution_id` says which attempt at the whole plan it belonged to. How execution IDs order attempts is described in [Execution IDs and attempt order](#execution-ids-and-attempt-order).
 
-Execution IDs have the form `exec_<UTC timestamp>_<32 hex digits>` and are allocated when an attempt is admitted. With the file spool, a later attempt at a plan gets a higher ID than every attempt recorded there, even when the clock stands still or has been set back, so sorting IDs sorts attempts. Attempts started at the same time by independent processes are not ordered against each other.
+### Attempt reports
+
+Every attempt keeps an in-memory report of what it established, and closes it however the attempt ends, including by an exception. On its way out, the engine then publishes the closed report as `plan.attempt_report`, **unless event publication has already failed during the attempt**. It does not try again through an emitter that has just failed, since the second failure would only bury the first. The log then says `Not publishing the report of attempt '<execution_id>'`.
+
+So an attempt can end without a terminal record. That happens when event publication failed, when publishing the report itself failed, or when the process was killed outright. Its snapshot then keeps showing the attempt as `running`, until a newer attempt is admitted. If even its `plan.attempt_started` was never recorded, the snapshot keeps showing an earlier attempt instead. None of these endings finishes the execution request, so the plan document does not record the attempt and the plan stays eligible. When a snapshot looks stuck, check the log for the attempt's execution ID, and the plan document's `executed_run_token` and `last_finalized_execution`.
+
+### Execution IDs and attempt order
+
+An attempt's execution ID is allocated when the attempt is admitted, before any step runs, in the form `exec_<UTC timestamp to the microsecond>_<32 hex digits>`. The ops snapshot shows the attempt whose ID orders highest. The ordering is only as reliable as these rules:
+
+- **Canonical IDs first.** An ID the engine allocates is *canonical*: exactly that shape, with a real date and time. Canonical IDs order by their timestamp, which, at their fixed width, is also their string order. Any other ID orders below every canonical one; only an attempt context a caller builds itself, rather than letting the engine allocate its ID, can carry such an ID. Attempts are therefore not ordered by comparing arbitrary IDs as strings.
+- **Within one engine.** An engine's allocator never allocates a timestamp at or below the last one it allocated, for any plan. Its IDs strictly increase, even when the clock stands still or moves backwards.
+- **Across restarts.** Before allocating, the allocator reads back the plan's recorded attempts and allocates above all of them. This protection lasts only as long as that history is retained. If the spool's attempt records are deleted or pruned, a clock that is behind after a restart can order a new attempt below an older one.
+- **Where the history comes from.** An engine whose emitter is a `FileSpoolEmitter`, as the daemon's and run-once's are, reads back its own spool automatically. With any other emitter, a `TeeEmitter` included, the engine orders attempts within itself only, unless it is given an allocator that reads a history:
+
+    ```python
+    from yggdrasil.core.engine import Engine
+    from yggdrasil.core.execution_ids import ExecutionIdAllocator
+    from yggdrasil.flow.events.attempt_records import SpoolAttemptHistory
+    from yggdrasil.flow.events.emitter import FileSpoolEmitter, TeeEmitter
+
+    engine = Engine(
+        emitter=TeeEmitter(FileSpoolEmitter(spool_dir=spool), other_emitter),
+        execution_ids=ExecutionIdAllocator(SpoolAttemptHistory(spool)),
+    )
+    ```
+
+- **Concurrent allocators.** Attempts allocated at the same time by independent engines or processes are not ordered against each other: each reads the history before the other has recorded anything.
+
+A lost or pruned history therefore degrades ordering to "correct while the clock moves forward". It never makes two IDs collide.
 
 ### Emitters
 

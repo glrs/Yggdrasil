@@ -128,7 +128,7 @@ not notify PlanWatcher.
 
 **Explanation:** A `continue_independent` plan finishes its request once every step that could run has run, even if some failed. Its result and its token are recorded together, and the plan does not run again by itself. Approving it again changes nothing.
 
-**Resolution:** Fix the cause, then raise `run_token` by one, leaving `status` as `"approved"`. On the dev SQLite backend, run `python tools/dev_plan_approval.py approve <plan_id>`. Steps that succeeded are reused, and failed or blocked steps run again. See [Plan Execution](plan_execution.md#requesting-a-rerun).
+**Resolution:** Fix the cause, then raise `run_token` by one, leaving `status` as `"approved"`. Write it conditionally on the plan's revision; on SQLite, the same transaction must also advance the plan-change sequence. Steps that succeeded are reused, and failed or blocked steps run again. See [Plan Execution](plan_execution.md#requesting-a-rerun).
 
 ### Steps were blocked
 
@@ -138,11 +138,21 @@ not notify PlanWatcher.
 
 If a step was blocked by a step it should not need, the dependency is in the plan: `deps` are the only thing that blocks. See [Dependencies and failure policy](../realm_authoring/guide.md#dependencies-and-failure-policy).
 
+### Snapshot shows an attempt still running
+
+**Symptom:** The snapshot's `attempt.state` stays `"running"`, but none of the plan's steps is running.
+
+**Explanation:** An attempt shows as running until its report is published. No report is published when event publication had already failed during the attempt (the log says `Not publishing the report of attempt '<execution_id>'`), when publishing the report itself failed, or when the process was killed. None of these endings finished the request.
+
+**Resolution:** Search the log for the attempt's execution ID to find the cause, such as an unwritable event spool. The plan document confirms that the request is unfinished: `executed_run_token` is unchanged, and the plan stays eligible. Once the cause is fixed, the next attempt at the plan replaces the stale one in the snapshot. See [Attempt reports](../flow_api/overview.md#attempt-reports).
+
 ### Plan rejected before any step ran
 
-**Symptom:** The log and the attempt report show `termination_reason: "preflight_rejected"` and a diagnostic such as a duplicate step ID, an unknown dependency, a dependency cycle, an unknown `failure_policy`, or an unresolvable `fn_ref`.
+**Symptom:** The log and the attempt report show `termination_reason: "preflight_rejected"` and a diagnostic such as a duplicate step ID, an unknown dependency, a dependency cycle, an unknown `failure_policy`, or a malformed or unresolvable `fn_ref`.
 
-**Explanation:** The engine validates the whole plan before running anything, and rejects it without side effects. A rejected `fail_fast` plan stays eligible. A rejected `continue_independent` request is finished with a failed outcome, since the same plan would be rejected again.
+**Explanation:** The engine validates the whole plan before running anything, and rejects it without side effects. A rejected `fail_fast` plan stays eligible. A rejected `continue_independent` request is finished with a failed outcome, since the same plan would be rejected again. A plan with an unknown `failure_policy` stays eligible too: it is not a valid `continue_independent` request.
+
+Only confirmed defects of the plan are rejected. A step module that exists but cannot be imported is a different case (see [`fn_ref` cannot be resolved or imported](#fn_ref-cannot-be-resolved-or-imported)).
 
 **Resolution:** Fix the realm's planning, and let it regenerate the plan.
 
@@ -158,14 +168,20 @@ If a step was blocked by a step it should not need, the dependency is in the pla
 
 ## Step execution failures
 
-### `ModuleNotFoundError` or `AttributeError` for `fn_ref`
+### `fn_ref` cannot be resolved or imported
 
-**Symptom:** Step fails with `cannot import name 'run_foo' from 'my_realm.steps'`
+Every step's `fn_ref` is resolved before any step runs. What happens next depends on whether the reference itself is wrong.
 
-**Resolution:**
+**Symptom:** The plan is rejected by preflight with `Malformed fn_ref for step '<step_id>'`, `Unresolvable fn_ref for step '<step_id>': '<fn_ref>' names module '<module>', which does not exist.`, or `... module '<module>' does not define '<name>'.`
+
+**Resolution:** The reference is wrong, which is a defect of the plan:
 - The `fn_ref` in your `StepSpec` must be a valid dotted Python path to a `@step`-decorated function
 - The function must exist and be importable in the daemon's Python environment
 - Check for typos in the module path
+
+**Symptom:** The attempt aborts with `Importing the module for step '<step_id>' (fn_ref='<fn_ref>') failed: ...`, and `termination_reason: "orchestration_error"`.
+
+**Explanation:** The module exists, but importing it failed: one of its own dependencies is missing, or it raised while being imported. That is a broken environment, not a malformed plan, so the plan is not rejected. The request stays eligible, and runs again once the environment is fixed and the plan changes again.
 
 ### `PreflightValidationError` — undecorated step function
 
@@ -310,10 +326,10 @@ find $YGG_EVENT_SPOOL -path "*/test_realm/*" -name "*.json" | sort
 
 ### Finding one attempt's events
 
-Every event carries the `execution_id` of the attempt that published it, and the attempt's plan-level records are named after it. The newest attempt at a plan is the highest ID:
+Every event carries the `execution_id` of the attempt that published it, and the attempt's plan-level records are named after it. For IDs the engine allocated, name order is attempt order, so the last one in sorted order is normally the newest attempt (see [Execution IDs and attempt order](../flow_api/overview.md#execution-ids-and-attempt-order) for the limits). Every attempt records its start when it is admitted, while its report may be missing (see [Snapshot shows an attempt still running](#snapshot-shows-an-attempt-still-running)), so look for start records:
 
 ```bash
-ls $YGG_EVENT_SPOOL/<realm>/<plan_id>/ | grep attempt_report | sort | tail -1
+ls $YGG_EVENT_SPOOL/<realm>/<plan_id>/ | grep attempt_started | sort | tail -1
 grep -rl '"execution_id": "<execution_id>"' $YGG_EVENT_SPOOL/<realm>/<plan_id>/
 ```
 
