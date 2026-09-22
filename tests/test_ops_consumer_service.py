@@ -11,8 +11,10 @@ import os
 import threading
 import unittest
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import Mock, patch
 
 from lib.ops.consumer_service import OpsConsumerService
@@ -107,6 +109,27 @@ class ServiceTestCase(unittest.TestCase):
         """A service writing to a mock sink."""
         return OpsConsumerService(interval_sec=interval_sec, writer=self.writer)
 
+    def record_workers(self) -> list[ThreadPoolExecutor]:
+        """Keep every worker the service creates from now on, in order."""
+        workers: list[ThreadPoolExecutor] = []
+
+        def create(*args: Any, **kwargs: Any) -> ThreadPoolExecutor:
+            worker = ThreadPoolExecutor(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        creation = patch(
+            "lib.ops.consumer_service.ThreadPoolExecutor", side_effect=create
+        )
+        creation.start()
+        self.addCleanup(creation.stop)
+        return workers
+
+    def assert_released(self, worker: ThreadPoolExecutor) -> None:
+        """Assert a worker was shut down: it accepts no further work."""
+        with self.assertRaises(RuntimeError):
+            worker.submit(lambda: None)
+
 
 class TestConstruction(unittest.TestCase):
     """Configuration is resolved when the service is built."""
@@ -173,13 +196,16 @@ class TestLifecycle(ServiceTestCase):
             await service.stop()
             return service._task
 
+        workers = self.record_workers()
+
         task = run_bounded(scenario())
 
         self.assertTrue(task.done())
         self.consumer_class.assert_called_once_with(
             Path(os.environ["YGG_EVENT_SPOOL"]), self.writer
         )
-        self.assertIsNone(service._worker)
+        (worker,) = workers
+        self.assert_released(worker)
 
     def test_start_while_running_starts_nothing_more(self):
         service = self.service()
@@ -216,6 +242,97 @@ class TestLifecycle(ServiceTestCase):
 
         self.assertIsNot(first, second)
         self.assertTrue(second.done())
+
+    def test_each_start_gets_a_worker_released_when_its_task_ends(self):
+        service = self.service()
+        workers = self.record_workers()
+
+        async def scenario():
+            for _ in range(2):
+                calls = self.consumer.calls
+                service.start()
+                await self.consumer.wait_for(lambda: self.consumer.calls > calls)
+                await service.stop()
+
+        run_bounded(scenario())
+
+        self.assertEqual(len(workers), 2)
+        self.assertIsNot(workers[0], workers[1])
+        for worker in workers:
+            self.assert_released(worker)
+
+    def test_worker_of_a_task_cancelled_before_it_ran_is_released(self):
+        service = self.service()
+        workers = self.record_workers()
+
+        async def scenario():
+            service.start()
+            task = service._task
+            task.cancel()
+            await asyncio.wait({task})
+            return task
+
+        task = run_bounded(scenario())
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.consumer.calls, 0)
+        (worker,) = workers
+        self.assert_released(worker)
+
+    def test_an_earlier_stop_cannot_stop_a_restarted_service(self):
+        # Two callers stop the service at once; the first restarts it as soon
+        # as its own stop returns, while the second is still resuming.
+        service = self.service()
+        workers = self.record_workers()
+        gate = self.consumer.hold(1)
+        finished: list[str] = []
+
+        async def stop_then_restart() -> None:
+            await service.stop()
+            service.start()
+            finished.append("restarted")
+
+        async def stop() -> None:
+            await service.stop()
+            finished.append("second stop returned")
+
+        async def scenario():
+            service.start()
+            await gate.reached()
+            restarting = asyncio.create_task(stop_then_restart())
+            await asyncio.sleep(0)
+            stopping = asyncio.create_task(stop())
+            await asyncio.sleep(0)
+            gate.release()
+            await asyncio.gather(restarting, stopping)
+            restarted = service._task
+            # The restarted service keeps consuming after both stops returned.
+            await self.consumer.wait_for(lambda: len(self.consumer.finished) >= 4)
+            alive = not restarted.done()
+            await service.stop()
+            return alive
+
+        alive = run_bounded(scenario())
+
+        self.assertEqual(finished, ["restarted", "second stop returned"])
+        self.assertTrue(alive, "the restarted service stopped")
+        self.assertEqual(len(workers), 2)
+        for worker in workers:
+            self.assert_released(worker)
+
+    def test_task_ending_unexpectedly_is_reported_once(self):
+        service = self.service()
+        self.consumer_class.side_effect = RuntimeError("spool consumer broken")
+
+        async def scenario():
+            service.start()
+            await asyncio.gather(service.stop(), service.stop())
+
+        with self.assertLogs(SERVICE_LOGGER, level="ERROR") as logs:
+            run_bounded(scenario())
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("spool consumer broken", logs.output[0])
 
     def test_stop_without_start_does_nothing(self):
         service = self.service()

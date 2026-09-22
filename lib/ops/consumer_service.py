@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -28,6 +29,11 @@ class OpsConsumerService:
     for the cycle in progress to finish, and so does its task when shutdown
     cancels it, which then starts no further cycle.
 
+    Each start runs a task with a worker of its own, which only that task's
+    end releases. A stop acts on the task running when it was called and
+    touches nothing once it has waited, so stops and restarts that overlap
+    can never leave a restarted service without its worker.
+
     The snapshot sink is normally injected by YggdrasilCore from its
     InternalStorageBundle. Bare construction falls back to the legacy
     CouchDB ``OpsWriter`` (honoring ``OPS_DB``, deprecated).
@@ -41,7 +47,8 @@ class OpsConsumerService:
         writer: OpsSnapshotSink | None = None,
         logger: logging.Logger | None = None,
     ):
-        """
+        """Configure the service; nothing runs until :meth:`start`.
+
         Args:
             interval_sec: Seconds between the end of one consumption cycle
                 and the start of the next.
@@ -58,9 +65,8 @@ class OpsConsumerService:
                 db_name=db_name or os.environ.get("OPS_DB") or "yggdrasil_ops"
             )
         self.writer = writer
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
-        self._worker: ThreadPoolExecutor | None = None
 
     async def _loop(self, worker: Executor) -> None:
         """Run consumption cycles until the service is stopped.
@@ -103,34 +109,46 @@ class OpsConsumerService:
         """Start consuming, unless the service is already running.
 
         A service still finishing the cycle a stop interrupted counts as
-        running, so a new one never overlaps it.
+        running, so a new one never overlaps it. The new task gets a worker
+        thread of its own, released when the task is done, however it ends:
+        even a task cancelled before it first ran releases it.
         """
-        if not self._task or self._task.done():
-            self._stop.clear()
-            if self._worker is None:
-                self._worker = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="ygg-ops-consumer"
-                )
-            self._task = asyncio.create_task(
-                self._loop(self._worker), name="ops-consumer"
-            )
+        if self._task is not None and not self._task.done():
+            return
+        self._stop.clear()
+        worker = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ygg-ops-consumer"
+        )
+        task = asyncio.create_task(self._loop(worker), name="ops-consumer")
+        task.add_done_callback(functools.partial(self._task_ended, worker))
+        self._task = task
 
     async def stop(self) -> None:
         """Stop consuming, once the cycle in progress, if any, has finished.
 
-        The service's task is waited for, never cancelled, so a cycle's
-        snapshot writes are not cut off part-way.
+        Stops the task running when it is called, and does nothing more once
+        that task is done, so it cannot affect a service restarted while it
+        waited. The task is waited for, never cancelled, so a cycle's snapshot
+        writes are not cut off part-way.
         """
         self._stop.set()
         task = self._task
         if task is not None and not task.done():
             # asyncio.wait, unlike awaiting the task, never cancels it.
             await asyncio.wait({task})
-        if task is not None and not task.cancelled() and task.exception():
+
+    def _task_ended(self, worker: ThreadPoolExecutor, task: asyncio.Task[None]) -> None:
+        """Release a finished task's worker, and report how the task ended.
+
+        The task's own worker and no other: a task never ends while a cycle
+        runs in its worker, so the worker is idle by now.
+
+        Args:
+            worker: The worker the task ran its cycles in.
+            task: The finished task.
+        """
+        worker.shutdown(wait=False)
+        if not task.cancelled() and task.exception() is not None:
             self._logger.error(
                 "The ops consumer stopped unexpectedly", exc_info=task.exception()
             )
-        if self._worker is not None:
-            # Idle by now: its last cycle has finished.
-            self._worker.shutdown(wait=False)
-            self._worker = None
