@@ -4,9 +4,12 @@ and lib/realms/test_realm/handler.py.
 
 - Decorator tests: every step is a proper @step-decorated callable.
 - Functional tests: new write/denial steps behave correctly with mocked DataAccess.
-- Handler tests: _do_plan_time_fetch uses connection() (not couchdb()) and awaits get().
+- Handler tests: _do_plan_time_fetch uses connection() (not couchdb()) and awaits get(),
+  and each scenario's plan gets the failure policy it names, else its recipe's.
+- Recipe tests: the two branching recipes differ only in the metadata prerequisite.
 """
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -445,3 +448,111 @@ class TestDataFetchPlanSteps(unittest.TestCase):
         from lib.realms.test_realm.recipes import RECIPES
 
         self.assertNotIn("data_fetch_plan", RECIPES)
+
+
+# ---------------------------------------------------------------------------
+# Handler: the failure policy a scenario's plan runs under
+# ---------------------------------------------------------------------------
+
+
+class TestScenarioFailurePolicy(unittest.TestCase):
+    """The failure policy TestRealmHandler gives the plan it drafts."""
+
+    def setUp(self):
+        from lib.realms.test_realm.handler import TestRealmHandler
+
+        self.handler = TestRealmHandler()
+        self.handler.realm_id = "test_realm"
+
+    def draft(self, **fields):
+        """Draft the plan of a scenario document with these fields."""
+        doc = {"_id": "test_scenario:x", "type": "ygg_test_scenario", **fields}
+        ctx = MagicMock(scope={"kind": "test_scenario", "id": "test_scenario:x"})
+        payload = {"doc": doc, "planning_ctx": ctx}
+        (draft,) = asyncio.run(self.handler.generate_plan_drafts(payload))
+        return draft
+
+    def test_branching_recipes_default_to_continue_independent(self):
+        for recipe in ("branch_failure", "branch_failure_metadata_required"):
+            with self.subTest(recipe=recipe):
+                draft = self.draft(recipe=recipe)
+
+                self.assertEqual(draft.plan.failure_policy, "continue_independent")
+                self.assertEqual(
+                    draft.preview["failure_policy"], "continue_independent"
+                )
+
+    def test_other_recipes_and_custom_steps_default_to_fail_fast(self):
+        custom_steps = [{"step_id": "a", "fn_name": "step_echo"}]
+        for mode, fields in (
+            ("recipe", {"recipe": "fail_mid_plan"}),
+            ("custom steps", {"steps": custom_steps}),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.draft(**fields).plan.failure_policy, "fail_fast")
+
+    def test_scenario_policy_replaces_the_recipe_default(self):
+        for recipe, policy in (
+            ("branch_failure", "fail_fast"),
+            ("fail_mid_plan", "continue_independent"),
+        ):
+            with self.subTest(recipe=recipe):
+                draft = self.draft(recipe=recipe, failure_policy=policy)
+
+                self.assertEqual(draft.plan.failure_policy, policy)
+                self.assertEqual(draft.preview["failure_policy"], policy)
+
+    def test_unknown_policy_is_rejected_not_downgraded(self):
+        for policy in ("continue", None):
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(ValueError, "Invalid failure_policy"):
+                    self.draft(recipe="branch_failure", failure_policy=policy)
+
+
+# ---------------------------------------------------------------------------
+# Recipes: branch_failure and branch_failure_metadata_required
+# ---------------------------------------------------------------------------
+
+
+class TestBranchingRecipes(unittest.TestCase):
+    """The branching recipes, as the integration scenarios rely on them."""
+
+    def test_metadata_prerequisite_is_the_only_difference(self):
+        from lib.realms.test_realm.recipes import (
+            branch_failure,
+            branch_failure_metadata_required,
+        )
+
+        independent = branch_failure()
+        required = branch_failure_metadata_required()
+
+        self.assertEqual(
+            [spec.step_id for spec in independent],
+            [spec.step_id for spec in required],
+        )
+        for alone, joined in zip(independent, required, strict=True):
+            with self.subTest(step=alone.step_id):
+                self.assertEqual(
+                    (alone.fn_ref, alone.params, alone.outputs),
+                    (joined.fn_ref, joined.params, joined.outputs),
+                )
+                if alone.step_id.endswith("__prepare"):
+                    self.assertEqual(alone.deps, ["validate_shared"])
+                    self.assertEqual(
+                        joined.deps, ["validate_shared", "update_metadata"]
+                    )
+                else:
+                    self.assertEqual(alone.deps, joined.deps)
+
+    def test_branch_roots_declare_the_file_they_write_after_overrides(self):
+        from lib.realms.test_realm.recipes import branch_failure
+
+        steps = branch_failure(overrides={"lane_1__prepare": {"filename": "own.txt"}})
+
+        self.assertEqual(
+            {spec.step_id: spec.outputs for spec in steps if spec.outputs},
+            {
+                "lane_1__prepare": {"lane_config": "own.txt"},
+                "lane_2__prepare": {"lane_config": "lane_2_config.txt"},
+            },
+        )

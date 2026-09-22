@@ -9,11 +9,22 @@ Each recipe represents a different test scenario:
 - fail_mid_plan: Fails in the middle of execution
 - long_running: Extended sleep for timeout testing
 - artifact_write: Tests artifact registration
+- branch_failure: Independent branches after shared validation; one branch
+  and the metadata update fail, the other branch completes
+- branch_failure_metadata_required: The same plan, with the metadata update
+  a declared prerequisite of every branch
+
+A recipe's plans run under the fail_fast policy unless
+RECIPE_FAILURE_POLICIES names another (see default_failure_policy).
 """
 
 from typing import Any
 
-from yggdrasil.flow.model import StepSpec
+from yggdrasil.flow.model import (
+    CONTINUE_INDEPENDENT_POLICY,
+    DEFAULT_FAILURE_POLICY,
+    StepSpec,
+)
 
 # Module path for fn_ref resolution by Engine
 _FN_REF_PREFIX = "lib.realms.test_realm.steps"
@@ -355,6 +366,179 @@ def artifact_write(
     ]
 
     return _apply_overrides(steps, overrides)
+
+
+# ---------------------------------------------------------------------------
+# Recipes: branch_failure and branch_failure_metadata_required
+# ---------------------------------------------------------------------------
+
+# The lanes a branching plan has a branch for, and the lane whose processing
+# fails.
+_BRANCH_LANES = (1, 2)
+_FAILING_LANE = 2
+
+
+def branch_failure(
+    overrides: dict[str, dict[str, Any]] | None = None,
+) -> list[StepSpec]:
+    """
+    Generate a plan of independent lane branches in which one branch fails.
+
+    Shared validation comes first. The metadata update and both lane branches
+    depend on it, and on nothing else. The metadata update fails, and so does
+    lane 2 partway through its branch. Under continue_independent, this
+    recipe's default policy, lane 1 still completes, lane 2's upload is
+    blocked, and the attempt ends failed.
+
+    Steps:
+        1. validate_shared: Echo (succeeds)
+        2. update_metadata: Always fails (after validate_shared)
+        3. lane_1__prepare: Write lane_1_config.txt (after validate_shared)
+        4. lane_1__process: Echo (after lane_1__prepare)
+        5. lane_1__upload: Echo (after lane_1__process)
+        6. lane_2__prepare: Write lane_2_config.txt (after validate_shared)
+        7. lane_2__process: Always fails (after lane_2__prepare)
+        8. lane_2__upload: Echo (after lane_2__process), so blocked
+
+    Args:
+        overrides: Optional dict mapping step_id to param overrides
+
+    Returns:
+        List of StepSpec for Engine execution
+    """
+    return _branching_steps(metadata_required=False, overrides=overrides or {})
+
+
+def branch_failure_metadata_required(
+    overrides: dict[str, dict[str, Any]] | None = None,
+) -> list[StepSpec]:
+    """
+    Generate the branch_failure plan with the metadata update required.
+
+    The same steps and failures as branch_failure, except that each lane
+    branch's first step also depends on update_metadata. Its failure blocks
+    both branches under continue_independent, this recipe's default policy,
+    so lane 2's processing is never invoked.
+
+    Steps:
+        1. validate_shared: Echo (succeeds)
+        2. update_metadata: Always fails (after validate_shared)
+        3. lane_1__prepare: Write lane_1_config.txt (after validate_shared
+           and update_metadata), so blocked, like the rest of lane 1
+        4. lane_1__process: Echo (after lane_1__prepare)
+        5. lane_1__upload: Echo (after lane_1__process)
+        6. lane_2__prepare: Write lane_2_config.txt (after validate_shared
+           and update_metadata), so blocked, like the rest of lane 2
+        7. lane_2__process: Always fails (after lane_2__prepare)
+        8. lane_2__upload: Echo (after lane_2__process)
+
+    Args:
+        overrides: Optional dict mapping step_id to param overrides
+
+    Returns:
+        List of StepSpec for Engine execution
+    """
+    return _branching_steps(metadata_required=True, overrides=overrides or {})
+
+
+def _branching_steps(
+    *, metadata_required: bool, overrides: dict[str, dict[str, Any]]
+) -> list[StepSpec]:
+    """
+    Build the plan both branching recipes share.
+
+    Whether the metadata update is a prerequisite of the branches is the only
+    difference between the two recipes, and only their dependencies express
+    it: the engine gives no step special treatment because of its name.
+
+    Each branch's first step writes a file and declares it as a required
+    output, so that step is reused on a rerun only while the file exists. The
+    declaration is made after the overrides are applied, so that it names the
+    file the step actually writes.
+
+    Args:
+        metadata_required: Whether each branch's first step also depends on
+            the metadata update.
+        overrides: Param overrides by step_id.
+
+    Returns:
+        list[StepSpec]: The steps, in plan order.
+    """
+    branch_prerequisites = ["validate_shared"]
+    if metadata_required:
+        branch_prerequisites.append("update_metadata")
+
+    steps = [
+        _make_step(
+            step_id="validate_shared",
+            name="Validate Shared Inputs",
+            fn_name="step_echo",
+            params={"message": "Shared inputs validated"},
+        ),
+        _make_step(
+            step_id="update_metadata",
+            name="Update Metadata",
+            fn_name="step_fail",
+            params={"error_message": "Planned metadata update failure"},
+            deps=["validate_shared"],
+        ),
+    ]
+    for lane in _BRANCH_LANES:
+        steps.extend(_lane_branch(lane, branch_prerequisites))
+
+    steps = _apply_overrides(steps, overrides)
+    for spec in steps:
+        if spec.step_id.endswith("__prepare"):
+            spec.outputs = {"lane_config": spec.params["filename"]}
+    return steps
+
+
+def _lane_branch(lane: int, prerequisites: list[str]) -> list[StepSpec]:
+    """
+    Build one lane's branch: prepare, then process, then upload.
+
+    Args:
+        lane: The lane number; the failing lane's processing always fails.
+        prerequisites: The steps the branch's first step depends on.
+
+    Returns:
+        list[StepSpec]: The branch's steps, in dependency order.
+    """
+    prepare = f"lane_{lane}__prepare"
+    process = f"lane_{lane}__process"
+    if lane == _FAILING_LANE:
+        process_fn = "step_fail"
+        process_params = {"error_message": f"Planned failure processing lane {lane}"}
+    else:
+        process_fn = "step_echo"
+        process_params = {"message": f"Lane {lane} processed"}
+
+    return [
+        _make_step(
+            step_id=prepare,
+            name=f"Prepare Lane {lane}",
+            fn_name="step_write_file",
+            params={
+                "filename": f"lane_{lane}_config.txt",
+                "content": f"Configuration for lane {lane}",
+            },
+            deps=list(prerequisites),
+        ),
+        _make_step(
+            step_id=process,
+            name=f"Process Lane {lane}",
+            fn_name=process_fn,
+            params=process_params,
+            deps=[prepare],
+        ),
+        _make_step(
+            step_id=f"lane_{lane}__upload",
+            name=f"Upload Lane {lane}",
+            fn_name="step_echo",
+            params={"message": f"Lane {lane} uploaded"},
+            deps=[process],
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -888,6 +1072,8 @@ RECIPES: dict[str, Any] = {
     "fail_mid_plan": fail_mid_plan,
     "long_running": long_running,
     "artifact_write": artifact_write,
+    "branch_failure": branch_failure,
+    "branch_failure_metadata_required": branch_failure_metadata_required,
     "data_fetch_exec": data_fetch_exec,
     "data_access_denied": data_access_denied,
     "data_fetch_all_methods": data_fetch_all_methods,
@@ -896,6 +1082,29 @@ RECIPES: dict[str, Any] = {
     "data_write_only_permission": data_write_only_permission,
     "data_write_no_id": data_write_no_id,
 }
+
+# Failure policy of a recipe's plans when the scenario document names none.
+# Recipes not listed here build fail_fast plans.
+RECIPE_FAILURE_POLICIES: dict[str, str] = {
+    "branch_failure": CONTINUE_INDEPENDENT_POLICY,
+    "branch_failure_metadata_required": CONTINUE_INDEPENDENT_POLICY,
+}
+
+
+def default_failure_policy(recipe_name: str | None) -> str:
+    """
+    Get the failure policy a recipe's plans run under by default.
+
+    Args:
+        recipe_name: The scenario's recipe; None for custom steps.
+
+    Returns:
+        str: The policy RECIPE_FAILURE_POLICIES names for the recipe, else
+        fail_fast.
+    """
+    if recipe_name is None:
+        return DEFAULT_FAILURE_POLICY
+    return RECIPE_FAILURE_POLICIES.get(recipe_name, DEFAULT_FAILURE_POLICY)
 
 
 def get_recipe(name: str):

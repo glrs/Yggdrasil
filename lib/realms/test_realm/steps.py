@@ -14,8 +14,9 @@ unawaited coroutines.
 
 All step functions are decorated with @step so that the Engine emits
 step.started, step.succeeded (with metrics/artifacts), and step.failed
-lifecycle events automatically. Exceptions still bubble up so the Engine
-stops the plan on failure.
+lifecycle events automatically. Exceptions still bubble up to the Engine,
+which records the step as failed: a fail_fast plan stops there, while a
+continue_independent plan blocks the step's dependents and runs the rest.
 """
 
 import random

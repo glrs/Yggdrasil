@@ -29,6 +29,8 @@ Standard recipes (selected via `"recipe"` field, in RECIPES registry):
 - **fail_mid_plan**: Succeeds initially (echo → sleep), then fails mid-execution
 - **long_running**: Extended sleep (30s default) for testing responsiveness
 - **artifact_write**: Creates files and registers artifacts
+- **branch_failure**: Shared validation, a metadata update and two lane branches; the metadata update and lane 2 fail, lane 1 completes (`continue_independent` by default)
+- **branch_failure_metadata_required**: The same plan with the metadata update a prerequisite of both lanes, so both are blocked (`continue_independent` by default)
 - **data_fetch_exec**: Fetches a CouchDB doc at *execution time* inside the step
 - **data_access_denied**: Verifies DataAccess correctly rejects unauthorized connections
 - **data_fetch_all_methods**: Exercises every read method on the execution-phase DataAccess client
@@ -41,11 +43,23 @@ Planning-time recipes (handler processes the doc before building steps; not in R
 - **data_fetch_plan**: Async-fetches a CouchDB doc *during planning*; bakes the result as a structured `ref_doc` dict into step params.
 - **metadata_harvest**: Extracts domain fields (`input_path`, `mode`, `priority`, `sample_id`, `flags`) from the scenario doc; bakes them as a structured `scenario` dict into step params.
 
+Every plan runs under the scenario's `failure_policy` field when it has one (`"fail_fast"` or `"continue_independent"`; any other value rejects the scenario). Without it, the `branch_failure` recipes run under `continue_independent`, and every other recipe and custom steps under `fail_fast`. So any recipe can be compared under both policies:
+
+```json
+{
+  "_id": "test_scenario:mid_plan_continue",
+  "type": "ygg_test_scenario",
+  "recipe": "fail_mid_plan",
+  "failure_policy": "continue_independent"
+}
+```
+
 Available steps (for custom mode):
 
 > All test realm steps are decorated with `@step`, so lifecycle events (`step.started`,
 > `step.succeeded`, `step.failed`) are emitted automatically by the decorator. Exceptions
-> still bubble up so the Engine stops the plan on failure.
+> still bubble up to the Engine: a `fail_fast` plan stops at the first failure, while a
+> `continue_independent` plan blocks the failed step's dependents and runs the rest.
 
 - **step_echo**: Echo message (params: `message`)
 - **step_sleep**: Configurable sleep with progress events (params: `duration_sec`)
@@ -180,9 +194,9 @@ Available steps (for custom mode):
 
 **Expected**:
 - Step 1 (fail_immediately) fails with RuntimeError (emits `step.failed`)
-- Step 2 (never_reached) never executes
+- Step 2 (never_reached) never executes: it is unreached, not blocked
 - Plan execution halts with error
-- `executed_run_token` NOT updated (plan remains eligible for retry)
+- `executed_run_token` NOT updated (plan remains eligible for retry): a `fail_fast` failure does not finish its request
 
 ---
 
@@ -209,6 +223,7 @@ Available steps (for custom mode):
 - Step 4 (never_reached) never executes
 - Plan marked as failed
 - `executed_run_token` NOT updated (eligible for retry)
+- With `"failure_policy": "continue_independent"`, step 4 is blocked instead, and the request is finished: `executed_run_token` is updated and `last_finalized_execution.outcome` is `"failed"`
 
 ---
 
@@ -722,6 +737,53 @@ resolved `doc_id`, `identity`, and `operation` are visible in step metrics.
 
 ---
 
+## Scenario 20: Independent Branches, One Fails
+
+**Purpose**: Show a failure contained to its branch. After shared validation, a metadata update and two lane branches (prepare → process → upload) run independently. This mirrors the demux realm's plan of one branch per lane.
+
+**Insert as**:
+```json
+{
+  "_id": "test_scenario:branch_failure",
+  "type": "ygg_test_scenario",
+  "recipe": "branch_failure",
+  "auto_run": true
+}
+```
+
+**Expected** (under `continue_independent`, the recipe's default policy):
+- `validate_shared` succeeds; `update_metadata` fails, and nothing depends on it
+- Lane 1 completes: `lane_1__prepare` writes `lane_1_config.txt` (a declared output), then `lane_1__process` and `lane_1__upload` succeed
+- Lane 2 fails partway: `lane_2__prepare` succeeds, `lane_2__process` fails, and `lane_2__upload` is blocked (`step.blocked`, with `lane_2__process` as its direct blocker and failed ancestor)
+- The attempt ends `failed` with 5 succeeded, 2 failed and 1 blocked step
+- The request is finished: `executed_run_token` equals `run_token`, `status` stays `"approved"`, and `last_finalized_execution.outcome` is `"failed"`. The plan does not run again until `run_token` is raised
+- After raising `run_token`, the rerun reuses every step that succeeded (`step.skipped`), unless its declared output was deleted, and runs the two failing steps again
+
+With `"failure_policy": "fail_fast"`, the same plan stops at `update_metadata`. The lane steps are unreached, and the plan stays eligible.
+
+---
+
+## Scenario 21: Independent Branches, Metadata Required
+
+**Purpose**: The same plan, with the author's other choice: the metadata update is a prerequisite of each lane branch. Only the dependencies differ.
+
+**Insert as**:
+```json
+{
+  "_id": "test_scenario:branch_failure_metadata_required",
+  "type": "ygg_test_scenario",
+  "recipe": "branch_failure_metadata_required",
+  "auto_run": true
+}
+```
+
+**Expected**:
+- `validate_shared` succeeds; `update_metadata` fails
+- Every lane step is blocked, with `update_metadata` as the failed ancestor. Lane 2's failing step is never invoked
+- The attempt ends `failed` with 1 succeeded, 1 failed and 6 blocked steps, and the request is finished
+
+---
+
 ## How to Insert Scenarios
 
 ### Via `curl` (local CouchDB):
@@ -892,6 +954,8 @@ Once retry logic is implemented, use **fail_fast** or **fail_mid_plan** scenario
 | Fail Fast | fail_fast | ✓ | <1s | Step 1 fails immediately |
 | Fail Mid-Plan | fail_mid_plan | ✓ | ~0.3s | Steps 1-2 succeed, 3 fails |
 | Artifact Write | artifact_write | ✓ | <1s | Files created, artifacts tracked |
+| Independent Branches | branch_failure | ✓ | <1s | Lane 1 completes; lane 2 fails partway; attempt failed, request finished |
+| Metadata Required | branch_failure_metadata_required | ✓ | <1s | Metadata failure blocks both lanes |
 | Custom Sleep | happy_path | ✓ | ~3s | Tests parameter override |
 | Quick Echo | happy_path | ✓ | <100ms | Baseline overhead |
 | Random Fail (50%) | random_fail | ✓ | ~0.5s | 50% chance of failure |

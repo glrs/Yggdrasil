@@ -13,11 +13,12 @@ from lib.core_utils.logging_utils import custom_logger
 from lib.realms.test_realm.recipes import (
     RECIPES,
     data_fetch_plan_steps,
+    default_failure_policy,
     get_recipe,
     metadata_harvest_steps,
 )
 from yggdrasil.flow.base_handler import BaseHandler
-from yggdrasil.flow.model import Plan
+from yggdrasil.flow.model import Plan, validate_failure_policy
 from yggdrasil.flow.planner import PlanDraft, PlanningContext
 
 
@@ -34,6 +35,8 @@ class TestRealmHandler(BaseHandler):
             "type": "ygg_test_scenario",
             "recipe": "happy_path",  # One of RECIPES keys
             "auto_run": true,          # Optional, default True
+            "failure_policy": "fail_fast",  # Optional, default: the
+                                       # recipe's (default_failure_policy)
             "overrides": {             # Optional step param overrides
                 "step_id": {"param": "value"}
             }
@@ -178,6 +181,10 @@ class TestRealmHandler(BaseHandler):
         3. **Recipe-based**: Provide a ``recipe`` field (e.g. ``happy_path``).
         4. **Custom steps**: Provide a ``steps`` array directly.
 
+        In every mode, the plan runs under the document's ``failure_policy``,
+        or the recipe's default policy when the document names none
+        (``fail_fast`` for custom steps and the planning-time modes).
+
         Args:
             payload: Event payload containing:
                 - doc: The scenario document
@@ -187,7 +194,8 @@ class TestRealmHandler(BaseHandler):
             list[PlanDraft] with one draft containing plan, auto_run flag, and notes
 
         Raises:
-            ValueError: If document type is not 'ygg_test_scenario'
+            ValueError: If document type is not 'ygg_test_scenario', or its
+                failure_policy is not a known policy
         """
 
         doc = payload.get("doc", {})
@@ -203,6 +211,10 @@ class TestRealmHandler(BaseHandler):
 
         recipe_name = doc.get("recipe")
         custom_steps = doc.get("steps")
+
+        # An explicit policy is never downgraded: an unknown one is rejected.
+        failure_policy = doc.get("failure_policy", default_failure_policy(recipe_name))
+        validate_failure_policy(failure_policy)
 
         # --- Mode 1: Planning-time data fetch (async, baked as structured dict) ---
         if recipe_name == "data_fetch_plan":
@@ -288,12 +300,15 @@ class TestRealmHandler(BaseHandler):
                 f"Scenario document must have either 'recipe' or 'steps' field: {doc.get('_id')}"
             )
 
+        preview["failure_policy"] = failure_policy
+
         # Build Plan
         plan = Plan(
             plan_id=f"test_realm:{ctx.scope['id']}",
             realm=self.realm_id or "test_realm",
             scope=ctx.scope,
             steps=steps,
+            failure_policy=failure_policy,
         )
 
         auto_run = doc.get("auto_run", True)

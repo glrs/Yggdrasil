@@ -33,6 +33,10 @@ Recipes:
     - fail_mid_plan: Middle step fails
     - long_running: Extended sleep (30s default)
     - artifact_write: Writes files and registers artifacts
+    - branch_failure: Independent lane branches; one lane and the metadata
+      update fail, the other lane completes (continue_independent)
+    - branch_failure_metadata_required: The same plan with the metadata
+      update a prerequisite of both lanes (continue_independent)
 
 Scenario Document Schema:
     {
@@ -40,6 +44,9 @@ Scenario Document Schema:
         "type": "ygg_test_scenario",          # Required (must be exact)
         "recipe": "<recipe_name>",          # Required
         "auto_run": true | false,             # Optional (default: true)
+        "failure_policy": "fail_fast" | "continue_independent",
+                                              # Optional (default: the
+                                              # recipe's, else fail_fast)
         "overrides": {                        # Optional
             "<step_id>": {"param": "value"}
         }
