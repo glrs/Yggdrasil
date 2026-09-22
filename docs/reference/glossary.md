@@ -11,10 +11,10 @@ A small dict identifying what a run pertains to: `{"kind": ..., "id": ...}`. Eve
 ```
 
 ### Plan
-A frozen, ordered list of `StepSpec`s to execute, identified by `plan_id`. Created by a handler's `generate_plan_drafts()` and persisted in `yggdrasil_plans`.
+A frozen graph of `StepSpec`s to execute, identified by `plan_id`, with a `failure_policy`. The steps' dependencies decide the execution order. Created by a handler's `generate_plan_drafts()` and persisted in `yggdrasil_plans`.
 
 ### StepSpec
-One step instance inside a `Plan`. Declares the function reference (`fn_ref`), static parameters (`params`), step dependencies (`deps`), and optional input paths used for fingerprinting.
+One step instance inside a `Plan`. Declares the function reference (`fn_ref`), static parameters (`params`), its prerequisites (`deps`), optional input paths used for fingerprinting, and optional required outputs (`outputs`) that gate reuse.
 
 ### PlanDraft
 One element of the list returned by a handler's `generate_plan_drafts()`. Wraps a `Plan` with an `auto_run` flag (`True` = execute immediately; `False` = hold for approval), a list of required approvers (future), and human-readable notes.
@@ -29,7 +29,7 @@ Passed to every `@step` function. Provides: `realm`, `scope`, `plan_id`, `step_i
 A named output of a step: `key` (semantic label), `path` (location on disk), `digest` (`sha256:<hex>` for files, `dirhash:<hex>` for directories).
 
 ### Fingerprint
-A deterministic SHA-256 digest of a step's params and declared inputs, used for caching. If it matches the `success.fingerprint` from a previous run, the step is skipped.
+A deterministic SHA-256 digest of a step's params, declared inputs and declared outputs, used for caching. If it matches the `success.fingerprint` from a previous run, and every declared output still exists, the step is reused instead of run.
 
 ### StepResult
 Returned by a `@step` function. Contains `artifacts`, `metrics` (scalar key-value map), and optional `extra` data.
@@ -73,14 +73,29 @@ Manages backend watcher instances. Resolves `WatchSpec.connection` to a concrete
 Central orchestrator (singleton). Discovers realms via `ygg.realm` entry points, manages handler subscriptions, dispatches `YggdrasilEvent` objects, persists `PlanDraft` outputs to `yggdrasil_plans`, and runs the main async event loop.
 
 ### PlanWatcher
-Watches `yggdrasil_plans`. When a plan transitions to `status="approved"` with an unexecuted run token, dispatches it to the Engine.
+Watches `yggdrasil_plans`. When a plan transitions to `status="approved"` with an unexecuted run token, hands it to the execution coordinator, which runs it through the Engine and records the result.
 
 ---
 
 ## Execution
 
 ### Engine (`yggdrasil.core.engine`)
-Sequential plan executor. For each `StepSpec`: creates a workdir, computes a fingerprint, skips on cache hit, dynamically imports and calls the `@step`-decorated function, emits step lifecycle events.
+Plan executor. Validates the plan, then runs its steps one at a time in dependency order. For each step it creates a workdir, computes a fingerprint, reuses a still-valid earlier success, or else calls the `@step`-decorated function. It publishes step lifecycle events and the attempt's report. See [Flow API](../flow_api/overview.md#engine-yggdrasilcoreengine).
+
+### Failure policy
+A plan's `failure_policy`. `fail_fast` (the default) stops the attempt at the first step failure. `continue_independent` blocks the steps that depend on a failure, runs everything else, and ends the attempt failed.
+
+### Step outcome
+How a step ended in one attempt: `succeeded`, `reused` (an earlier success was reused), `failed`, or `blocked` (never invoked, because a prerequisite failed or was blocked). A step without an outcome was never reached.
+
+### Execution attempt
+One run of a plan, identified by an `execution_id` (`exec_<UTC timestamp>_<hex>`). Later attempts at a plan get higher IDs. Every event an attempt publishes carries its ID, and it ends with an attempt report.
+
+### Run token
+`run_token` on a plan document is its latest execution request. `executed_run_token` is the latest request that was finished, which for a `continue_independent` plan may have failed. Raising `run_token` requests a rerun. See [Plan Execution](plan_execution.md).
+
+### Plan generation
+`plan_generation`, an opaque ID naming one planned version of a plan. Approval and run-token changes keep it; regenerating the plan replaces it, so a result is never recorded onto a different version of the plan than the one that ran.
 
 ### `@step` decorator
 Wraps a plain Python function to standardise the step lifecycle: creates `ctx.workdir`, emits `step.started`, calls the function, emits `step.succeeded` or `step.failed`.
@@ -92,21 +107,26 @@ Wraps a plain Python function to standardise the step lifecycle: creates `ctx.wo
 Structured JSON records emitted to the configured event spool during plan execution. Distinct from trigger events — these record *what happened during execution*.
 
 **Types:**
-- `plan.started` — Engine began a plan
+- `plan.attempt_started` — an attempt was admitted, with its planned steps
 - `step.started` — step function entered
 - `step.progress` — optional mid-step update
 - `step.artifact` — one artifact registered
 - `step.succeeded` — step completed
-- `step.failed` — step raised an exception
-- `step.skipped` — skipped due to fingerprint cache hit
+- `step.failed` — step raised an exception, or did not produce a required output
+- `step.retry_unimplemented` — follows `step.failed` for a transient error
+- `step.skipped` — an earlier success was reused (`reason: "cache_hit"`)
+- `step.blocked` — a prerequisite failed or was blocked, so the step will not run
+- `plan.attempt_report` — the attempt ended; carries its full report
 
-Each record contains: `type`, `seq`, `ts`, `eid`, `realm`, `scope`, `plan_id`, `step_id`, `step_name`, `fingerprint`.
+Each record contains `type`, `ts`, `eid`, `realm`, `scope`, `plan_id`, and the attempt's `execution_id`, `plan_generation` and `run_token`. Events of a step's run also carry `seq`, `step_id`, `step_name` and `fingerprint`.
 
 **Spool layout:**
 ```
 <spool_root>/
   <realm>/<plan_id>/
-    0001_plan_started.json
+    <execution_id>_plan_attempt_started.json
+    <execution_id>_plan_attempt_report.json
+    <step_id>/<execution_id>_step_blocked.json
     <step_id>/<run_id>/
       0001_step_started.json
       ...
@@ -120,6 +140,9 @@ Protocol: a single `emit(event: dict)` method. Three concrete implementations (i
 - `CouchEmitter` — writes events as CouchDB documents
 
 Realm code interacts with the emitter only via `ctx.emitter` (typed as `EventEmitter`). Concrete emitter classes should never be imported by realm code.
+
+### Operational snapshot (`plan_status`)
+A per-plan summary the ops consumer builds from the event spool and writes to the operations store. It shows one attempt, the most recently admitted, with every planned step's state and outcome. Plans whose spool predates attempt records get a labelled legacy projection instead. See [Plan Execution](plan_execution.md#operational-snapshots-plan_status).
 
 ---
 

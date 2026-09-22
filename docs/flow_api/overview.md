@@ -15,7 +15,8 @@ The concrete, frozen workflow to execute. Created by a handler's planner and per
 | `plan_id` | `str` | Unique identifier (e.g. `"my_realm:object-123"`) |
 | `realm` | `str` | Realm that owns this plan |
 | `scope` | `dict` | Scope dict (`{"kind": ..., "id": ...}`) |
-| `steps` | `list[StepSpec]` | Ordered list of step specs |
+| `steps` | `list[StepSpec]` | The plan's steps. Dependencies decide the execution order; list order only breaks ties between steps that are ready at the same time |
+| `failure_policy` | `str` | What a step failure does to the rest of the plan: `"fail_fast"` (default) or `"continue_independent"`. See [Failure policies](#failure-policies). Any other value is rejected |
 
 ### `StepSpec`
 
@@ -27,8 +28,9 @@ Defines one step inside a plan.
 | `name` | `str` | Human-readable label |
 | `fn_ref` | `str` | Dotted import path to the `@step` function |
 | `params` | `dict` | Static parameters passed to the step |
-| `deps` | `list[str]` | `step_id`s that must succeed before this step runs |
+| `deps` | `list[str]` | Prerequisites: `step_id`s that must all have succeeded, or been reused, in the same attempt before this step runs. They may appear anywhere in the plan's step list |
 | `inputs` | `dict` | Artifact paths tracked for fingerprinting (optional) |
+| `outputs` | `dict[str, str]` | Required output paths, keyed by artifact key: absolute, or relative to the step's work directory. An earlier success is reused only while all of them exist. See [Declared outputs and reuse](#declared-outputs-and-reuse) (optional) |
 | `scope` | `dict \| None` | Override scope for this step (optional) |
 
 ### `StepContext`
@@ -42,12 +44,12 @@ Passed to every `@step` function at execution time.
 | `plan_id` | `str` | Owning plan ID |
 | `step_id` | `str` | This step's ID |
 | `step_name` | `str` | Human-readable step name |
-| `workdir` | `Path` | Per-run working directory (unique per fingerprint run) |
+| `workdir` | `Path` | The step's work directory, `<work_root>/<plan_id>/<step_id>`. Every attempt at the plan uses the same one |
 | `scope_dir` | `Path` | Shared scope directory for artifacts across all plan steps |
 | `emitter` | `BaseEmitter` | Event emitter |
 | `run_mode` | `str` | `"auto"` or `"manual"` |
 | `fingerprint` | `str` | SHA-256 fingerprint for this run |
-| `run_id` | `str` | Unique run ID (UUID fragment) |
+| `run_id` | `str` | ID of this invocation of the step |
 | `data` | `DataAccess` | Phase-aware read/write gateway to configured data sources. Call `connection(name)` to obtain a sync client (execution phase: reads + writes; planning phase: async reads only). |
 
 ### `PlanningContext`
@@ -96,7 +98,8 @@ Wraps a plain function to standardize step lifecycle:
 1. Creates `ctx.workdir`
 2. Emits `step.started`
 3. Calls the function with `ctx` as first argument
-4. Emits `step.succeeded` (with artifacts + metrics) or `step.failed`
+4. Checks that every output the step declares exists. A missing one fails the step (`PermanentStepError` with code `missing_required_outputs`), so no success is ever reported for it
+5. Emits `step.succeeded` (with artifacts + metrics) or `step.failed`
 
 ```python
 from yggdrasil.flow.step import step
@@ -125,7 +128,7 @@ def run_processor(
     ...
 ```
 
-`In(key)` declarations tell the Engine which paths to include in the fingerprint computation. `Out(key)` declarations register expected artifacts.
+`In(key)` declarations tell the Engine which paths to include in the fingerprint computation. `Out(key)` declarations name the artifacts the step produces; `PlanBuilder` records them, as absolute paths, in the step's `outputs`.
 
 ---
 
@@ -148,25 +151,55 @@ A planner is a `BaseHandler` subclass — not just any object implementing `gene
 
 ## Engine (`yggdrasil.core.engine`)
 
-`Engine.run(plan)` runs a `Plan` sequentially:
+`Engine.run(plan)` runs one **attempt** at a plan. Steps run one at a time, in dependency order:
 
-1. Creates `<work_root>/<plan_id>/` and writes `plan.json`
-2. For each `StepSpec` (respecting `deps` ordering):
-   - Creates `<plan_dir>/<step_id>/` workdir
-   - Computes fingerprint from params + input file digests
-   - Checks `success.fingerprint` — **skips** if unchanged (cache hit)
-   - Resolves `fn_ref`; **raises `ValueError`** immediately if the callable is not `@step`-decorated (guard against silent loss of lifecycle events)
-   - Calls the resolved function with the constructed `StepContext` and coerced params
-   - On success: writes `success.fingerprint`, emits `step.succeeded`
-   - On failure: emits `step.failed`, aborts remaining steps
+1. **Preflight**, before anything is written to the work root. The plan is rejected if a step ID is empty or duplicated, a dependency names an unknown step or the step itself, the dependencies form a cycle, `failure_policy` is unknown, `outputs` are malformed, or a step's `fn_ref` cannot be resolved, is not `@step`-decorated, or cannot bind its `params`. A rejected plan raises `PreflightValidationError` (a `ValueError`), and no step runs.
+2. Creates `<work_root>/<plan_id>/` and writes `plan.json`.
+3. Runs every step whose prerequisites are satisfied. A step is **ready** once every step in its `deps` has succeeded or been reused in this attempt. When several steps are ready, the one listed first in `plan.steps` runs first. For each step it:
+    - creates its work directory, `<plan_dir>/<step_id>/`
+    - computes its fingerprint
+    - reuses an earlier success when one is still valid, emitting `step.skipped` (see [Declared outputs and reuse](#declared-outputs-and-reuse))
+    - otherwise removes the step's old success marker, then calls the function with its `StepContext` and coerced params. On success it writes a new `success.fingerprint`
+4. Hands a step failure to the plan's [failure policy](#failure-policies).
+
+!!! note "`deps` did not always order execution"
+    Before dependency scheduling existed, the engine ran steps in the order of `plan.steps` and used `deps` only to check that the named steps existed. A plan that listed a step before its prerequisite ran it first anyway. Now `deps` alone decides the order. A dependency may be listed after the step that needs it, and a plan whose list was already in dependency order runs in the same order as before.
 
 The engine's workspace and event spool are configured at daemon startup by `YggdrasilCore`. See [Configuration](../getting_started/configuration.md).
+
+### Failure policies
+
+A plan's `failure_policy` decides what an ordinary step failure does to the rest of the attempt. An ordinary step failure is any exception the step raises, including `PermanentStepError` and `TransientStepError` (retries are not implemented), and a required output the step did not produce.
+
+| `failure_policy` | After a step fails | `Engine.run` returns |
+|---|---|---|
+| `fail_fast` (default) | The attempt stops. Steps not run yet are never reached. | `None` if every step succeeded. The failure propagates; a `TransientStepError` surfaces as a `PermanentStepError`. |
+| `continue_independent` | The failure is recorded, and every step that depends on it, directly or through other steps, is **blocked**. Everything else keeps running until no step is ready. | The finished `AttemptReport`. Its `outcome` is `"failed"` if any step failed or was blocked. A returned report is **not** a success. |
+
+A plan without `failure_policy` runs under `fail_fast`, exactly as it did before failure policies existed.
+
+Whichever the policy, some failures stop the whole attempt rather than one step: event publication and cache-marker bookkeeping failures (`OrchestrationError`), and cancellation. `Engine.run` then raises under either policy. The attempt's published report (`plan.attempt_report`, below) still records what was established before it stopped.
+
+Each step in an attempt ends with one outcome:
+
+| Outcome | Meaning | Satisfies a dependent's `deps`? |
+|---|---|---|
+| `succeeded` | Executed and completed | Yes |
+| `reused` | An earlier success was still valid and was reused | Yes |
+| `failed` | Executed, and failed | No |
+| `blocked` | Never invoked: a prerequisite failed or was blocked | No |
+
+A step without an outcome was never reached: a `fail_fast` failure, a cancellation or an infrastructure failure ended the attempt first. Blocked and unreached work are always told apart. A blocked step's report entry names its **direct blockers** (the failed or blocked prerequisites) and its **failed ancestors** (every failed step upstream of it).
+
+Only dependencies decide what a failure blocks. The engine gives no step special treatment for its name or position. To make one step mandatory for another, such as a metadata update before a set of branches, list it in `deps`. A step left out of `deps` does not stop the branch when it fails; the attempt as a whole still ends failed. See [Realm authoring](../realm_authoring/guide.md#dependencies-and-failure-policy).
+
+Operational callers (the daemon and `run-doc --run-once`) interpret the report under both policies, and record the result on the plan document. See [Plan Execution](../reference/plan_execution.md).
 
 ---
 
 ## Fingerprint computation
 
-Default fingerprint = `sha256(JSON(params) + digests_of_inputs)`.
+Default fingerprint = `sha256(JSON(params) + digests_of_inputs + declared outputs)`.
 
 Input digests are sourced from (in priority order):
 1. `StepSpec.inputs` dict (planner-provided)
@@ -178,7 +211,29 @@ For each input path:
 - **Directory** → `dirhash:<hex>` (hash of sorted paths + sizes + mtimes)
 - **Missing** → recorded as `"missing"`
 
-If params and inputs are unchanged from a previous run, the Engine skips the step.
+A step's `outputs` are hashed as declared, and only when it has some, so changing a step's declared outputs invalidates its earlier success. Steps without `outputs` fingerprint as they always have.
+
+### Declared outputs and reuse
+
+A step's work directory, `<work_root>/<plan_id>/<step_id>`, belongs to the plan, not to one attempt. A rerun executes the step in the same directory, over whatever the previous attempt left behind. A step that succeeds leaves a `success.fingerprint` marker there.
+
+An attempt **reuses** a step instead of running it when all of these hold:
+
+1. Its prerequisites have succeeded or been reused in this attempt. A blocked step is never reused, whatever its marker says.
+2. Its marker matches its current fingerprint.
+3. Every path in its `outputs` exists.
+
+Reuse emits `step.skipped` with `reason: "cache_hit"`, and satisfies the step's dependents like a success. A missing declared output makes the step run again. The engine logs why it did not reuse the step.
+
+Declared outputs work as follows:
+
+- **Paths.** An absolute path is used as is. Any other path is relative to the producing step's own work directory, never the plan directory or the process's working directory. `PlanBuilder` always declares absolute paths.
+- **Presence only.** A path counts as present when it exists. The existence of a directory says nothing about whether its contents are complete, so declare a file, or a completion sentinel, inside it when completeness matters. Failing to check a path at all, such as a permission error, aborts the attempt rather than counting as missing.
+- **No outputs, no check.** A step that declares no outputs is reused on its marker alone, as before. Any artifact-producing step that later steps rely on should declare its required outputs. A step that produces no artifact, such as a validation, needs none.
+
+When a step is not reused, its marker is removed before it is called, so a rerun that fails part-way never leaves an earlier success reusable over outputs it partly replaced. A step's success is then finalized in one order: its declared outputs are checked, `step.succeeded` is published, the new marker is written atomically (a same-filesystem rename), and only then do its dependents become ready. A failure to write the marker aborts the attempt.
+
+The marker is not a transaction across the event spool, the artifacts and the plan store, and nothing is flushed to disk. Realm steps must still tolerate being run again over their own earlier output.
 
 ---
 
@@ -190,8 +245,10 @@ If params and inputs are unchanged from a previous run, the Engine skips the ste
 $YGG_EVENT_SPOOL/
   <realm>/
     <plan_id>/
-      0001_plan_started.json
+      <execution_id>_plan_attempt_started.json
+      <execution_id>_plan_attempt_report.json
       <step_id>/
+        <execution_id>_step_blocked.json     # only if the attempt blocked the step
         <run_id>/
           0001_step_started.json
           0002_step_progress.json
@@ -199,21 +256,28 @@ $YGG_EVENT_SPOOL/
           0004_step_succeeded.json
 ```
 
-Plan-level events omit the `<step_id>` directory.
+Plan-level records sit directly in the plan's directory. Every attempt writes its own, since the file names carry its execution ID. Each reuse or execution of a step gets its own `<run_id>` directory. A blocked step never ran, so its record sits in the step's directory, with no run directory.
 
-### Common event types
+### Event types
 
 | Type | When emitted |
 |------|-------------|
-| `plan.started` | Engine begins executing a plan |
+| `plan.attempt_started` | An attempt is admitted, before preflight and before any step runs. Carries the attempt's identity, failure policy and every planned step, so an attempt that runs no step is still visible |
 | `step.started` | Step function entered |
 | `step.progress` | Optional mid-step progress update |
 | `step.artifact` | One artifact registered |
 | `step.succeeded` | Step finished successfully |
-| `step.failed` | Step raised an exception |
-| `step.skipped` | Engine skipped due to cache hit |
+| `step.failed` | Step raised an exception, or did not produce a required output |
+| `step.retry_unimplemented` | Follows `step.failed` for a `TransientStepError`: retries are not implemented |
+| `step.skipped` | An earlier success was reused (`reason: "cache_hit"`) |
+| `step.blocked` | A prerequisite failed or was blocked, so the step will not run in this attempt. Published once, as soon as it is blocked, with the blockers known at that moment |
+| `plan.attempt_report` | Once, whenever the attempt ends, including by failure, cancellation or preflight rejection. Carries the full report: termination reason, outcome, every step's outcome, failures, and the complete blocker lists |
 
-Each event JSON record contains: `type`, `seq`, `ts`, `eid`, `realm`, `scope`, `plan_id`, `step_id`, `step_name`, `fingerprint`.
+Each event JSON record contains `type`, `ts`, `eid`, `realm`, `scope` and `plan_id`. The events of a step's run also carry `seq`, `step_id`, `step_name` and `fingerprint`. A `step.blocked` record carries `step_id`, `step_name`, `direct_blockers` and `failed_ancestors`.
+
+Every event an attempt publishes also carries the attempt's identity: `execution_id`, and the `plan_generation` and `run_token` the attempt captured from the plan document (both `null` for a direct `Engine.run` call). A step's `run_id` identifies one invocation of that step. The `execution_id` says which attempt at the whole plan it belonged to.
+
+Execution IDs have the form `exec_<UTC timestamp>_<32 hex digits>` and are allocated when an attempt is admitted. With the file spool, a later attempt at a plan gets a higher ID than every attempt recorded there, even when the clock stands still or has been set back, so sorting IDs sorts attempts. Attempts started at the same time by independent processes are not ordered against each other.
 
 ### Emitters
 

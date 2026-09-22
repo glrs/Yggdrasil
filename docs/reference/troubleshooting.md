@@ -112,9 +112,47 @@ not notify PlanWatcher.
 
 **Checks:**
 1. Confirm PlanWatcher is started: `grep "PlanWatcher" yggdrasil.log`
-2. Check `run_token > executed_run_token` in the plan document
+2. Check `run_token > executed_run_token` in the plan document. If they are equal, the last request is already finished, whatever its outcome (see [A finished plan does not run again](#a-finished-plan-does-not-run-again)).
 3. Verify the configured internal plan store (`yggdrasil_plans` database) exists and is accessible: the CouchDB
    plans connection in production, or the SQLite file in dev mode.
+4. Search the log for `pending finalization`: the plan may have an unrecorded result (see [Result could not be recorded](#result-could-not-be-recorded)).
+5. Search the log for `the daemon is stopping`. A plan that became eligible while the daemon was shutting down was not started, and stays eligible. A daemon restarted from its saved checkpoint resumes after that change and does not see it again. Re-emit an observable change for the plan once the daemon is running.
+
+---
+
+## Plan finished, but not as expected
+
+### A finished plan does not run again
+
+**Symptom:** `status="approved"`, `executed_run_token == run_token`, and nothing runs, even though `last_finalized_execution.outcome` is `"failed"`.
+
+**Explanation:** A `continue_independent` plan finishes its request once every step that could run has run, even if some failed. Its result and its token are recorded together, and the plan does not run again by itself. Approving it again changes nothing.
+
+**Resolution:** Fix the cause, then raise `run_token` by one, leaving `status` as `"approved"`. On the dev SQLite backend, run `python tools/dev_plan_approval.py approve <plan_id>`. Steps that succeeded are reused, and failed or blocked steps run again. See [Plan Execution](plan_execution.md#requesting-a-rerun).
+
+### Steps were blocked
+
+**Symptom:** The snapshot shows steps in state `step.blocked`, and the attempt's outcome is `"failed"`.
+
+**Explanation:** Under `continue_independent`, a step whose prerequisite failed, or was itself blocked, is never invoked. Its `failed_ancestors` name the failed steps to fix; `direct_blockers` name its immediate prerequisites. A blocked step is not a failure of its own, and it runs on the next request once its prerequisites succeed.
+
+If a step was blocked by a step it should not need, the dependency is in the plan: `deps` are the only thing that blocks. See [Dependencies and failure policy](../realm_authoring/guide.md#dependencies-and-failure-policy).
+
+### Plan rejected before any step ran
+
+**Symptom:** The log and the attempt report show `termination_reason: "preflight_rejected"` and a diagnostic such as a duplicate step ID, an unknown dependency, a dependency cycle, an unknown `failure_policy`, or an unresolvable `fn_ref`.
+
+**Explanation:** The engine validates the whole plan before running anything, and rejects it without side effects. A rejected `fail_fast` plan stays eligible. A rejected `continue_independent` request is finished with a failed outcome, since the same plan would be rejected again.
+
+**Resolution:** Fix the realm's planning, and let it regenerate the plan.
+
+### Result could not be recorded
+
+**Symptom:** The log says `finished, but its result could not be recorded; keeping it pending`. The snapshot shows the attempt as finished, but the plan document's `executed_run_token` was not advanced. `run-doc --run-once` exits with code `1`.
+
+**Explanation:** Recording the result failed through every retry: the plan store was unreachable, failed, or kept losing write races. The process keeps the result in memory and does not run the plan again. Other plans are unaffected.
+
+**Resolution:** Once the plan store is healthy, raise `run_token`. The daemon records the pending result first, then runs the new request. A restart loses the pending result, and the old request then runs again, so realm steps must tolerate that. See [Plan Execution](plan_execution.md#when-a-result-cannot-be-recorded).
 
 ---
 
@@ -129,14 +167,14 @@ not notify PlanWatcher.
 - The function must exist and be importable in the daemon's Python environment
 - Check for typos in the module path
 
-### `ValueError` — undecorated step function
+### `PreflightValidationError` — undecorated step function
 
-**Symptom:** Plan execution raises:
+**Symptom:** Plan execution is rejected with:
 ```
-ValueError: Undecorated step function detected for step '<step_id>' (fn_ref='<fn_ref>'). Decorate it with '@step' from 'yggdrasil.flow.step'.
+PreflightValidationError: Undecorated step function detected for step '<step_id>' (fn_ref='<fn_ref>'). Decorate it with '@step' from 'yggdrasil.flow.step'.
 ```
 
-**Explanation:** The Engine validates every resolved callable before execution. If `fn_ref` resolves to a plain function missing the `@step` decorator, the plan is aborted immediately. This prevents silent loss of lifecycle events (`step.started`, `step.succeeded`, `step.failed`) — which `@step` is responsible for emitting.
+**Explanation:** The Engine resolves and validates every step's callable before any step runs. If `fn_ref` resolves to a plain function missing the `@step` decorator, the plan is rejected, with no step run. `PreflightValidationError` is a `ValueError`. The check prevents silent loss of lifecycle events (`step.started`, `step.succeeded`, `step.failed`), which `@step` is responsible for emitting.
 
 **Resolution:** Decorate the function with `@step`:
 ```python
@@ -268,6 +306,15 @@ meanwhile.
 
 ```bash
 find $YGG_EVENT_SPOOL -path "*/test_realm/*" -name "*.json" | sort
+```
+
+### Finding one attempt's events
+
+Every event carries the `execution_id` of the attempt that published it, and the attempt's plan-level records are named after it. The newest attempt at a plan is the highest ID:
+
+```bash
+ls $YGG_EVENT_SPOOL/<realm>/<plan_id>/ | grep attempt_report | sort | tail -1
+grep -rl '"execution_id": "<execution_id>"' $YGG_EVENT_SPOOL/<realm>/<plan_id>/
 ```
 
 ---

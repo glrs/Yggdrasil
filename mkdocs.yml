@@ -59,6 +59,7 @@ nav:
       - Cookbook: realm_authoring/cookbook.md
   - Reference:
       - Glossary: reference/glossary.md
+      - Plan execution: reference/plan_execution.md
       - Test realm: reference/test_realm.md
       - Troubleshooting: reference/troubleshooting.md
 

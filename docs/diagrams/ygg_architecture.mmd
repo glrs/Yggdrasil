@@ -18,12 +18,13 @@ flowchart TB
     subgraph Execution["Plan Execution"]
       PDB[("yggdrasil_plans")]
       PW["PlanWatcher"]
-      E["Engine<br/>(per-step workdirs, fingerprint cache)"]
+      C["PlanExecutionCoordinator<br/>(admission, one attempt per plan, finalization)"]
+      E["Engine<br/>(dependency scheduler, failure policy,<br/>per-step workdirs, fingerprint + output reuse)"]
     end
 
     subgraph Ops["Ops Status"]
       SP[/"Event spool<br/>$YGG_EVENT_SPOOL"/]
-      OC["OpsConsumerService<br/>(FileSpoolConsumer + OpsWriter)"]
+      OC["OpsConsumerService<br/>(FileSpoolConsumer: one attempt per snapshot)"]
       ODB[("ops DB<br/>plan_status docs")]
     end
 
@@ -36,8 +37,10 @@ flowchart TB
     Y -->|save_plan| PDB
     PDB -->|"_changes"| PW
     PW -->|PLAN_EXECUTION event| Y
-    Y -->|run approved plan| E
+    Y -->|submit plan| C
+    C -->|run attempt| E
+    C -->|record outcome + token| PDB
     E -->|"@step functions"| HPC
-    E -->|step events| SP
+    E -->|attempt + step events| SP
     SP --> OC
     OC --> ODB

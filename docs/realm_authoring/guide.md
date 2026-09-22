@@ -8,6 +8,7 @@ Use the unified `ygg.realm` entry point with `RealmDescriptor` for registration.
 This guide covers:
 - Creating a RealmDescriptor
 - Defining handlers with required attributes
+- Plan dependencies, failure policy and required outputs
 - Configuring WatchSpecs for event routing
 - Dev-mode gating patterns
 - Validation rules and common pitfalls
@@ -135,6 +136,80 @@ def get_realm_descriptor() -> RealmDescriptor:
 ```
 
 > Passing `watchspecs` a callable (rather than a list) enables dev-mode gating. See [Dev-Mode Gating](#dev-mode-gating).
+
+## Dependencies and failure policy
+
+A plan is a graph, not a sequence. Each step's `deps` decide when it may run and what a failure takes down with it:
+
+- Every step in `deps` is a success prerequisite. The step runs only once all of them have succeeded, or been reused, in the same attempt.
+- Nothing else creates a dependency. A step's position in the list, a shared scope or a common name prefix does not.
+- Steps may be listed in any order. List order only decides which of several ready steps runs first, so a readable order still makes the plan easier to follow.
+
+The plan's `failure_policy` decides what a failure does to the steps that do not depend on it:
+
+```python
+from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan
+
+plan = Plan(
+    plan_id=f"my_realm:{ctx.scope['id']}",
+    realm=self.realm_id or "my_realm",
+    scope=ctx.scope,
+    steps=steps,
+    failure_policy=CONTINUE_INDEPENDENT_POLICY,  # omit for "fail_fast"
+)
+```
+
+| Policy | Use it when | After a failure |
+|---|---|---|
+| `fail_fast` (default) | Any failure makes the rest of the plan pointless | The attempt stops. The request stays eligible and runs again the next time the plan changes |
+| `continue_independent` | The plan holds independent branches, such as one per lane or sample, that should finish even if another fails | Steps depending on the failure are blocked, and the rest runs. The attempt ends failed, and its request is finished: running it again takes a new request (see [Plan Execution](../reference/plan_execution.md#requesting-a-rerun)) |
+
+An unknown policy is rejected, never downgraded to `fail_fast`. A realm that sets `failure_policy` must require a Yggdrasil version that supports it. An older one would not run the plan as a continuation plan.
+
+### Choosing what is a prerequisite
+
+Whether one step must succeed before another is the realm author's decision, expressed only through `deps`. The engine gives no step special treatment for its name. Take a plan with shared validation, a metadata update, and one branch per lane:
+
+```python
+steps = [validate_runfolder, update_metadata]  # update_metadata depends on validation
+branch_prerequisites = ["validate_runfolder"]
+if metadata_is_required:
+    branch_prerequisites.append("update_metadata")
+for lane in lanes:
+    # The first step of each branch gets branch_prerequisites as its deps;
+    # every later step depends on the one before it in its branch.
+    steps.extend(lane_branch(lane, first_deps=branch_prerequisites))
+```
+
+Under `continue_independent`:
+
+| Failing step | Metadata update independent | Metadata update a prerequisite |
+|---|---|---|
+| Shared validation | Everything depending on it, the metadata update and every branch, is blocked | Same |
+| Metadata update | Every branch still runs; the attempt still ends failed | Every branch is blocked |
+| Lane 2 processing | Lane 2's later steps are blocked; other lanes continue | Same |
+
+`docs/design/demux_realm_single_flowcell_plan_prd.md` works through this graph for the demux realm. The test realm's `branch_failure` and `branch_failure_metadata_required` recipes build both variants, so both can be run in dev mode (see [Test Realm](../reference/test_realm.md#scenario-20-independent-branches-one-fails)).
+
+Give branch steps IDs that stay the same however the inputs are ordered, for example `lane_2__demux` rather than one based on a list index. A step's ID names its work directory, and reuse on a rerun depends on finding that directory again.
+
+### Declaring required outputs
+
+A step whose artifacts later steps depend on should declare them in `outputs`, so that an earlier success is reused only while those artifacts exist:
+
+```python
+StepSpec(
+    step_id="lane_2__demux",
+    name="Demultiplex lane 2",
+    fn_ref="my_realm.steps.demultiplex",
+    params={"lane": 2},
+    deps=["lane_2__samplesheet"],
+    # Relative paths are relative to this step's own work directory.
+    outputs={"demux_complete": "output/DEMUX_COMPLETE"},
+)
+```
+
+The step fails if it returns without producing a declared output, and it runs again if a declared output has gone missing since it last succeeded. Only existence is checked, so declare a completion sentinel rather than a directory whose contents matter. Steps that produce no artifact, such as validations, need no outputs. See [Declared outputs and reuse](../flow_api/overview.md#declared-outputs-and-reuse).
 
 ## Required Handler Attributes
 
@@ -304,7 +379,8 @@ Events can be triggered via:
 │  5. YggdrasilCore.handle_event() routes to subscribed handlers      │
 │  6. Handler.generate_plan_drafts() → list[PlanDraft]               │
 │  7. Plan persisted to yggdrasil_plans database                      │
-│  8. PlanWatcher detects eligible plan → Engine executes             │
+│  8. PlanWatcher detects eligible plan → Engine executes it          │
+│  9. Result recorded on the plan document; snapshot from events      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

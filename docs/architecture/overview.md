@@ -84,23 +84,40 @@ Each realm provides one or more handler classes. A handler:
 2. Implements `derive_scope(doc)` — extracts a scope dict `{"kind": ..., "id": ...}`
 3. Implements `generate_plan_drafts(payload)` — returns a `list[PlanDraft]` containing the execution plan(s)
 
-Handlers **generate plans; they do not execute them**. Execution is decoupled: the core schedules it asynchronously, and the Engine runs plans sequentially.
+Handlers **generate plans; they do not execute them**. Execution is decoupled: the core schedules it asynchronously, and the Engine runs each plan's steps one at a time, in dependency order.
 
 ### Engine
 
 `yggdrasil/core/engine.py`
 
-Executes a `Plan` (list of `StepSpec`):
+Executes one attempt at a `Plan`, a graph of `StepSpec`s:
 
-1. Creates `<work_root>/<plan_id>/` and writes `plan.json`
-2. For each step: creates a workdir, computes a fingerprint, checks the cache, calls the `@step`-decorated function
-3. Emits structured events to the configured event spool at each step lifecycle point
+1. Validates the whole plan (graph, failure policy, output declarations, step callables) before anything runs
+2. Creates `<work_root>/<plan_id>/` and writes `plan.json`
+3. Runs each step once its prerequisites (`deps`) have succeeded: creates a workdir, computes a fingerprint, reuses a still-valid earlier success, or else calls the `@step`-decorated function
+4. On a step failure, stops (`fail_fast`), or blocks the failure's dependents and keeps running the rest (`continue_independent`)
+5. Emits structured events to the configured event spool, stamped with the attempt's execution ID, from `plan.attempt_started` to `plan.attempt_report`
+
+See [Flow API](../flow_api/overview.md#engine-yggdrasilcoreengine).
+
+### PlanExecutionCoordinator
+
+`lib/core_utils/plan_execution.py`
+
+The one execution path for both the daemon and `run-doc --run-once`:
+
+- Admits a plan from a fresh read of its document. Eligibility, authority, policy, generation and run token all come from that one read
+- Runs at most one attempt per plan at a time in this process. A request that arrives meanwhile is checked again afterwards, not dropped
+- Interprets the attempt's report, and records a finished request's outcome and token together on the plan document, with bounded retries. It never records onto a regenerated plan
+- On shutdown, lets the running step finish and starts no new one
+
+See [Plan Execution](../reference/plan_execution.md).
 
 ### PlanWatcher
 
 `lib/watchers/plan_watcher.py`
 
-Monitors the `yggdrasil_plans` database. When a plan document transitions to `status="approved"` and `run_token > executed_run_token`, the PlanWatcher picks it up and dispatches it to the Engine.
+Monitors the `yggdrasil_plans` database. When a plan document transitions to `status="approved"` and `run_token > executed_run_token`, the PlanWatcher picks it up and hands it to the execution coordinator.
 
 PlanWatcher uses `ChangesFetcher` for continuous polling with `include_docs=True`, which triggers a separate `fetch_document_by_id()` call per change row so eligibility checks have the full document body available.
 
@@ -155,7 +172,10 @@ At startup, `YggdrasilCore` calls each discovered `get_realm_descriptor()`, coll
 6. Handler.generate_plan_drafts(payload)  →  list[PlanDraft]
 7. Core persists PlanDraft as plan document in yggdrasil_plans DB
 8. PlanWatcher detects plan with status="approved"
-9. Engine.run(plan)  →  steps run in workdirs, events emitted
+9. PlanExecutionCoordinator admits it  →  Engine runs one attempt: steps run in
+   workdirs, events emitted
+10. Coordinator records the result on the plan document
+11. Ops consumer builds the plan's plan_status snapshot from the spooled events
 ```
 
 ---
@@ -167,7 +187,7 @@ Yggdrasil has two distinct event layers — do not confuse them:
 | Layer | Purpose | Classes |
 |-------|---------|---------|
 | **Trigger events** | Route watcher notifications to handlers | `YggdrasilEvent`, `EventType` enum, `YggdrasilCore` subscriptions |
-| **Step events** | Record step lifecycle during execution | `step.started`, `step.succeeded`, `step.failed`, emitted to the configured event spool |
+| **Step events** | Record each execution attempt and its steps' lifecycle | `plan.attempt_started`, `step.started`, `step.succeeded`, `step.failed`, `step.blocked`, `plan.attempt_report`, emitted to the configured event spool |
 
 Trigger events control *which handler runs*. Step events record *what happened during execution*.
 

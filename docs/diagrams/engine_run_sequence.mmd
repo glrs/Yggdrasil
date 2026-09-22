@@ -1,42 +1,62 @@
 sequenceDiagram
-  participant CLI as YggdrasilCore / run-doc
+  participant Caller as Coordinator / Engine.run
   participant Eng as Engine
+  participant Sch as DependencyScheduler
   participant Fn as @step function
   participant Ctx as StepContext
   participant Emt as EventEmitter
   participant WD as Work dir
   participant Spool as Spool FS
 
-  CLI->>Eng: run(plan)
-  loop steps (topo order)
-    Eng->>WD: ensure step workdir
-    Eng->>Eng: fingerprint = fp(params + input digests)
-    Eng->>WD: read success.fingerprint
-    alt fingerprint unchanged
-      Eng->>Emt: emit(step.skipped, run_id)
-      Emt->>Spool: 0001_step_skipped.json
-      note right of Eng: skip execution
+  Caller->>Eng: _run_attempt(plan, context with execution_id)
+  note right of Caller: execution_id allocated first,<br/>ordered after every recorded attempt
+  Eng->>Emt: emit(plan.attempt_started, step inventory)
+  Emt->>Spool: {execution_id}_plan_attempt_started.json
+  Eng->>Eng: preflight (ids, deps, cycles, policy, outputs, callables)
+  opt plan rejected
+    Eng->>Emt: emit(plan.attempt_report, preflight_rejected)
+    Eng--xCaller: raise PreflightValidationError (no step ran)
+  end
+  Eng->>WD: write plan.json
+  loop while the scheduler has a ready step (all deps succeeded or reused)
+    Sch-->>Eng: next ready step (plan-list order breaks ties)
+    Eng->>WD: ensure {plan_id}/{step_id}/
+    Eng->>Eng: fingerprint = fp(params + input digests + declared outputs)
+    alt marker matches and every declared output exists
+      Eng->>Emt: emit(step.skipped, reason=cache_hit)
+      Emt->>Spool: {step_id}/{run_id}/0001_step_skipped.json
+      Eng->>Sch: reused (satisfies dependents)
     else run required
-      Eng->>Ctx: create (realm, plan_id, step_id, run_id, emitter, fingerprint)
+      Eng->>WD: remove success.fingerprint
+      Eng->>Ctx: create (run_id, fingerprint, required outputs, correlation)
       Eng->>Fn: call(ctx, **params)
-      Ctx->>Emt: emit(step.started, params)
-      Emt->>Spool: 0001_step_started.json
-      Fn->>Ctx: ctx.add_artifact(...)
-      Ctx->>Emt: emit(step.artifact)
-      Emt->>Spool: 0002_step_artifact.json
-      alt step succeeds
-        Fn-->>Eng: StepResult(artifacts, metrics)
+      Ctx->>Emt: emit(step.started)
+      Emt->>Spool: {step_id}/{run_id}/0001_step_started.json
+      alt step returns and its declared outputs exist
         Ctx->>Emt: emit(step.succeeded)
-        Emt->>Spool: 0003_step_succeeded.json
-        Eng->>WD: write success.fingerprint
-      else step raises
-        Ctx->>Emt: emit(step.failed, kind=permanent|transient)
+        Emt->>Spool: 000N_step_succeeded.json
+        Eng->>WD: replace success.fingerprint atomically
+        Eng->>Sch: succeeded (dependents may become ready)
+      else step raises, or a declared output is missing
+        Ctx->>Emt: emit(step.failed)
         Emt->>Spool: 000N_step_failed.json
         opt transient error
           Eng->>Emt: emit(step.retry_unimplemented)
-          note right of Eng: retry not implemented yet —<br/>escalated to permanent
         end
-        Eng--xCLI: raise (plan run stops, no fingerprint written)
+        alt fail_fast
+          Eng->>Emt: emit(plan.attempt_report, failed_fast)
+          Eng--xCaller: raise (later steps unreached, no marker written)
+        else continue_independent
+          Eng->>Sch: failed
+          Sch-->>Eng: newly blocked dependents
+          Eng->>Emt: emit(step.blocked) for each
+          Emt->>Spool: {step_id}/{execution_id}_step_blocked.json
+        end
       end
     end
   end
+  note over Eng,Spool: event-publication or marker failure, or cancellation<br/>between steps, ends the attempt under either policy
+  Eng->>Emt: emit(plan.attempt_report, completed, with every outcome and blocker)
+  Emt->>Spool: {execution_id}_plan_attempt_report.json
+  Eng-->>Caller: drained report (outcome failed if any step failed or was blocked)
+  note right of Caller: coordinator records a finished request's<br/>outcome and token on the plan document

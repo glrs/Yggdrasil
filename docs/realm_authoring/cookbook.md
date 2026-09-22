@@ -127,7 +127,7 @@ return PlanDraft(
 )
 ```
 
-The plan is stored in `yggdrasil_plans` with `status="draft"`. It executes only after an operator sets `status="approved"` and increments `run_token`. (Currently there is no UI available to perform this task).
+The plan is stored in `yggdrasil_plans` with `status="draft"`. It executes once an operator sets `status="approved"`. (Currently there is no UI available to perform this task.) Approval is all `status` ever records: the outcome of a run is kept separately, and a later run is requested by raising `run_token`. See [Plan Execution](../reference/plan_execution.md).
 
 ---
 
@@ -151,7 +151,7 @@ def run_pipeline(ctx: StepContext, config_file: str, threads: int = 4) -> StepRe
         "--threads", str(threads),
     ]
 
-    # ctx.workdir is a unique per-run directory
+    # ctx.workdir is the step's own directory, reused by every attempt
     result = subprocess.run(cmd, cwd=ctx.workdir, capture_output=True)
 
     if result.returncode != 0:
@@ -175,7 +175,7 @@ def run_pipeline(ctx: StepContext, config_file: str, threads: int = 4) -> StepRe
 | `plan_id` | `str` | Current plan ID |
 | `step_id` | `str` | Current step ID |
 | `step_name` | `str` | Human-readable step name |
-| `workdir` | `Path` | Per-run working directory |
+| `workdir` | `Path` | The step's work directory, `<work_root>/<plan_id>/<step_id>`, shared by every attempt at the plan |
 | `scope_dir` | `Path` | Shared scope directory across all steps in this plan |
 | `emitter` | `BaseEmitter` | Event emitter for progress/artifact events |
 | `run_mode` | `str` | `"auto"` or `"manual"` |
@@ -452,6 +452,65 @@ def run_transform(
 ```
 
 The Engine computes `sha256(params + sha256(input_file))` as the fingerprint. If the file changes, the cached fingerprint mismatches and the step re-runs.
+
+---
+
+## Pattern 10: Independent branches that finish when one fails
+
+When a plan holds one branch per lane, sample or delivery, a failure in one branch need not stop the others. Build each branch from a recipe with stable, namespaced step IDs, point each branch's first step at the shared prerequisites, and set `failure_policy="continue_independent"`:
+
+```python
+# my_realm/recipes.py
+from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY, Plan, StepSpec
+
+_PREFIX = "my_realm.steps"
+
+
+def lane_branch(lane: int, prerequisites: list[str]) -> list[StepSpec]:
+    """One lane's chain: process, then upload."""
+    ns = f"lane_{lane}"
+    return [
+        StepSpec(
+            step_id=f"{ns}__process",
+            name=f"Process lane {lane}",
+            fn_ref=f"{_PREFIX}.process_lane",
+            params={"lane": lane},
+            deps=list(prerequisites),
+            outputs={"result": "output/DONE"},  # sentinel in this step's workdir
+        ),
+        StepSpec(
+            step_id=f"{ns}__upload",
+            name=f"Upload lane {lane}",
+            fn_ref=f"{_PREFIX}.upload_lane",
+            params={"lane": lane},
+            deps=[f"{ns}__process"],
+        ),
+    ]
+
+
+def flowcell_plan(plan_id: str, realm: str, scope: dict, lanes: list[int]) -> Plan:
+    steps = [
+        StepSpec(
+            step_id="validate",
+            name="Validate inputs",
+            fn_ref=f"{_PREFIX}.validate",
+            params={},
+        ),
+    ]
+    for lane in lanes:
+        steps.extend(lane_branch(lane, prerequisites=["validate"]))
+    return Plan(
+        plan_id=plan_id,
+        realm=realm,
+        scope=scope,
+        steps=steps,
+        failure_policy=CONTINUE_INDEPENDENT_POLICY,
+    )
+```
+
+If `lane_2__process` fails, `lane_2__upload` is blocked, every other lane still runs, and the attempt ends failed. Its request counts as finished: rerunning it takes a raised `run_token`, and the rerun reuses the lanes that already succeeded.
+
+**When to use:** Branches that do not need each other's results. Make a shared step a prerequisite only of the branches that really need it. See [Dependencies and failure policy](guide.md#dependencies-and-failure-policy) for the choices, and [Plan Execution](../reference/plan_execution.md) for what operators see.
 
 ---
 

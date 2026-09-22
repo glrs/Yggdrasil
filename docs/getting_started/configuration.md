@@ -195,7 +195,10 @@ store.
 
 Approval changes `status` to `"approved"`. Requesting another execution
 increments `run_token`; a plan is eligible only while `run_token` is
-greater than `executed_run_token`. A SQLite integration must also advance
+greater than `executed_run_token`. Neither field says whether a run
+succeeded: `executed_run_token` marks the latest *finished* request, and
+the outcome is recorded separately (see
+[Plan Execution](../reference/plan_execution.md)). A SQLite integration must also advance
 the plan change sequence transactionally so PlanWatcher observes the
 update, and must write only if the plan is still at the revision it read
 (`SQLiteInternalStore.put_document(..., expected_rev=...)`), so it never
