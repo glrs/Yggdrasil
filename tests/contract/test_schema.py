@@ -54,7 +54,7 @@ from yggdrasil.contract.schema import (
     schema_for,
     validate,
 )
-from yggdrasil.contract.timestamps import CANONICAL_PATTERN
+from yggdrasil.contract.timestamps import CANONICAL_MAX_LENGTH, CANONICAL_PATTERN
 from yggdrasil.flow.model import VALID_FAILURE_POLICIES, StepSpec
 from yggdrasil.flow.outcomes import (
     AttemptReport,
@@ -87,9 +87,26 @@ NONCANONICAL_TIMESTAMPS = (
     "2026-10-22T10:00:00+00:00",  # the spelling earlier releases wrote
     "2026-02-30T00:00:00Z",  # no such date
     "2026-10-22T10:00:00Z\n",  # a trailing newline
-    "2026-10-22T10:00:00.5Z",  # a fraction of a second
+    "2026-10-22T10:00:00.5Z\n",  # a trailing newline after a fraction
+    "2026-10-22T10:00:00.50Z",  # a fraction ending in 0
+    "2026-10-22T10:00:00.1234567Z",  # a fraction of seven digits
     "2026-10-22t10:00:00z",  # lowercase
     "2026-10-22 10:00:00Z",  # a space
+)
+
+# Canonical timestamps with a fraction of a second.
+FRACTIONAL_TIMESTAMPS = (
+    "2026-10-22T10:00:00.5Z",
+    "2026-10-22T10:00:00.000001Z",
+    "2026-10-22T10:00:00.123456Z",
+)
+
+# Timestamps followed by a newline, short enough that only the pattern can
+# stop them: none is longer than the timestamp's maximum length.
+FINAL_NEWLINES = (
+    "2026-10-22T10:00:00Z\n",
+    "2026-10-22T10:00:00.5Z\n",
+    "2026-10-22T10:00:00.12345Z\n",
 )
 
 
@@ -435,11 +452,27 @@ class TestProblemReports(unittest.TestCase):
         self.assertIn("2 problems", str(error))
 
     def test_a_value_failing_several_rules_is_one_problem(self):
-        # The legacy spelling breaks the pattern and the length.
-        document = plan_document(created_at="2026-10-22T10:00:00+00:00")
+        # A seven-digit fraction breaks the pattern and the length.
+        document = plan_document(created_at="2026-10-22T10:00:00.1234567Z")
         self.assertEqual(
             problems(PLAN_DOCUMENT, document), [("created_at", BAD_TIMESTAMP)]
         )
+
+    def test_a_bad_timestamp_says_what_the_canonical_spelling_is(self):
+        for value, detail in (
+            (
+                "2026-10-22T09:30:00+00:00",
+                "is not a timestamp spelled canonically: in UTC, ending in Z, to "
+                "the whole second or with a fraction of 1 to 6 digits not ending "
+                "in 0, as in 2026-10-22T10:00:00Z or 2026-10-22T10:00:00.25Z",
+            ),
+            ("2026-02-30T00:00:00.5Z", "is not a date and time that exists"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ContractError) as caught:
+                    validate(PLAN_DOCUMENT, plan_document(updated_at=value))
+                (problem,) = caught.exception.problems
+                self.assertEqual(problem.message, f"updated_at '{value}' {detail}")
 
     def test_keys_that_are_not_plain_names_are_quoted(self):
         document = plan_document(**{"my-field": 1})
@@ -500,6 +533,12 @@ class TestTimestamps(SpoolTestCase):
             with self.subTest(kind=kind, path=path):
                 self.assertEqual(problems(kind, document), [])
 
+    def test_a_canonical_fraction_conforms(self):
+        for kind, document, path in self.contract_timestamps():
+            for value in FRACTIONAL_TIMESTAMPS:
+                with self.subTest(kind=kind, path=path, value=value):
+                    self.assertEqual(problems(kind, changed(document, path, value)), [])
+
     def test_a_noncanonical_timestamp_is_one_bad_timestamp(self):
         for kind, document, path in self.contract_timestamps():
             for value in NONCANONICAL_TIMESTAMPS:
@@ -529,6 +568,14 @@ class TestTimestamps(SpoolTestCase):
 class TestPublishedSchemas(unittest.TestCase):
     """The canonical spelling is in the artifacts, for any validator to apply."""
 
+    def carriers(self) -> list[tuple[str, dict[str, Any], str]]:
+        """One conforming document of each kind, and a timestamp's path in it."""
+        return [
+            (PLAN_DOCUMENT, plan_document(), "created_at"),
+            (ATTEMPT_REPORT, report(), "started_at"),
+            (PLAN_STATUS, projection_snapshot(None, {}), "updated_at"),
+        ]
+
     def test_a_plain_validator_rejects_the_legacy_spelling_and_a_newline(self):
         document = plan_document()
         validator = plain_validator(PLAN_DOCUMENT)
@@ -537,15 +584,39 @@ class TestPublishedSchemas(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(validator.is_valid({**document, "created_at": value}))
 
-    def test_only_the_length_stops_a_trailing_newline(self):
-        value = "2026-10-22T10:00:00Z\n"
-        # Python's $ matches before a final newline, so the pattern alone lets
-        # the value through.
-        self.assertIsNotNone(re.search(CANONICAL_PATTERN, value))
-        errors = plain_validator(PLAN_DOCUMENT).iter_errors(
-            {**plan_document(), "created_at": value}
-        )
-        self.assertEqual([error.validator for error in errors], ["maxLength"])
+    def test_a_plain_validator_applies_the_canonical_spelling(self):
+        for kind, document, path in self.carriers():
+            validator = plain_validator(kind)
+            self.assertTrue(validator.is_valid(document))
+            for value in FRACTIONAL_TIMESTAMPS:
+                with self.subTest(kind=kind, value=value):
+                    self.assertTrue(validator.is_valid(changed(document, path, value)))
+            for value in (
+                "2026-10-22T10:00:00.50Z",
+                "2026-10-22T10:00:00.000000Z",
+                "2026-10-22T10:00:00.1234567Z",
+                "2026-10-22T10:00:00.5+00:00",
+            ):
+                with self.subTest(kind=kind, value=value):
+                    self.assertFalse(validator.is_valid(changed(document, path, value)))
+
+    def test_the_pattern_itself_stops_a_final_newline(self):
+        # With $ at its end, the pattern would let each value through: in
+        # Python, $ also matches just before a final newline.
+        dollar_ended = CANONICAL_PATTERN.removesuffix("(?![\\s\\S])") + "$"
+        for kind, document, path in self.carriers():
+            validator = plain_validator(kind)
+            for value in FINAL_NEWLINES:
+                with self.subTest(kind=kind, value=value):
+                    self.assertLessEqual(len(value), CANONICAL_MAX_LENGTH)
+                    self.assertIsNotNone(re.search(dollar_ended, value))
+                    self.assertIsNone(re.search(CANONICAL_PATTERN, value))
+                    errors = validator.iter_errors(changed(document, path, value))
+                    self.assertEqual([error.validator for error in errors], ["pattern"])
+                    self.assertEqual(
+                        problems(kind, changed(document, path, value)),
+                        [(path, BAD_TIMESTAMP)],
+                    )
 
     def test_whether_a_date_exists_is_the_format_check(self):
         document = plan_document(created_at="2026-02-30T00:00:00Z")
@@ -570,10 +641,12 @@ class TestPublishedSchemas(unittest.TestCase):
                         "type": "string",
                         "format": "date-time",
                         "pattern": CANONICAL_PATTERN,
-                        "maxLength": len(CANONICAL),
+                        "maxLength": CANONICAL_MAX_LENGTH,
                     },
                 )
-                self.assertEqual(len(CANONICAL), 20)
+                self.assertEqual(
+                    len("2026-10-22T10:00:00.123456Z"), CANONICAL_MAX_LENGTH
+                )
 
     def test_the_contract_timestamps_use_the_definition(self):
         expected = {

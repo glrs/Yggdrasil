@@ -128,12 +128,14 @@ def check_replaceable(doc_id: str, existing: Mapping[str, Any]) -> str:
     document is refused for its family whatever its ``created_at`` holds.
 
     The replacement keeps the document's creation instant, spelled
-    canonically (``2026-10-22T10:00:00Z``). A supported document's value must
-    already be canonical and is kept verbatim. An unversioned document's
-    value may be either spelling that earlier releases wrote, a whole-second
-    UTC time ending in ``Z`` or ``+00:00``, and is re-spelled with ``Z``. Any
-    other value is refused: the build time is never substituted and
-    precision is never truncated.
+    canonically. A supported document's value must already be canonical,
+    whole seconds (``2026-10-22T10:00:00Z``) or a fraction
+    (``2026-10-22T10:00:00.25Z``), and is kept verbatim. An unversioned
+    document's value may be either spelling that earlier releases wrote, a
+    whole-second UTC time ending in ``Z`` or ``+00:00``, and is re-spelled
+    with ``Z``; earlier releases never wrote a fraction, so an unversioned
+    document with one is refused. Any other value is refused: the build time
+    is never substituted and precision is never truncated.
 
     Args:
         doc_id: ID of the plan whose slot is being replaced.

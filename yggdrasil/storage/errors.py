@@ -114,8 +114,9 @@ class UnsupportedDocumentError(Exception):
             this release does not support). For ``created_at``: ``missing``
             (absent), ``malformed`` (not an RFC 3339 date-time naming a real
             date and time) or ``unsupported`` (a real date-time in a spelling
-            the replacement cannot carry, such as another offset or a
-            fraction of a second).
+            the replacement cannot carry: another offset, a fraction that is
+            not canonical, such as ``.250Z`` or seven digits, and, over an
+            unversioned document, any fraction).
         supported: The plan-document families this release supports.
     """
 

@@ -288,7 +288,10 @@ def _validator(name: str) -> Any:
     ``1.0``, and Python counts ``True`` as an int. ``date-time`` is the one
     format checked, and is checked explicitly, by
     :func:`~yggdrasil.contract.timestamps.is_date_time`: whether the date and
-    time exist. The canonical spelling is each timestamp's ``pattern``.
+    time exist. The canonical spelling, to the whole second or with a fraction
+    of one to six digits, is each timestamp's ``pattern``, which a plain
+    validator applies too. The pattern ends with ``(?![\\s\\S])`` rather than
+    ``$``, so even a validator using Python's ``re`` refuses a final newline.
 
     Args:
         name: The resource's file name in ``schemas/``.
@@ -423,8 +426,9 @@ def _problems_of(error: Any) -> list[_Problem]:
         detail = (
             "is not a date and time that exists"
             if keyword == "format"
-            else "is not a timestamp spelled canonically: whole seconds, in "
-            "UTC, ending in Z, as in 2026-10-22T10:00:00Z"
+            else "is not a timestamp spelled canonically: in UTC, ending in Z, to "
+            "the whole second or with a fraction of 1 to 6 digits not ending in "
+            "0, as in 2026-10-22T10:00:00Z or 2026-10-22T10:00:00.25Z"
         )
         return [_Problem(path, BAD_TIMESTAMP, detail, value)]
     if keyword == "pattern":

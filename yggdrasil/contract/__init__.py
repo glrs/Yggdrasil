@@ -18,7 +18,8 @@ contract's runtime core:
   decide whether and how a plan runs (the execution tokens, the failure
   policy, the execution definition), each reporting its problems as text and
   as structured records;
-- :mod:`yggdrasil.contract.timestamps`: the canonical timestamp spelling;
+- :mod:`yggdrasil.contract.timestamps`: the canonical timestamp spelling that
+  writers produce, and the reading and formatting of instants;
 - :mod:`yggdrasil.contract.diagnostics`: showing a recorded value in a
   diagnostic, bounded and never raising.
 

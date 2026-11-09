@@ -81,9 +81,21 @@ UNUSABLE_CREATED_AT = (
     ("2026-01-01T00:00:00Z\n", "malformed"),
     ("2026-01-01T02:00:00+02:00", "unsupported"),
     ("2026-01-01T00:00:00-00:00", "unsupported"),
-    ("2026-01-01T00:00:00.5Z", "unsupported"),
     ("2026-01-01T00:00:00.000+00:00", "unsupported"),
+    ("2026-01-01T00:00:00.5+00:00", "unsupported"),
+    ("2026-01-01T00:00:00.250Z", "unsupported"),
+    ("2026-01-01T00:00:00.1234567Z", "unsupported"),
     ("2026-01-01t00:00:00z", "unsupported"),
+)
+
+# Canonical creation times with a fraction of a second. A supported document
+# keeps one verbatim. An unversioned document cannot carry one: earlier
+# releases wrote whole seconds only.
+FRACTIONAL_CREATED = (
+    "2026-01-01T00:00:00.5Z",
+    "2026-01-01T00:00:00.25Z",
+    "2026-01-01T00:00:00.000001Z",
+    "2026-01-01T00:00:00.123456Z",
 )
 
 
@@ -185,6 +197,24 @@ class TestReplaceRule(ConformingBuilders):
 
         self.assertEqual(regenerated["created_at"], CREATED)
         self.assertNotEqual(regenerated["updated_at"], CREATED)
+
+    def test_a_supported_document_keeps_a_canonical_fraction_verbatim(self):
+        for created_at in FRACTIONAL_CREATED:
+            with self.subTest(created_at=created_at):
+                regenerated = self.rebuild(slot_document(created_at=created_at))
+
+                self.assertEqual(regenerated["created_at"], created_at)
+                self.assertNotEqual(regenerated["updated_at"], created_at)
+
+    def test_an_unversioned_document_with_a_fraction_is_refused(self):
+        for created_at in FRACTIONAL_CREATED:
+            with self.subTest(created_at=created_at):
+                self.assert_refused(
+                    slot_document(schema_version=ABSENT, created_at=created_at),
+                    field="created_at",
+                    reason="unsupported",
+                    recorded=created_at,
+                )
 
     def test_a_supported_document_needs_a_canonical_created_at(self):
         for created_at, reason in (
@@ -424,11 +454,42 @@ class SaveScenarios:
         self.assertEqual(stored["created_at"], CREATED)
         self.assertNotEqual(stored["updated_at"], CREATED)
 
+    def test_a_supported_document_keeps_a_canonical_fraction_verbatim(self):
+        for index, created_at in enumerate(FRACTIONAL_CREATED):
+            plan_id = f"pln_fraction_{index}"
+            with self.subTest(created_at=created_at):
+                before = self.put(slot_document(plan_id, created_at=created_at))
+
+                stored = self.save(plan_id)
+
+                self.assertEqual(stored["created_at"], created_at)
+                self.assertNotEqual(stored["updated_at"], created_at)
+                self.assertNotEqual(
+                    stored["plan_generation"], before["plan_generation"]
+                )
+                self.assertNotEqual(stored["_rev"], before["_rev"])
+
+    def test_an_unversioned_document_with_a_fraction_is_left(self):
+        for index, created_at in enumerate(FRACTIONAL_CREATED):
+            plan_id = f"pln_unversioned_fraction_{index}"
+            with self.subTest(created_at=created_at):
+                self.put(
+                    slot_document(plan_id, schema_version=ABSENT, created_at=created_at)
+                )
+                self.assert_refused_without_writing(
+                    plan_id,
+                    field="created_at",
+                    reason="unsupported",
+                    recorded=created_at,
+                )
+
     def test_a_supported_document_with_a_noncanonical_created_at_is_left(self):
         cases = (
             (LEGACY_CREATED, "unsupported"),
             (ABSENT, "missing"),
             ("yesterday", "malformed"),
+            ("2026-01-01T00:00:00.250Z", "unsupported"),
+            ("2026-01-01T00:00:00.1234567Z", "unsupported"),
         )
         for index, (created_at, reason) in enumerate(cases):
             plan_id = f"pln_supported_{index}"
