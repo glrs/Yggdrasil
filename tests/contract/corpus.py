@@ -19,12 +19,13 @@ entry also names that entry (``derived_from``), and differs from it in those
 fields only.
 
 The build is deterministic. Every producer reads one frozen clock, set to the
-scenario's instant. Run and execution IDs are numbered per scenario,
-generations and owners derive from fixed labels, and storage revisions are
-fixed. Each scenario has its own scratch spool and work directory, and no path
-from them reaches a document. The build reads no configuration: each step's
-DataAccess is configured with no external systems, instead of loading the
-building machine's ``main.json``.
+scenario's instant, which is always a whole second; a scenario that needs a
+fraction of a second supplies the time to a writer, as a caller may. Run and
+execution IDs are numbered per scenario, generations and owners derive from
+fixed labels, and storage revisions are fixed. Each scenario has its own
+scratch spool and work directory, and no path from them reaches a document.
+The build reads no configuration: each step's DataAccess is configured with
+no external systems, instead of loading the building machine's ``main.json``.
 
 Regenerate from the repository root with::
 
@@ -105,6 +106,7 @@ INVALID = "invalid"
 # The sequences: one plan's history, read in order.
 REQUEST_LIFECYCLE = "request_lifecycle"
 UNVERSIONED_REGENERATION = "unversioned_regeneration"
+FRACTIONAL_REGENERATION = "fractional_regeneration"
 
 # When scenarios happen. An attempt, its finalization and the snapshots taken
 # of it share one instant: the frozen clock does not move during an attempt.
@@ -116,6 +118,12 @@ REGENERATED = "2026-10-23T08:00:00Z"
 
 # When steps published the legacy histories, before attempts were correlated.
 LEGACY_PUBLISHED = "2025-01-01T00:00:00Z"
+
+# Times a caller supplied to a writer, with a fraction of a second. The clocks
+# write whole seconds, so only a supplied time has a fraction.
+FRACTIONAL_PLANNED = "2026-10-22T09:00:00.25Z"
+FRACTIONAL_FINALIZED = "2026-10-22T10:00:00.5Z"
+FRACTIONAL_REGENERATED = "2026-10-23T08:00:00.123456Z"
 
 # The ticket a foreign writer records, and the actors that approve and rerun.
 TICKET = "OPS-1234"
@@ -306,6 +314,7 @@ def build(scratch: Path | None = None) -> dict[str, bytes]:
         _finalized_plans(corpus, workspaces)
         _malformed_plan_documents(corpus)
         _snapshots(corpus, workspaces)
+        _fractional_timestamps(corpus, workspaces)
     return corpus.files()
 
 
@@ -620,11 +629,13 @@ class _Workspace:
             )
         return _Attempt(document=document, family=family, context=context)
 
-    def finalized(self, attempt: _Attempt) -> dict[str, Any]:
+    def finalized(self, attempt: _Attempt, *, now: str = EXECUTED) -> dict[str, Any]:
         """Return the document the finalizer writes for a finished attempt.
 
         Args:
             attempt: An attempt that finished its request.
+            now: When the finalizer records it; EXECUTED, the attempt's own
+                instant, unless a scenario supplies another time.
 
         Returns:
             dict[str, Any]: The finalized document, at its next revision.
@@ -638,7 +649,7 @@ class _Workspace:
         refusal = check_finalization(attempt.document, request)
         if refusal is not None:
             raise CorpusError(f"the finalizer would not record: {refusal.message}")
-        document = build_finalized_document(attempt.document, request, now=EXECUTED)
+        document = build_finalized_document(attempt.document, request, now=now)
         return _stored(document, after=attempt.document)
 
     def snapshot(
@@ -789,11 +800,13 @@ def _generation(plan_id: str, name: str) -> str:
     return _fixed_hex(f"{plan_id} generation {name}")
 
 
-def _planned(plan: Plan, **kwargs: Any) -> dict[str, Any]:
-    """Return the builder's first document of plan, as stored, planned at PLANNED.
+def _planned(plan: Plan, *, now: str = PLANNED, **kwargs: Any) -> dict[str, Any]:
+    """Return the builder's first document of plan, as stored.
 
     Args:
         plan: The plan.
+        now: When it is planned; PLANNED unless a scenario supplies another
+            time.
         **kwargs: The builder's other options, such as ``auto_run``.
 
     Returns:
@@ -803,7 +816,7 @@ def _planned(plan: Plan, **kwargs: Any) -> dict[str, Any]:
         plan,
         REALM,
         dict(SCOPE),
-        now=PLANNED,
+        now=now,
         plan_generation=_generation(plan.plan_id, "A"),
         **kwargs,
     )
@@ -1298,6 +1311,84 @@ def _snapshots(corpus: _Corpus, workspaces: _Workspaces) -> None:
         derived_from=finished_file,
         by_hand=(SCHEMA_VERSION_FIELD,),
     )
+
+
+def _fractional_timestamps(corpus: _Corpus, workspaces: _Workspaces) -> None:
+    """Plan documents whose writers were given times with a fraction of a second.
+
+    The clocks write whole seconds, so every fraction here is a time the
+    corpus supplies to a writer, as a caller may. Each canonical one is kept
+    verbatim, through planning, regeneration and finalization. Two hand edits
+    spell the first document's ``created_at`` in ways the canonical spelling
+    does not allow.
+    """
+    plan = make_plan(spec("demux"), spec("qc", "demux"), plan_id="pln_fractional")
+    draft_file = "plan_document/fractional_timestamps.json"
+    draft = corpus.add(
+        draft_file,
+        _planned(plan, now=FRACTIONAL_PLANNED),
+        scenario="draft planned at a supplied fractional time",
+        provenance="build_plan_document, given a canonical fractional time",
+        sequence=FRACTIONAL_REGENERATION,
+    )
+    regenerated = build_plan_document(
+        plan,
+        REALM,
+        dict(SCOPE),
+        existing=draft,
+        now=FRACTIONAL_REGENERATED,
+        plan_generation=_generation(plan.plan_id, "B"),
+    )
+    corpus.add(
+        "plan_document/fractional_regenerated.json",
+        _stored(regenerated, after=draft),
+        scenario="regenerated over a document created at a fractional time",
+        provenance=(
+            "build_plan_document over the stored draft, given another canonical "
+            "fractional time; created_at is kept verbatim"
+        ),
+        sequence=FRACTIONAL_REGENERATION,
+    )
+
+    workspace = workspaces.open("fractional_finalized")
+    planned = _planned(
+        make_plan(spec("demux"), plan_id="pln_fractional_finalized"),
+        now=FRACTIONAL_PLANNED,
+        auto_run=True,
+    )
+    attempt = workspace.attempt(planned, TerminationReason.COMPLETED)
+    corpus.add(
+        "plan_document/fractional_finalized.json",
+        workspace.finalized(attempt, now=FRACTIONAL_FINALIZED),
+        scenario="auto-run, finalized at a supplied fractional time",
+        provenance=(
+            "build_plan_document given a canonical fractional time, then "
+            "build_finalized_document recording the engine's attempt, given "
+            "another"
+        ),
+    )
+
+    for file, scenario, created_at in (
+        (
+            "plan_document/noncanonical_fraction.json",
+            "created_at with a fraction ending in 0",
+            FRACTIONAL_PLANNED.replace(".25Z", ".250Z"),
+        ),
+        (
+            "plan_document/excess_precision.json",
+            "created_at with a fraction of seven digits",
+            FRACTIONAL_PLANNED.replace(".25Z", ".2500001Z"),
+        ),
+    ):
+        corpus.add(
+            file,
+            {**draft, "created_at": created_at},
+            scenario=scenario,
+            provenance=f"the fractional draft, with created_at {created_at} set by hand",
+            problems=[("created_at", "bad_timestamp")],
+            derived_from=draft_file,
+            by_hand=("created_at",),
+        )
 
 
 def _legacy_snapshot(workspace: _Workspace) -> dict[str, Any]:

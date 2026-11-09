@@ -289,6 +289,65 @@
       ],
       "provenance": "the finished snapshot, with schema_version removed by hand",
       "scenario": "unversioned snapshot"
+    },
+    {
+      "expectation": "valid",
+      "file": "plan_document/fractional_timestamps.json",
+      "kind": "plan_document",
+      "position": 1,
+      "provenance": "build_plan_document, given a canonical fractional time",
+      "scenario": "draft planned at a supplied fractional time",
+      "sequence": "fractional_regeneration"
+    },
+    {
+      "expectation": "valid",
+      "file": "plan_document/fractional_regenerated.json",
+      "kind": "plan_document",
+      "position": 2,
+      "provenance": "build_plan_document over the stored draft, given another canonical fractional time; created_at is kept verbatim",
+      "scenario": "regenerated over a document created at a fractional time",
+      "sequence": "fractional_regeneration"
+    },
+    {
+      "expectation": "valid",
+      "file": "plan_document/fractional_finalized.json",
+      "kind": "plan_document",
+      "provenance": "build_plan_document given a canonical fractional time, then build_finalized_document recording the engine's attempt, given another",
+      "scenario": "auto-run, finalized at a supplied fractional time"
+    },
+    {
+      "by_hand": [
+        "created_at"
+      ],
+      "derived_from": "plan_document/fractional_timestamps.json",
+      "expectation": "invalid",
+      "file": "plan_document/noncanonical_fraction.json",
+      "kind": "plan_document",
+      "problems": [
+        {
+          "code": "bad_timestamp",
+          "path": "created_at"
+        }
+      ],
+      "provenance": "the fractional draft, with created_at 2026-10-22T09:00:00.250Z set by hand",
+      "scenario": "created_at with a fraction ending in 0"
+    },
+    {
+      "by_hand": [
+        "created_at"
+      ],
+      "derived_from": "plan_document/fractional_timestamps.json",
+      "expectation": "invalid",
+      "file": "plan_document/excess_precision.json",
+      "kind": "plan_document",
+      "problems": [
+        {
+          "code": "bad_timestamp",
+          "path": "created_at"
+        }
+      ],
+      "provenance": "the fractional draft, with created_at 2026-10-22T09:00:00.2500001Z set by hand",
+      "scenario": "created_at with a fraction of seven digits"
     }
   ]
 }

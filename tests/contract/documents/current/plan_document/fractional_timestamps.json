@@ -1,0 +1,52 @@
+{
+  "_id": "pln_fractional",
+  "_rev": "1-corpus",
+  "created_at": "2026-10-22T09:00:00.25Z",
+  "executed_run_token": -1,
+  "execution_authority": "daemon",
+  "execution_owner": null,
+  "plan": {
+    "failure_policy": "fail_fast",
+    "plan_id": "pln_fractional",
+    "realm": "test_realm",
+    "scope": {
+      "id": "P1",
+      "kind": "project"
+    },
+    "steps": [
+      {
+        "deps": [],
+        "fn_ref": "tests.execution:scripted",
+        "inputs": {},
+        "name": "demux",
+        "outputs": {},
+        "params": {},
+        "scope": {},
+        "step_id": "demux"
+      },
+      {
+        "deps": [
+          "demux"
+        ],
+        "fn_ref": "tests.execution:scripted",
+        "inputs": {},
+        "name": "qc",
+        "outputs": {},
+        "params": {},
+        "scope": {},
+        "step_id": "qc"
+      }
+    ]
+  },
+  "plan_generation": "7f760ab02f4577dcee3f55ba3d5d816d",
+  "preview": {},
+  "realm": "test_realm",
+  "run_token": 0,
+  "schema_version": 1,
+  "scope": {
+    "id": "P1",
+    "kind": "project"
+  },
+  "status": "draft",
+  "updated_at": "2026-10-22T09:00:00.25Z"
+}
