@@ -14,11 +14,19 @@ from yggdrasil.contract.controls import (
     MAX_TOKEN,
     PLAN_DEFINITION_FIELDS,
     STEP_DEFINITION_FIELDS,
+    DefinitionCheck,
     FailurePolicyCheck,
     TokenPair,
+    execution_definition_check,
     execution_definition_problems,
     failure_policy_of,
     token_pair,
+)
+from yggdrasil.contract.problems import (
+    INVALID_EXECUTION_DEFINITION,
+    INVALID_FAILURE_POLICY,
+    INVALID_TOKENS,
+    ContractProblem,
 )
 from yggdrasil.flow.model import VALID_FAILURE_POLICIES
 from yggdrasil.storage.plan_documents import build_plan_document
@@ -46,6 +54,21 @@ HOSTILE: tuple[Any, ...] = (
     {"a": {"b": [None]}},
     [{"step_id": "s1"}] * 3,
 )
+
+
+def tokens_detail(path: str, message: str) -> ContractProblem:
+    """The structured form of a token problem."""
+    return ContractProblem(path, INVALID_TOKENS, message)
+
+
+def policy_detail(path: str, message: str) -> ContractProblem:
+    """The structured form of a failure-policy problem."""
+    return ContractProblem(path, INVALID_FAILURE_POLICY, message)
+
+
+def definition_detail(path: str, message: str) -> ContractProblem:
+    """The structured form of an execution-definition problem."""
+    return ContractProblem(path, INVALID_EXECUTION_DEFINITION, message)
 
 
 def _put(container: dict[str, Any], key: str, value: Any) -> None:
@@ -89,7 +112,7 @@ class TestTokenPair(unittest.TestCase):
     """One rule for both tokens: present, true ints, in range, executed <= run."""
 
     def test_a_built_document_has_a_valid_pair(self):
-        self.assertEqual(token_pair(plan_document()), TokenPair(True, 0, -1, ()))
+        self.assertEqual(token_pair(plan_document()), TokenPair(True, 0, -1, (), ()))
 
     def test_valid_pairs(self):
         for run, executed in (
@@ -103,7 +126,7 @@ class TestTokenPair(unittest.TestCase):
             with self.subTest(run=run, executed=executed):
                 document = plan_document(run_token=run, executed_run_token=executed)
                 self.assertEqual(
-                    token_pair(document), TokenPair(True, run, executed, ())
+                    token_pair(document), TokenPair(True, run, executed, (), ())
                 )
 
     def test_each_invalid_run_token_is_refused_on_its_own(self):
@@ -126,6 +149,9 @@ class TestTokenPair(unittest.TestCase):
                 self.assertEqual(pair.executed, -1)  # still valid on its own
                 self.assertEqual(len(pair.problems), 1, pair.problems)
                 self.assertTrue(pair.problems[0].startswith("run_token "))
+                self.assertEqual(
+                    pair.details, (tokens_detail("run_token", pair.problems[0]),)
+                )
 
     def test_each_invalid_executed_token_is_refused_on_its_own(self):
         for value in (
@@ -149,12 +175,27 @@ class TestTokenPair(unittest.TestCase):
                 self.assertIsNone(pair.executed)
                 self.assertEqual(len(pair.problems), 1, pair.problems)
                 self.assertTrue(pair.problems[0].startswith("executed_run_token "))
+                self.assertEqual(
+                    pair.details,
+                    (tokens_detail("executed_run_token", pair.problems[0]),),
+                )
 
     def test_executed_above_run_is_invalid_though_each_token_is_valid(self):
         pair = token_pair(plan_document(run_token=4, executed_run_token=5))
         self.assertEqual(
             pair,
-            TokenPair(False, 4, 5, ("executed_run_token 5 is above run_token 4",)),
+            TokenPair(
+                False,
+                4,
+                5,
+                ("executed_run_token 5 is above run_token 4",),
+                (
+                    tokens_detail(
+                        "executed_run_token",
+                        "executed_run_token 5 is above run_token 4",
+                    ),
+                ),
+            ),
         )
 
     def test_problems_name_the_field_and_the_recorded_value(self):
@@ -174,7 +215,9 @@ class TestTokenPair(unittest.TestCase):
         for fields, problem in cases:
             with self.subTest(problem=problem):
                 pair = token_pair(plan_document(**fields))
+                (field,) = fields
                 self.assertEqual(pair.problems, (problem,))
+                self.assertEqual(pair.details, (tokens_detail(field, problem),))
 
     def test_both_tokens_invalid_reports_both(self):
         pair = token_pair(plan_document(run_token="5", executed_run_token=ABSENT))
@@ -184,6 +227,10 @@ class TestTokenPair(unittest.TestCase):
                 "run_token '5' is a str, not a JSON integer",
                 "executed_run_token is missing",
             ),
+        )
+        self.assertEqual(
+            [(d.path, d.code) for d in pair.details],
+            [("run_token", INVALID_TOKENS), ("executed_run_token", INVALID_TOKENS)],
         )
 
     def test_a_document_that_is_not_an_object_has_no_valid_pair(self):
@@ -195,6 +242,7 @@ class TestTokenPair(unittest.TestCase):
                 )
                 self.assertEqual(len(pair.problems), 1)
                 self.assertTrue(pair.problems[0].startswith("the plan document "))
+                self.assertEqual(pair.details, (tokens_detail("", pair.problems[0]),))
 
 
 class TestFailurePolicyOf(unittest.TestCase):
@@ -208,7 +256,8 @@ class TestFailurePolicyOf(unittest.TestCase):
             with self.subTest(policy=policy):
                 document = with_plan_field("failure_policy", policy)
                 self.assertEqual(
-                    failure_policy_of(document), FailurePolicyCheck(True, policy, ())
+                    failure_policy_of(document),
+                    FailurePolicyCheck(True, policy, (), ()),
                 )
 
     def test_absent_or_unknown_policy_is_invalid(self):
@@ -228,21 +277,38 @@ class TestFailurePolicyOf(unittest.TestCase):
         for value, problem in cases:
             with self.subTest(value=value):
                 result = failure_policy_of(with_plan_field("failure_policy", value))
-                self.assertEqual(result, FailurePolicyCheck(False, None, (problem,)))
+                self.assertEqual(
+                    result,
+                    FailurePolicyCheck(
+                        False,
+                        None,
+                        (problem,),
+                        (policy_detail("plan.failure_policy", problem),),
+                    ),
+                )
 
     def test_a_missing_or_malformed_plan_is_named(self):
         cases = [
-            (plan_document(plan=ABSENT), "plan is missing"),
-            (plan_document(plan=None), "plan is null"),
-            (plan_document(plan=["steps"]), "plan ['steps'] is a list, not an object"),
-            (plan_document(plan="p"), "plan 'p' is a str, not an object"),
-            ([], "the plan document [] is a list, not an object"),
-            (None, "the plan document None is a NoneType, not an object"),
+            (plan_document(plan=ABSENT), "plan", "plan is missing"),
+            (plan_document(plan=None), "plan", "plan is null"),
+            (
+                plan_document(plan=["steps"]),
+                "plan",
+                "plan ['steps'] is a list, not an object",
+            ),
+            (plan_document(plan="p"), "plan", "plan 'p' is a str, not an object"),
+            ([], "", "the plan document [] is a list, not an object"),
+            (None, "", "the plan document None is a NoneType, not an object"),
         ]
-        for document, problem in cases:
+        for document, path, problem in cases:
             with self.subTest(problem=problem):
                 result = failure_policy_of(document)
-                self.assertEqual(result, FailurePolicyCheck(False, None, (problem,)))
+                self.assertEqual(
+                    result,
+                    FailurePolicyCheck(
+                        False, None, (problem,), (policy_detail(path, problem),)
+                    ),
+                )
 
 
 class TestExecutionDefinitionProblems(unittest.TestCase):
@@ -269,6 +335,10 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
 
     def test_a_built_document_is_complete(self):
         self.assertEqual(execution_definition_problems(plan_document()), ())
+        self.assertEqual(
+            execution_definition_check(plan_document()),
+            DefinitionCheck(True, (), ()),
+        )
 
     def test_each_missing_or_null_plan_field_is_named(self):
         for key in PLAN_DEFINITION_FIELDS:
@@ -278,6 +348,14 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
                         with_plan_field(key, value)
                     )
                     self.assertEqual(problems, (f"plan.{key} is {state}",))
+                    self.assertEqual(
+                        execution_definition_check(with_plan_field(key, value)),
+                        DefinitionCheck(
+                            False,
+                            problems,
+                            (definition_detail(f"plan.{key}", problems[0]),),
+                        ),
+                    )
 
     def test_each_missing_or_null_step_field_is_named(self):
         for key in STEP_DEFINITION_FIELDS:
@@ -287,6 +365,12 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
                         with_step_field(1, key, value)
                     )
                     self.assertEqual(problems, (f"plan.steps[1].{key} is {state}",))
+                    self.assertEqual(
+                        execution_definition_check(
+                            with_step_field(1, key, value)
+                        ).details,
+                        (definition_detail(f"plan.steps[1].{key}", problems[0]),),
+                    )
 
     def test_every_problem_is_reported_at_once(self):
         doc = plan_document()
@@ -302,6 +386,14 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
                 "plan.steps[1].outputs is null",
             ),
         )
+        self.assertEqual(
+            [(d.path, d.code) for d in execution_definition_check(doc).details],
+            [
+                ("plan.failure_policy", INVALID_EXECUTION_DEFINITION),
+                ("plan.steps[0].deps", INVALID_EXECUTION_DEFINITION),
+                ("plan.steps[1].outputs", INVALID_EXECUTION_DEFINITION),
+            ],
+        )
 
     def test_steps_must_be_a_list(self):
         cases = [
@@ -315,6 +407,10 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
                     with_plan_field("steps", value)
                 )
                 self.assertEqual(problems, (problem,))
+                self.assertEqual(
+                    execution_definition_check(with_plan_field("steps", value)).details,
+                    (definition_detail("plan.steps", problem),),
+                )
 
     def test_each_step_must_be_an_object(self):
         doc = plan_document()
@@ -327,17 +423,27 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
                 "plan.steps[3] 7 is an int, not an object",
             ),
         )
+        self.assertEqual(
+            [d.path for d in execution_definition_check(doc).details],
+            ["plan.steps[2]", "plan.steps[3]"],
+        )
 
     def test_a_missing_or_malformed_plan_is_the_only_problem(self):
         cases = [
-            (plan_document(plan=ABSENT), "plan is missing"),
-            (plan_document(plan=None), "plan is null"),
-            (plan_document(plan=[]), "plan [] is a list, not an object"),
-            ("doc", "the plan document 'doc' is a str, not an object"),
+            (plan_document(plan=ABSENT), "plan", "plan is missing"),
+            (plan_document(plan=None), "plan", "plan is null"),
+            (plan_document(plan=[]), "plan", "plan [] is a list, not an object"),
+            ("doc", "", "the plan document 'doc' is a str, not an object"),
         ]
-        for document, problem in cases:
+        for document, path, problem in cases:
             with self.subTest(problem=problem):
                 self.assertEqual(execution_definition_problems(document), (problem,))
+                self.assertEqual(
+                    execution_definition_check(document),
+                    DefinitionCheck(
+                        False, (problem,), (definition_detail(path, problem),)
+                    ),
+                )
 
     def test_values_are_left_to_deserialization_and_preflight(self):
         # Presence only: an empty step list, or a dependency list of the wrong
@@ -351,6 +457,7 @@ class TestExecutionDefinitionProblems(unittest.TestCase):
         self.assertEqual(
             execution_definition_problems(with_plan_field("steps", [])), ()
         )
+        self.assertEqual(execution_definition_check(doc).details, ())
 
 
 class TestNoStoredValueMakesACheckRaise(unittest.TestCase):
@@ -385,18 +492,33 @@ class TestNoStoredValueMakesACheckRaise(unittest.TestCase):
                     document = place(value)
                     pair = token_pair(document)
                     policy = failure_policy_of(document)
-                    definition = execution_definition_problems(document)
+                    definition = execution_definition_check(document)
+                    self.assertEqual(
+                        definition.problems, execution_definition_problems(document)
+                    )
 
                     verdicts = {
                         "tokens": pair.valid,
                         "policy": policy.valid,
-                        "definition": not definition,
+                        "definition": definition.valid,
                     }
                     for check in self.INVALID_FOR.get(where, ()):
                         self.assertFalse(verdicts[check], check)
-                    for problem in (*pair.problems, *policy.problems, *definition):
-                        self.assertIsInstance(problem, str)
-                        self.assertLess(len(problem), 200, problem)
+                    codes = (
+                        (pair, INVALID_TOKENS),
+                        (policy, INVALID_FAILURE_POLICY),
+                        (definition, INVALID_EXECUTION_DEFINITION),
+                    )
+                    for result, code in codes:
+                        self.assertEqual(
+                            tuple(d.message for d in result.details), result.problems
+                        )
+                        for problem in result.problems:
+                            self.assertIsInstance(problem, str)
+                            self.assertLess(len(problem), 200, problem)
+                        for detail in result.details:
+                            self.assertEqual(detail.code, code)
+                            self.assertIsInstance(detail.path, str)
 
 
 if __name__ == "__main__":

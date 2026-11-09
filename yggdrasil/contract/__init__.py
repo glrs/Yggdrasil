@@ -9,10 +9,15 @@ contract's runtime core:
 
 - the document kinds, and the families this release writes and supports
   (below);
+- :mod:`yggdrasil.contract.problems`: how a problem is reported, one record and
+  one set of codes shared by validation, the control checks and the reader;
+- :mod:`yggdrasil.contract.fields`: every field name and vocabulary word of the
+  contract, spelled once; a leaf that imports nothing from the package;
 - :mod:`yggdrasil.contract.versions`: reading a document's ``schema_version``;
 - :mod:`yggdrasil.contract.controls`: the checks on the control fields that
   decide whether and how a plan runs (the execution tokens, the failure
-  policy, the execution definition);
+  policy, the execution definition), each reporting its problems as text and
+  as structured records;
 - :mod:`yggdrasil.contract.timestamps`: the canonical timestamp spelling;
 - :mod:`yggdrasil.contract.diagnostics`: showing a recorded value in a
   diagnostic, bounded and never raising.

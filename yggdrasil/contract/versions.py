@@ -23,8 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from yggdrasil.contract import ATTEMPT_REPORT, SUPPORTED_FAMILIES
-
-SCHEMA_VERSION_FIELD = "schema_version"
+from yggdrasil.contract.fields import SCHEMA_VERSION_FIELD
 
 # Version states.
 SUPPORTED = "supported"
