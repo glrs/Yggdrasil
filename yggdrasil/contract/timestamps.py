@@ -19,7 +19,8 @@ and the timezone-aware ISO 8601 forms that Python's
 ``datetime.fromisoformat`` reads, converted to UTC. Being canonical is not a
 condition for being read. A value that names no instant is unknown, never
 guessed: no timezone is assumed, and a fraction finer than a microsecond is
-never rounded or truncated.
+never rounded or truncated. A fraction counts only after ``.`` or ``,``,
+which narrows what Python reads (see :func:`parse_timestamp`).
 
 Nothing here reads the clock: every function checks, reads or formats the
 value it is given.
@@ -79,6 +80,17 @@ _MAX_FRACTION_DIGITS = 6
 # A fraction with more digits than that, after either separator, anywhere: in
 # the time or in the offset.
 _EXCESS_FRACTION = re.compile(f"[.,][0-9]{{{_MAX_FRACTION_DIGITS + 1}}}")
+
+# Digits after the seconds of a time or an offset that neither "." nor ","
+# introduces: after a colon, as in ``10:20:30:5``, or directly, as in
+# ``10:20:307`` and the basic ``1020305``. Python's ISO parser reads them as a
+# fraction, and drops a single one before the zone. Extended, they follow a
+# ``HH:MM:SS``. Basic, a ``HHMMSS`` followed by more digits makes a run of
+# seven digits after a character other than a digit, "." or ",", or of more
+# digits than a compact date's eight at the start.
+_UNMARKED_FRACTION = re.compile(
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}:?[0-9]|(?<=[^0-9.,])[0-9]{7}|^[0-9]{9}"
+)
 
 # A value's trailing UTC offset, when it carries a fraction, read as Python's
 # ISO parser reads it: two-digit hours, then optionally minutes and seconds,
@@ -203,10 +215,29 @@ def parse_timestamp(value: object) -> datetime | None:
     Anything else is None: a value that is not a string; text without a
     timezone, since none is assumed; a fraction of more than six digits,
     after ``.`` or ``,``, in the time or in the offset, since nothing is
-    rounded or truncated; text containing a NUL, after which Python's ISO
+    rounded or truncated; digits after the seconds that neither ``.`` nor
+    ``,`` introduces (below); text containing a NUL, after which Python's ISO
     parser can stop checking (it reads ``2026-11-06T10:20:30Z\\x00junk``); an
     offset of 24 hours or more; an instant outside the years 0001 to 9999 in
     UTC.
+
+    A fraction is read only after ``.`` or ``,``. Python 3.11 also reads, as
+    a fraction, digits that follow the seconds of the time or of the offset
+    after a colon (``2026-11-06T10:20:30:1234567+00:00``) or directly
+    (``2026-11-06T1020301234567+00:00``, ``+000000000001``). It truncates
+    such a fraction beyond six digits, loses it from an offset whose whole
+    seconds are zero, and drops a single such digit before the zone. So a
+    value with digits there is None: a narrow exception to reading what
+    Python reads. Without parsing the date, a colon or a digit used between
+    the date and the time can look the same, as in
+    ``2026-11-06:10:20:30Z``, and such a value is None too.
+
+    Other forms Python reads are read as Python reads them. For example, one
+    stray character before the zone is ignored (``2026-11-06T10:20:30xZ``),
+    a fraction after the hour or the minute counts in seconds
+    (``2026-11-06T10:20.5Z`` is 10:20:00.5), an offset's minutes and seconds
+    roll over (``+05:60`` is ``+06:00``), and an empty fraction is ignored
+    (``2026-11-06T10:20:30.Z``).
 
     The fraction of an offset is kept exactly. Python 3.11 drops it when the
     offset's whole seconds are zero, reading ``+00:00:00.000001`` as UTC, so
@@ -227,7 +258,7 @@ def parse_timestamp(value: object) -> datetime | None:
     """
     if not isinstance(value, str) or "\x00" in value:
         return None
-    if _EXCESS_FRACTION.search(value) is not None:
+    if _EXCESS_FRACTION.search(value) or _UNMARKED_FRACTION.search(value):
         return None
     instant = _rfc3339_instant(value)
     return instant if instant is not None else _iso_instant(value)

@@ -305,17 +305,8 @@ class TestTrailingNewline(unittest.TestCase):
                 self.assertIsNone(parse_timestamp(value))
 
 
-class TestParseTimestamp(unittest.TestCase):
-    """The instant a recorded timestamp names, read as these cases pin it.
-
-    These cases are compatibility checks for Python upgrades. The reader
-    hands what RFC 3339 does not cover to Python's
-    ``datetime.fromisoformat``, so a new Python can change what it reads. A
-    case that starts to fail is a change in what the reader accepts, to be
-    reviewed as one, never a test to adjust. They detect changes in the cases
-    they name, not every change in the parser's grammar. Each asserts the
-    instant read, never mere success.
-    """
+class ReadingTestCase(unittest.TestCase):
+    """Assertions on what parse_timestamp reads, for the classes below."""
 
     def assert_reads(self, cases: dict[str, datetime]) -> None:
         """Assert each value reads as exactly its instant, aware in UTC."""
@@ -332,6 +323,19 @@ class TestParseTimestamp(unittest.TestCase):
         for name, value in values.items():
             with self.subTest(name):
                 self.assertIsNone(parse_timestamp(value))
+
+
+class TestParseTimestamp(ReadingTestCase):
+    """The instant a recorded timestamp names, read as these cases pin it.
+
+    These cases are compatibility checks for Python upgrades. The reader
+    hands what RFC 3339 does not cover to Python's
+    ``datetime.fromisoformat``, so a new Python can change what it reads. A
+    case that starts to fail is a change in what the reader accepts, to be
+    reviewed as one, never a test to adjust. They detect changes in the cases
+    they name, not every change in the parser's grammar. Each asserts the
+    instant read, never mere success.
+    """
 
     def test_canonical_values_are_read_exactly(self):
         self.assert_reads(
@@ -423,6 +427,78 @@ class TestParseTimestamp(unittest.TestCase):
                     "2026-11-06T11:20:30.1234567+01:00"
                 ),
                 "many digits": "2026-11-06T10:20:30." + "1" * 100 + "Z",
+            }
+        )
+
+    def test_a_fraction_needs_a_point_or_a_comma(self):
+        # Python 3.11 reads digits after the seconds as a fraction when a
+        # colon introduces them or they follow directly, truncating them
+        # beyond six digits and losing them from an offset whose whole seconds
+        # are zero.
+        self.assert_unread(
+            {
+                "seven digits after a colon in the time": (
+                    "2026-11-06T10:20:30:1234567+00:00"
+                ),
+                "seven digits right after the basic seconds": (
+                    "2026-11-06T1020301234567+00:00"
+                ),
+                "a microsecond after a colon in a zero offset": (
+                    "2026-11-06T10:20:30+00:00:00:000001"
+                ),
+                "a microsecond right after a zero basic offset's seconds": (
+                    "2026-11-06T10:20:30+000000000001"
+                ),
+                "one digit after a colon in the time": "2026-11-06T10:20:30:5Z",
+                "six digits after a colon in the time": "2026-11-06T10:20:30:123456Z",
+                "six zeros then a one after a colon": "2026-11-06T10:20:30:0000001Z",
+                "two digits right after the basic seconds": "2026-11-06T10203012Z",
+                "six digits right after the basic seconds": (
+                    "2026-11-06T102030123456Z"
+                ),
+                "after a compact date": "20261106T1020301234567Z",
+                "after a compact date and a digit between date and time": (
+                    "2026110651020301234567Z"
+                ),
+                "a digit after a colon in a zero offset": (
+                    "2026-11-06T10:20:30+00:00:00:5"
+                ),
+                "two digits right after a zero basic offset's seconds": (
+                    "2026-11-06T10:20:30+00000012"
+                ),
+                "after a negative zero basic offset's seconds": (
+                    "2026-11-06T10:20:30-000000000001"
+                ),
+                "a digit after a colon in a nonzero offset": (
+                    "2026-11-06T10:20:30+01:00:00:5"
+                ),
+                "a colon fraction followed by other text": (
+                    "2026-11-06T10:20:30:123456xZ"
+                ),
+            }
+        )
+
+    def test_a_digit_right_after_the_seconds_is_never_dropped(self):
+        # Python 3.11 drops a single such digit before the zone.
+        self.assert_unread(
+            {
+                "after the extended seconds": "2026-11-06T10:20:307Z",
+                "after the basic seconds": "2026-11-06T1020307Z",
+                "after the seconds, before an offset": "2026-11-06T10:20:307+01:00",
+                "after a compact date's basic seconds": "20261106T1020307Z",
+            }
+        )
+
+    def test_a_colon_or_digit_between_date_and_time_can_look_the_same(self):
+        # Python reads each as 10:20:30Z on its date. Without parsing the date,
+        # the reader cannot tell its separator from a time's unmarked fraction.
+        self.assert_unread(
+            {
+                "a colon after a date": "2026-11-06:10:20:30Z",
+                "a colon after a compact date": "20261106:10:20:30Z",
+                "a colon after a week": "2026-W45:10:20:30Z",
+                "a digit after a date": "2026-11-065102030Z",
+                "a digit after a compact date": "202611065102030Z",
             }
         )
 
@@ -579,12 +655,64 @@ class TestParseTimestamp(unittest.TestCase):
                 "2026-11-06T10:20:30Z",
                 "2026-11-06T10:20:30+00:00:00.000001",
                 "2026-11-06T10:20:30.1234567Z",
+                "2026-11-06T10:20:30:1234567+00:00",
                 "0001-01-01T00:00:00+01:00",
                 "2026-11-06T10:20:30\x00Z",
                 None,
                 10**5000,
             ):
                 parse_timestamp(value)
+
+
+class TestPythonQuirks(ReadingTestCase):
+    """Forms outside the named cases, read as Python 3.11 reads them.
+
+    Python's ISO parser reads these four forms in ways ISO 8601 does not
+    describe, and the reader keeps its readings. Each case pins the instant
+    read today. Like the named cases, they are compatibility checks for
+    Python upgrades: a case that starts to fail is a change in what the
+    reader accepts, to be reviewed as one, never a test to adjust.
+    """
+
+    def test_one_stray_character_before_the_zone_is_ignored(self):
+        self.assert_reads(
+            {
+                "2026-11-06T10:20:30xZ": INSTANT,
+                "2026-11-06T10:20:30 Z": INSTANT,
+                # A colon after the seconds, with no digit after it.
+                "2026-11-06T10:20:30:Z": INSTANT,
+                "2026-11-06T10:20xZ": utc(2026, 11, 6, 10, 20),
+                "2026-11-06T10:20:30x+01:00": utc(2026, 11, 6, 9, 20, 30),
+            }
+        )
+
+    def test_a_fraction_after_the_hour_or_the_minute_counts_in_seconds(self):
+        self.assert_reads(
+            {
+                "2026-11-06T10:20.5Z": utc(2026, 11, 6, 10, 20, 0, 500000),
+                "2026-11-06T10.5Z": utc(2026, 11, 6, 10, 0, 0, 500000),
+                "2026-11-06T10:20:30+01:00.5": utc(2026, 11, 6, 9, 20, 29, 500000),
+                "2026-11-06T10:20:30+01.5": utc(2026, 11, 6, 9, 20, 29, 500000),
+            }
+        )
+
+    def test_an_offsets_minutes_and_seconds_roll_over(self):
+        self.assert_reads(
+            {
+                "2026-11-06T10:20:30+05:60": utc(2026, 11, 6, 4, 20, 30),
+                "2026-11-06T10:20:30+01:00:60": utc(2026, 11, 6, 9, 19, 30),
+                "2026-11-06T10:20:30-00:99": utc(2026, 11, 6, 11, 59, 30),
+            }
+        )
+
+    def test_an_empty_fraction_is_ignored(self):
+        self.assert_reads(
+            {
+                "2026-11-06T10:20:30.Z": INSTANT,
+                "2026-11-06T10:20:30,Z": INSTANT,
+                "2026-11-06T10:20:30.+01:00": utc(2026, 11, 6, 9, 20, 30),
+            }
+        )
 
 
 class OffsetWithoutUtcOffset(tzinfo):
