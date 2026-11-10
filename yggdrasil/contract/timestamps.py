@@ -237,7 +237,11 @@ def parse_timestamp(value: object) -> datetime | None:
     a fraction after the hour or the minute counts in seconds
     (``2026-11-06T10:20.5Z`` is 10:20:00.5), an offset's minutes and seconds
     roll over (``+05:60`` is ``+06:00``), and an empty fraction is ignored
-    (``2026-11-06T10:20:30.Z``).
+    (``2026-11-06T10:20:30.Z``). Python also leaves the text between a
+    six-digit fraction and the zone unchecked:
+    ``2026-11-06T10:20:30.123456 junk here+01:00`` is 09:20:30.123456 in UTC,
+    its six digits and its offset exact. That is Python's reading of that
+    value, not a promise that other text there is read.
 
     The fraction of an offset is kept exactly. Python 3.11 drops it when the
     offset's whole seconds are zero, reading ``+00:00:00.000001`` as UTC, so

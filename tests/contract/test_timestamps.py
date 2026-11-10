@@ -667,7 +667,7 @@ class TestParseTimestamp(ReadingTestCase):
 class TestPythonQuirks(ReadingTestCase):
     """Forms outside the named cases, read as Python 3.11 reads them.
 
-    Python's ISO parser reads these four forms in ways ISO 8601 does not
+    Python's ISO parser reads these five forms in ways ISO 8601 does not
     describe, and the reader keeps its readings. Each case pins the instant
     read today. Like the named cases, they are compatibility checks for
     Python upgrades: a case that starts to fail is a change in what the
@@ -711,6 +711,27 @@ class TestPythonQuirks(ReadingTestCase):
                 "2026-11-06T10:20:30.Z": INSTANT,
                 "2026-11-06T10:20:30,Z": INSTANT,
                 "2026-11-06T10:20:30.+01:00": utc(2026, 11, 6, 9, 20, 30),
+            }
+        )
+
+    def test_a_six_digit_fraction_keeps_its_instant_before_unchecked_text(self):
+        # Python stops reading a fraction at six digits and leaves the text
+        # between them and the zone unchecked. This value is pinned because
+        # its six digits and its offset are both kept exactly; nothing here
+        # promises that other text in that place is read.
+        self.assert_reads(
+            {
+                "2026-11-06T10:20:30.123456 junk here+01:00": utc(
+                    2026, 11, 6, 9, 20, 30, 123456
+                ),
+            }
+        )
+        # A seventh digit is still excess precision, refused before parsing.
+        self.assert_unread(
+            {
+                "a seventh digit before the text": (
+                    "2026-11-06T10:20:30.1234567 junk here+01:00"
+                ),
             }
         )
 
