@@ -108,8 +108,9 @@ def correlate(plan: PlanRead, snapshot: SnapshotRead | NoDocument) -> Correlatio
     stays as the plan states it, and the qualification is stated here. Two
     finished records of one execution that disagree on how it ended are both
     shown, and neither is picked. A snapshot that still shows the execution
-    running, or not yet ended, beside its finalized result is lag, not
-    disagreement; so are missing or unrecognised values.
+    running, or finished without a recognised outcome, beside its finalized
+    result is lag or incomplete evidence, not disagreement; so is any other
+    missing or unrecognised value.
 
     The reasons of each verdict are judged in this order, the first that
     applies giving the answer:
@@ -310,9 +311,12 @@ def conflicting_endings(
     """Return the two endings of one execution when its two terminal claims disagree.
 
     Only two explicit, usable terminal claims can conflict: the finalized
-    record and the snapshot's attempt in state ``finished``, of the same
-    execution without an identity conflict, whose outcomes or termination
-    reasons are both recognised and differ. Each differing field is
+    record, and the snapshot's attempt in state ``finished`` with a
+    recognised outcome, of the same execution without an identity conflict,
+    whose outcomes or termination reasons are both recognised and differ.
+    A finished attempt whose outcome is absent, ``null`` or unrecognised has
+    not said how it ended, so it is incomplete evidence: none of its values
+    is compared, its termination reason included. Each differing field is
     reported once.
 
     Args:
@@ -331,6 +335,7 @@ def conflicting_endings(
         or record is None
         or isinstance(observed, str)
         or observed.settled is not True
+        or observed.outcome.value is None
     ):
         return None
     attempt = observed

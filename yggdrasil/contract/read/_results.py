@@ -450,11 +450,14 @@ class StepError:
 
     While the attempt runs, a step entry's ``error`` is the step's
     ``step.failed`` event's; once the attempt has ended, it is the report's
-    failure record, which also names the error's type. Each field is read as
-    text or unknown, as the error carried it.
+    failure record, which also names the error's type. The message and the
+    error type are text or ``null``, and any other value is unknown and
+    reported; the kind, the code and the advice are kept as the error carried
+    them, so a value of any type is unknown but no problem.
 
     Attributes:
-        message: The error's message, from its ``error`` field.
+        message: The error's message, from its ``error`` field; None when it
+            is not non-empty text.
         kind: ``permanent`` or ``transient``, recognised beside the recorded
             value.
         code: The error's code, as the step gave it.
@@ -478,7 +481,8 @@ class ObservedStep:
         step_id: The step's ID: its key in the snapshot's ``steps``.
         name: The step's ``step_name``; None when it is not non-empty text.
         status: The step's status, one of STEP_STATUSES (see
-            :func:`~yggdrasil.contract.read.step_status`). ``started`` is
+            :func:`~yggdrasil.contract.read.step_status`); ``unknown`` for an
+            entry without its ``state`` or ``outcome`` key. ``started`` is
             recorded past activity, not proof of present activity.
         contradiction: Why the entry contradicts itself; None when it does
             not.
@@ -670,7 +674,8 @@ class ConflictingEndings:
 
     Attributes:
         finalized: How the plan's finalized record says it ended.
-        observed: How the snapshot's finished attempt says it ended.
+        observed: How the snapshot's finished attempt says it ended; its
+            outcome is always recognised.
         fields: The fields, ``outcome`` or ``termination_reason``, whose
             recognised values differ, sorted.
     """
@@ -703,8 +708,8 @@ class Correlation:
             statement about the request's validity, completion or
             eligibility.
         conflicting_endings: The two endings when the finalized record and
-            the finished attempt of the same execution disagree on how it
-            ended; None otherwise.
+            the same execution's finished attempt, with a recognised outcome,
+            disagree on how it ended; None otherwise.
         problems: What the pair contradicts: an identity conflict, or
             conflicting endings.
     """

@@ -445,25 +445,86 @@ class TestStepStatus(ReaderTestCase):
         self.assertTrue(result.usable)
 
     def test_a_state_or_outcome_of_the_wrong_type_costs_that_step(self):
-        for field, value, expected in (
-            ("state", [], ("steps.qc.state", "wrong_type")),
-            ("state", None, ("steps.qc.state", "wrong_type")),
-            ("state", ABSENT, ("steps.qc.state", "missing_field")),
-            ("outcome", 5, ("steps.qc.outcome", "wrong_type")),
-            ("outcome", ABSENT, ("steps.qc.outcome", "missing_field")),
+        for field, name, value, expected in (
+            ("state", "a list", [], ("steps.qc.state", "wrong_type")),
+            ("state", "null", None, ("steps.qc.state", "wrong_type")),
+            ("state", "absent", ABSENT, ("steps.qc.state", "missing_field")),
+            ("outcome", "a number", 5, ("steps.qc.outcome", "wrong_type")),
+            ("outcome", "absent", ABSENT, ("steps.qc.outcome", "missing_field")),
         ):
-            with self.subTest(field=field, value=repr(value)):
+            with self.subTest(field=field, value=name):
                 result = read(changed(snapshot("running"), f"steps.qc.{field}", value))
 
                 steps = steps_of(result)
                 self.assertEqual(paths_and_codes(result), [expected])
                 self.assertEqual(steps["demux"].status, "started")
-                self.assertIn(steps["qc"].status, ("unknown", "pending"))
+                self.assertEqual(steps["qc"].status, "unknown")
 
-    def test_an_absent_outcome_is_no_outcome(self):
-        result = read(changed(snapshot("running"), "steps.qc.outcome", ABSENT))
+    def test_an_absent_state_or_outcome_is_not_null(self):
+        """A required key that is absent records nothing: no status, no contradiction.
 
-        self.assertEqual(steps_of(result)["qc"].status, "pending")
+        Read as null, a pending state would be its status, and a terminal state
+        or a recognised outcome would contradict it.
+        """
+        for name, state, outcome in (
+            ("no outcome, in state pending", "pending", ABSENT),
+            ("no outcome, beside a terminal event", "step.succeeded", ABSENT),
+            ("no outcome, beside another step event", "step.started", ABSENT),
+            ("no state, beside a recognised outcome", ABSENT, "succeeded"),
+            ("no state, beside a null outcome", ABSENT, None),
+            ("neither", ABSENT, ABSENT),
+        ):
+            with self.subTest(name):
+                document = changed(snapshot("running"), "steps.qc.state", state)
+                document = changed(document, "steps.qc.outcome", outcome)
+
+                result = read(document)
+
+                step = steps_of(result)["qc"]
+                self.assertEqual((step.status, step.contradiction), ("unknown", None))
+                self.assertEqual(
+                    paths_and_codes(result),
+                    [
+                        (f"steps.qc.{field}", "missing_field")
+                        for field, value in (("state", state), ("outcome", outcome))
+                        if value is ABSENT
+                    ],
+                )
+                self.assertTrue(result.usable)
+                self.assertEqual(steps_of(result)["demux"].status, "started")
+
+    def test_an_explicit_null_is_read_by_the_table(self):
+        """null is recorded, so beside a terminal event it is a contradiction."""
+        contradiction = ("steps.qc", "step_record_contradiction")
+        for name, state, outcome, status, problems in (
+            ("a null outcome, in state pending", "pending", None, "pending", []),
+            (
+                "a null outcome, beside a terminal event",
+                "step.succeeded",
+                None,
+                "unknown",
+                [contradiction],
+            ),
+            (
+                "a null state, beside a recognised outcome",
+                None,
+                "succeeded",
+                "unknown",
+                [("steps.qc.state", "wrong_type"), contradiction],
+            ),
+        ):
+            with self.subTest(name):
+                document = changed(snapshot("running"), "steps.qc.state", state)
+                document = changed(document, "steps.qc.outcome", outcome)
+
+                result = read(document)
+
+                step = steps_of(result)["qc"]
+                self.assertEqual(step.status, status)
+                self.assertEqual(
+                    step.contradiction is not None, contradiction in problems
+                )
+                self.assertEqual(paths_and_codes(result), problems)
 
 
 class TestSettled(ReaderTestCase):
@@ -968,11 +1029,10 @@ class TestStepError(ReaderTestCase):
                 )
                 self.assertEqual(step.status, "failed")
 
-    def test_its_values_are_kept_as_the_step_gave_them(self):
-        """The event's values are the step's own, so they are text or unknown."""
+    def test_its_open_values_are_kept_as_the_step_gave_them(self):
+        """The kind, code and advice are the step's own: text, or unknown."""
         path = "steps.lane1_demux.error"
         for field, value in (
-            ("error", 7),
             ("code", 404),
             ("advice", ["retry"]),
             ("kind", 1),
@@ -986,12 +1046,50 @@ class TestStepError(ReaderTestCase):
                 error = steps_of(result)["lane1_demux"].error
                 assert error is not None
                 read_back = {
-                    "error": error.message,
                     "code": error.code,
                     "advice": error.advice,
                     "kind": error.kind.value,
                 }
                 self.assertIsNone(read_back[field])
+
+    def test_a_message_that_is_not_text_is_the_wrong_type(self):
+        """Read alike in both shapes: unknown, and reported at the message itself."""
+        path = "steps.lane1_demux.error.error"
+        for shape, name in (
+            ("the event's", "running_with_failure"),
+            ("the report's", "finished_with_failures"),
+        ):
+            for value_name, value in (
+                ("a number", 7),
+                ("a boolean", False),
+                ("a list", ["boom"]),
+                ("an object", {"message": "boom"}),
+            ):
+                with self.subTest(shape=shape, value=value_name):
+                    result = read(changed(snapshot(name), path, value))
+
+                    step = steps_of(result)["lane1_demux"]
+                    assert step.error is not None
+                    self.assertIsNone(step.error.message)
+                    self.assertEqual(paths_and_codes(result), [(path, "wrong_type")])
+                    self.assertEqual(step.error.kind.value, "permanent")
+                    self.assertEqual(step.status, "failed")
+                    self.assertTrue(result.usable)
+
+    def test_a_null_or_empty_message_is_no_message(self):
+        path = "steps.lane1_demux.error.error"
+        for shape, name in (
+            ("the event's", "running_with_failure"),
+            ("the report's", "finished_with_failures"),
+        ):
+            for value_name, value in (("null", None), ("empty text", "")):
+                with self.subTest(shape=shape, value=value_name):
+                    result = read(changed(snapshot(name), path, value))
+
+                    error = steps_of(result)["lane1_demux"].error
+                    assert error is not None
+                    self.assertIsNone(error.message)
+                    self.assertEqual(result.problems, ())
 
     def test_an_unrecognised_kind_is_unknown_with_its_text(self):
         result = read(

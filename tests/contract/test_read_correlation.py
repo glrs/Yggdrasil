@@ -821,11 +821,17 @@ class TestConflictingEndings(ReaderTestCase):
         )
 
     def test_a_conflicting_termination_reason(self):
+        """Both outcomes recognised and equal: the reason alone can conflict."""
         correlation = ended(termination_reason="cancelled")
 
         conflict = correlation.conflicting_endings
         assert conflict is not None
         self.assertEqual(conflict.fields, ("termination_reason",))
+        self.assertEqual(conflict.observed, Ending("succeeded", "cancelled"))
+        self.assertEqual(
+            [(p.path, p.code) for p in correlation.problems],
+            [("last_finalized_execution.termination_reason", "conflicting_endings")],
+        )
 
     def test_both_conflict(self):
         correlation = ended(outcome="failed", termination_reason="failed_fast")
@@ -856,6 +862,26 @@ class TestConflictingEndings(ReaderTestCase):
             )
             self.assertIsNone(correlation.conflicting_endings)
             self.assertEqual(correlation.problems, ())
+
+    def test_a_finished_attempt_without_a_recognised_outcome_is_incomplete(self):
+        """It has not said how it ended, so not even its termination reason counts.
+
+        Its execution is still the finalized record's.
+        """
+        for name, outcome in (
+            ("absent", ABSENT),
+            ("null", None),
+            ("unrecognised", "partially_succeeded"),
+        ):
+            with self.subTest(name):
+                correlation = ended(outcome=outcome, termination_reason="cancelled")
+
+                self.assertEqual(
+                    correlation.finalized_and_observation,
+                    Verdict("same_execution", "execution_ids_equal"),
+                )
+                self.assertIsNone(correlation.conflicting_endings)
+                self.assertEqual(correlation.problems, ())
 
     def test_unrecognised_values_are_incomplete_evidence(self):
         for attempt in (

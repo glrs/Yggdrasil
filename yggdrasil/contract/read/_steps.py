@@ -9,7 +9,10 @@ it: ``step.succeeded`` records ``succeeded``, ``step.skipped`` ``reused``,
 :func:`step_status` derives the step's status from the two, and says when
 they contradict each other. :func:`observed_steps` reads every entry of a
 snapshot whose structure has been checked: the status, the time of the
-latest event, the reported progress, the error, and the blockers.
+latest event, the reported progress, the error, and the blockers. Both keys
+are required on every entry, and an absent one is not ``null``: the entry
+records nothing to derive a status from, so its status is ``unknown``, the
+absent key is its one problem, and nothing is contradicted.
 """
 
 from __future__ import annotations
@@ -80,7 +83,11 @@ def step_status(state: object, outcome: object) -> StepStatus:
     values are checked to be text before either is looked up, so a list or
     an object is never hashed or compared as a word.
 
-    A value helper: it checks no document version, and never raises.
+    A value helper: it checks no document version, and never raises. It
+    takes recorded values, so None is ``null``. An entry without its
+    ``state`` or ``outcome`` key records no value at all, which is not
+    ``null``: :func:`~yggdrasil.contract.read.read_snapshot` reads such an
+    entry as ``unknown``, with no contradiction, without this rule.
 
     Args:
         state: The entry's recorded ``state``, of any type.
@@ -153,7 +160,9 @@ def observed_step(
     """Read one step entry, each answer from the fields it depends on.
 
     - status and contradiction from ``state`` and ``outcome``
-      (:func:`step_status`);
+      (:func:`step_status`); an entry without either key is ``unknown``,
+      the absent key its one problem (``missing_field``), and contradicts
+      nothing;
     - the time of the latest event from ``ts``, read tolerantly; ``null`` is
       no time and no problem;
     - progress from ``progress``, only in state ``step.progress``: the
@@ -179,7 +188,12 @@ def observed_step(
     path: _values.Path = (STEPS_FIELD, step_id)
     state = _state(entry, path, problems)
     outcome = _outcome(entry, path, problems)
-    status = step_status(state, outcome)
+    if STATE_FIELD in entry and OUTCOME_FIELD in entry:
+        status = step_status(state, outcome)
+    else:
+        # An absent key records nothing, which is not null: there is nothing
+        # to derive a status from, and nothing to contradict.
+        status = StepStatus(UNKNOWN, None)
     if status.contradiction is not None:
         problems.append(
             _values.problem(
@@ -223,9 +237,12 @@ def step_error(
     While the attempt runs, the error is the ``step.failed`` event's (its
     message as ``error``, ``kind``, ``code`` and ``advice``), whose values
     are kept as the step gave them. Once the attempt has ended, it is the
-    report's failure record, which also names ``error_type``. So each field
-    is text or unknown, and only ``error_type``, which the report records as
-    text or ``null``, can be of the wrong type.
+    report's failure record, which also names ``error_type``. Both shapes
+    are read alike. The message is text, or ``null`` for none; any other
+    value is unknown and of the wrong type, reported at the error's own
+    ``error`` key. ``error_type`` is text or ``null`` the same way.
+    ``kind``, ``code`` and ``advice`` are open: a value of any type is
+    unknown but no problem.
 
     Args:
         entry: The step entry.
@@ -250,13 +267,15 @@ def step_error(
         return None
 
     def open_text(key: str) -> str | None:
-        """Read one of the error's fields, kept as the step gave it."""
+        """Read one of the error's open fields, kept as the step gave it."""
         return _values.text(
             error, key, error_path, problems, required=True, typed=False
         ).value
 
     return StepError(
-        message=open_text(ERROR_FIELD),
+        message=_values.text(
+            error, ERROR_FIELD, error_path, problems, required=True, nullable=True
+        ).value,
         kind=_values.word(
             error, KIND_FIELD, error_path, problems, ERROR_KINDS, typed=False
         ),
