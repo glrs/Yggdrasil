@@ -8,10 +8,13 @@ document may become unusable, a field unknown; nothing may raise.
 
 The inputs are every plan document alone, every snapshot alone, and every
 plan and snapshot that the manifest's sequences put together. A pair is read
-the way a consumer reads one: the plan first, then its snapshot under the
-plan's realm when the plan names a snapshot, or ``LOOKUP_IMPOSSIBLE`` when it
-does not; a plan that is not usable is also correlated with a snapshot
-already at hand. Each pair is also correlated with every NoDocument.
+the way a consumer reads one: the plan first, then the snapshot for the
+plan's ID, under the realm the plan records, or the pair's own realm when
+the plan recognises none, and the two reads correlated. A plan that names no
+snapshot ID, because it is not usable or its scope or realm is damaged,
+gives a consumer nothing to look the snapshot up by; it is still correlated
+with the snapshot already at hand. Each pair is also correlated with every
+NoDocument, ``LOOKUP_IMPOSSIBLE`` included.
 
 The damage is deliberate. It says nothing about what Yggdrasil writes.
 """
@@ -37,12 +40,13 @@ from tests.contract.read_support import (
     snapshot_names,
     valid_names,
 )
-from tests.contract.support import ABSENT
+from tests.contract.support import ABSENT, changed
 from yggdrasil.contract.diagnostics import MAX_LENGTH
 from yggdrasil.contract.problems import ALL_CODES, ContractProblem
 from yggdrasil.contract.read import (
     LOOKUP_IMPOSSIBLE,
     MISSING,
+    PRESENT,
     UNAVAILABLE,
     Correlation,
     Recorded,
@@ -443,6 +447,13 @@ def pair_answers(
 ) -> Answers:
     """Read a plan and its snapshot as a consumer does, and correlate them.
 
+    The snapshot is read for the plan's ID, under the realm the plan
+    records when it recognises one, so that the two reads are of one plan,
+    and under the pair's own realm otherwise. The snapshot at hand is read
+    whether or not the plan names a snapshot ID: a usable plan whose scope
+    or realm is damaged names none, and its reads are correlated all the
+    same. Then each NoDocument a consumer may hold instead.
+
     Args:
         plan_body: The plan document.
         snapshot_body: Its snapshot.
@@ -453,17 +464,17 @@ def pair_answers(
         Answers: Each function and its result.
     """
     plan = read_plan(plan_body, plan_id=plan_id)
-    answers: Answers = [(read_plan, plan)]
-    if plan.snapshot_id is None or plan.recorded is None:
-        answers.append((correlate, correlate(plan, LOOKUP_IMPOSSIBLE)))
-    else:
-        recorded_realm = plan.recorded.realm.value
-        assert recorded_realm is not None  # a snapshot ID names the realm
-        read = read_snapshot(snapshot_body, plan_id=plan_id, realm=recorded_realm)
-        answers += [(read_snapshot, read), (correlate, correlate(plan, read))]
-    if not plan.usable:
-        at_hand = read_snapshot(snapshot_body, plan_id=plan_id, realm=realm)
-        answers += [(read_snapshot, at_hand), (correlate, correlate(plan, at_hand))]
+    recorded_realm = plan.recorded.realm.value if plan.recorded is not None else None
+    read = read_snapshot(
+        snapshot_body,
+        plan_id=plan_id,
+        realm=recorded_realm if recorded_realm is not None else realm,
+    )
+    answers: Answers = [
+        (read_plan, plan),
+        (read_snapshot, read),
+        (correlate, correlate(plan, read)),
+    ]
     for sentinel in (MISSING, UNAVAILABLE, LOOKUP_IMPOSSIBLE):
         answers.append((correlate, correlate(plan, sentinel)))
     return answers
@@ -619,6 +630,65 @@ class TestUndamaged(ReaderTestCase):
                 )
                 self.assertIsNotNone(read.steps)
                 self.assertEqual(faults_of(correlate, correlation), [])
+
+
+class TestPairReads(ReaderTestCase):
+    """A pair is read as a consumer reads one, with the snapshot at hand."""
+
+    def test_a_plan_with_no_snapshot_id_is_correlated_with_the_snapshot_at_hand(self):
+        """A damaged scope or realm leaves the plan usable but names no snapshot ID.
+
+        The snapshot is still read and correlated, beside the NoDocuments: under
+        the realm the plan records when it recognises one, under the pair's own
+        realm otherwise.
+        """
+        undamaged = plan_document("approved_finalized")
+        plan_id, realm = undamaged["_id"], undamaged["realm"]
+        for name, path, value in (
+            ("no scope", "scope", ABSENT),
+            ("a scope without an ID", "scope.id", ""),
+            ("a realm that is not text", "realm", 5),
+        ):
+            with self.subTest(name):
+                plan_body = changed(undamaged, path, value)
+                plan = read_plan(plan_body, plan_id=plan_id)
+                self.assertTrue(plan.usable)
+                self.assertIsNone(plan.snapshot_id)
+
+                answers = pair_answers(
+                    plan_body, snapshot("finished_success"), plan_id, realm
+                )
+
+                reads = [result for kind, result in answers if kind is read_snapshot]
+                self.assertEqual(len(reads), 1)
+                self.assertEqual(
+                    (reads[0].presence, reads[0].usable, reads[0].realm),
+                    (PRESENT, True, realm),
+                )
+                correlations = [result for kind, result in answers if kind is correlate]
+                self.assertEqual(
+                    [correlation.snapshot for correlation in correlations],
+                    [reads[0], MISSING, UNAVAILABLE, LOOKUP_IMPOSSIBLE],
+                )
+                self.assertEqual(
+                    correlations[0].finalized_and_observation.verdict,
+                    "same_execution",
+                )
+
+    def test_the_snapshot_is_read_under_the_realm_the_plan_records(self):
+        """A plan of another realm is paired with no snapshot of the pair's realm."""
+        undamaged = plan_document("approved_finalized")
+        plan_id, realm = undamaged["_id"], undamaged["realm"]
+        plan_body = changed(undamaged, "realm", "another_realm")
+
+        answers = pair_answers(plan_body, snapshot("finished_success"), plan_id, realm)
+
+        (read,) = [result for kind, result in answers if kind is read_snapshot]
+        self.assertEqual(read.realm, "another_realm")
+        self.assertEqual(
+            [(problem.path, problem.code) for problem in read.problems],
+            [("realm", "identity_mismatch")],
+        )
 
 
 class TestPlantedFaults(ReaderTestCase):
