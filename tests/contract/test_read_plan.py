@@ -29,6 +29,7 @@ from yggdrasil.contract.read import (
     UNAVAILABLE,
     UNSUPPORTED_DOCUMENT,
     PlanRead,
+    Recorded,
     eligibility,
     eligibility_reason,
     generation_of,
@@ -362,19 +363,56 @@ class TestRecordedFields(ReaderTestCase):
                     self.assertIs(recorded.recorded, value)
                     self.assertEqual(paths_and_codes(plan), [(path, "wrong_type")])
 
-    def test_the_owner_is_a_non_empty_string_or_null(self):
-        owner = self.field(
-            changed(plan_document("draft"), "execution_owner", "run_once:abc"),
-            "execution_owner",
+    def test_the_owner_is_required_text_or_null(self):
+        """``execution_owner`` is required, and holds text or ``null``.
+
+        Non-empty text is the owner. Empty text and ``null`` are valid and
+        name no owner, without a problem. An absent field is missing, and any
+        other value is of the wrong type. No case changes the eligibility
+        decision, which does not judge who may execute the plan.
+        """
+        decision = eligibility(plan_document("draft"))
+        cases = (
+            (
+                "text",
+                "run_once:abc",
+                Recorded("run_once:abc", "run_once:abc", True),
+                [],
+            ),
+            ("empty text", "", Recorded(None, "", True), []),
+            ("null", None, Recorded(None, None, True), []),
+            (
+                "absent",
+                ABSENT,
+                Recorded(None, None, False),
+                [("execution_owner", "missing_field")],
+            ),
         )
-        self.assertEqual(owner.value, "run_once:abc")
-        for name, value in (("empty", ""), ("int", 5), ("object", {})):
+        for name, value, owner, problems in cases:
             with self.subTest(name):
                 plan = read(changed(plan_document("draft"), "execution_owner", value))
 
+                assert plan.recorded is not None
+                self.assertEqual(plan.recorded.execution_owner, owner)
+                self.assertEqual(paths_and_codes(plan), problems)
+                self.assertEqual(plan.eligibility, decision)
+        for name, value in (
+            ("int", 5),
+            ("bool", True),
+            ("object", {}),
+            ("list", ["run_once:abc"]),
+        ):
+            with self.subTest(name):
+                plan = read(changed(plan_document("draft"), "execution_owner", value))
+
+                assert plan.recorded is not None
+                owner = plan.recorded.execution_owner
+                self.assertIsNone(owner.value)
+                self.assertIs(owner.recorded, value)
                 self.assertEqual(
                     paths_and_codes(plan), [("execution_owner", "wrong_type")]
                 )
+                self.assertEqual(plan.eligibility, decision)
 
     def test_optional_text(self):
         for path in ("notes", "approved_by", "run_requested_by"):
@@ -550,6 +588,13 @@ class TestControlChecks(ReaderTestCase):
             (
                 "plan.steps.0.name",
                 ABSENT,
+                [("plan.steps[0].name", "invalid_execution_definition")],
+            ),
+            # A step's name is required by the execution definition, so a
+            # null one is that check's finding, not the text reader's.
+            (
+                "plan.steps.0.name",
+                None,
                 [("plan.steps[0].name", "invalid_execution_definition")],
             ),
         )

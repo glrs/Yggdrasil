@@ -249,8 +249,9 @@ class PlanFields:
             APPROVAL_STATUSES.
         execution_authority: Who may execute the plan, recognised as a word
             of EXECUTION_AUTHORITIES.
-        execution_owner: Which run-once process owns the plan, a non-empty
-            string; recorded as ``null`` for the daemon.
+        execution_owner: Which run-once process owns the plan, recognised
+            when it is non-empty text. Required; ``null``, as recorded for
+            the daemon, and empty text name no owner, without a problem.
         notes: Notes about the plan.
         created_at: When the plan was first planned.
         updated_at: When the document was last written.

@@ -174,9 +174,11 @@ def identifier(
     problems: list[ContractProblem],
     *,
     required: bool = True,
-    nullable: bool = False,
 ) -> Recorded[str]:
-    """Read a field that holds an ID or another non-empty string.
+    """Read a field that holds an ID, a generation or another non-empty string.
+
+    Empty text and ``null`` are of the wrong type: neither identifies
+    anything.
 
     Args:
         container: The object holding the field.
@@ -184,7 +186,6 @@ def identifier(
         parent: The path of container.
         problems: Where a problem is appended.
         required: Whether an absent field is a problem.
-        nullable: Whether ``null`` is a valid value, read as no value.
 
     Returns:
         Recorded[str]: The string, recognised only when it is not empty.
@@ -195,12 +196,9 @@ def identifier(
             problems.append(missing(path))
         return absent()
     value = container[key]
-    if value is None and nullable:
-        return Recorded(None, None, True)
     if is_identifier(value):
         return Recorded(value, value, True)
-    expected = f"{NON_EMPTY_STRING} or null" if nullable else NON_EMPTY_STRING
-    problems.append(wrong_type(path, value, expected))
+    problems.append(wrong_type(path, value, NON_EMPTY_STRING))
     return Recorded(None, value, True)
 
 
@@ -209,27 +207,39 @@ def text(
     key: str,
     parent: Path,
     problems: list[ContractProblem],
+    *,
+    required: bool = False,
+    nullable: bool = False,
 ) -> Recorded[str]:
-    """Read an optional field of free text, such as a name or a note.
+    """Read a field of free text, such as a name, a note or a run-once owner.
 
-    An absent field is no value and no problem. Empty text is valid but says
-    nothing, so it is recognised as no value, without a problem.
+    Empty text is valid but says nothing, so it is recognised as no value,
+    without a problem.
 
     Args:
         container: The object holding the field.
         key: The field.
         parent: The path of container.
         problems: Where a problem is appended.
+        required: Whether an absent field is a problem.
+        nullable: Whether ``null`` is a valid value: recorded, recognising
+            no text, without a problem.
 
     Returns:
         Recorded[str]: The text, recognised when it is not empty.
     """
+    path = (*parent, key)
     if key not in container:
+        if required:
+            problems.append(missing(path))
         return absent()
     value = container[key]
+    if value is None and nullable:
+        return Recorded(None, None, True)
     if isinstance(value, str):
         return Recorded(value or None, value, True)
-    problems.append(wrong_type((*parent, key), value, STRING))
+    expected = f"{STRING} or null" if nullable else STRING
+    problems.append(wrong_type(path, value, expected))
     return Recorded(None, value, True)
 
 

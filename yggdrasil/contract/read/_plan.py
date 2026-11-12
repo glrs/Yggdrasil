@@ -200,7 +200,8 @@ def plan_fields(
     ``realm``, ``scope``, ``status``, ``execution_authority``,
     ``execution_owner``, ``created_at`` and ``updated_at`` are required; the
     rest are optional. A word outside its vocabulary is unknown, kept, and
-    not a problem.
+    not a problem. ``execution_owner`` is text or ``null``: empty text and
+    ``null`` name no owner, without a problem.
 
     Args:
         document: A plan document of a supported family.
@@ -218,8 +219,13 @@ def plan_fields(
         execution_authority=_values.word(
             document, EXECUTION_AUTHORITY_FIELD, _ROOT, problems, EXECUTION_AUTHORITIES
         ),
-        execution_owner=_values.identifier(
-            document, EXECUTION_OWNER_FIELD, _ROOT, problems, nullable=True
+        execution_owner=_values.text(
+            document,
+            EXECUTION_OWNER_FIELD,
+            _ROOT,
+            problems,
+            required=True,
+            nullable=True,
         ),
         notes=_values.text(document, NOTES_FIELD, _ROOT, problems),
         created_at=_values.timestamp(
