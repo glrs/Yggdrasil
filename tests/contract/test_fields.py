@@ -24,6 +24,7 @@ from yggdrasil.flow.errors import PermanentStepError
 from yggdrasil.flow.events import attempt_records
 from yggdrasil.flow.model import VALID_FAILURE_POLICIES, StepResult
 from yggdrasil.flow.outcomes import (
+    AttemptDiagnostic,
     ExecutionOutcome,
     StepFailure,
     StepOutcome,
@@ -122,6 +123,14 @@ class TestProducerVocabularies(unittest.TestCase):
         self.assertEqual(dict(fields.OUTCOME_EVENTS), recorded)
         self.assertEqual(fields.EVENT_STEP_BLOCKED, attempt_records.STEP_BLOCKED_EVENT)
 
+    def test_failure_fields_are_the_ones_the_report_records(self):
+        self.assertEqual(
+            fields.STEP_FAILURE_FIELDS, frozenset(StepFailure.__dataclass_fields__)
+        )
+        self.assertEqual(
+            fields.DIAGNOSTIC_FIELDS, frozenset(AttemptDiagnostic.__dataclass_fields__)
+        )
+
     def test_step_statuses_are_outcomes_states_and_started(self):
         self.assertEqual(
             fields.STEP_STATUSES,
@@ -216,6 +225,17 @@ class TestPublishedSchemas(unittest.TestCase):
         )
         self.assertEqual(
             fields.STEP_ENTRY_FIELDS, properties(self.status["$defs"]["step"])
+        )
+
+    def test_step_error_and_diagnostic_fields(self):
+        self.assertEqual(
+            fields.LIVE_ERROR_FIELDS, properties(self.status["$defs"]["live_error"])
+        )
+        self.assertEqual(
+            fields.STEP_FAILURE_FIELDS, properties(self.report["$defs"]["step_failure"])
+        )
+        self.assertEqual(
+            fields.DIAGNOSTIC_FIELDS, properties(self.report["$defs"]["diagnostic"])
         )
 
     def test_snapshot_vocabularies(self):

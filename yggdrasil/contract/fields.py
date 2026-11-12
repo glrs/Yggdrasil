@@ -206,6 +206,23 @@ STEP_ENTRY_FIELDS = frozenset(
     }
 )
 
+# Fields of a step entry's error, in its two stored shapes: the failure as the
+# step's step.failed event carries it while the attempt runs, and the report's
+# failure record once it has ended, which also names the step and the type of
+# the error. ``error`` holds the message.
+KIND_FIELD = "kind"
+CODE_FIELD = "code"
+ADVICE_FIELD = "advice"
+ERROR_TYPE_FIELD = "error_type"
+LIVE_ERROR_FIELDS = frozenset({ERROR_FIELD, KIND_FIELD, CODE_FIELD, ADVICE_FIELD})
+STEP_FAILURE_FIELDS = LIVE_ERROR_FIELDS | {STEP_ID_FIELD, ERROR_TYPE_FIELD}
+
+# Fields of an attempt's diagnostic: why the attempt ended without a step to
+# blame, such as a preflight rejection or an interrupt.
+MESSAGE_FIELD = "message"
+DETAILS_FIELD = "details"
+DIAGNOSTIC_FIELDS = frozenset({MESSAGE_FIELD, ERROR_TYPE_FIELD, DETAILS_FIELD})
+
 # A plan document's approval status.
 DRAFT = "draft"
 APPROVED = "approved"
