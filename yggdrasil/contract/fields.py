@@ -82,6 +82,12 @@ PLAN_DOCUMENT_FIELDS = frozenset(
     }
 )
 
+# Fields of a scope, wherever one is recorded: what the plan is about. Other
+# keys of a scope are realm-defined.
+SCOPE_KIND_FIELD = "kind"
+SCOPE_ID_FIELD = "id"
+SCOPE_FIELDS = frozenset({SCOPE_KIND_FIELD, SCOPE_ID_FIELD})
+
 # Fields of the plan inside a plan document, and of each of its steps.
 PLAN_ID_FIELD = "plan_id"
 STEPS_FIELD = "steps"
@@ -257,6 +263,10 @@ INTERRUPTED = "interrupted"
 UNREACHED = "unreached"
 UNKNOWN = "unknown"
 STEP_STATES = frozenset({PENDING, INTERRUPTED, UNREACHED, UNKNOWN})
+
+# The keys of an attempt's ``counts``, in an attempt report and in a
+# snapshot's attempt: the steps of each step outcome, and those never reached.
+COUNTS_FIELDS = frozenset({SUCCEEDED, REUSED, FAILED, BLOCKED, UNREACHED})
 
 # The lifecycle events of a step, which an entry's ``state`` otherwise names.
 EVENT_STEP_STARTED = "step.started"

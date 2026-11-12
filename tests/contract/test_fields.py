@@ -178,6 +178,14 @@ class TestPublishedSchemas(unittest.TestCase):
             fields.PLAN_DOCUMENT_FIELDS, frozenset(self.document["properties"])
         )
 
+    def test_scope_fields(self):
+        self.assertEqual(
+            fields.SCOPE_FIELDS, properties(self.document["$defs"]["scope"])
+        )
+        self.assertEqual(
+            frozenset(self.document["$defs"]["scope"]["required"]), fields.SCOPE_FIELDS
+        )
+
     def test_plan_document_vocabularies(self):
         self.assertEqual(fields.APPROVAL_STATUSES, enum_of(self.document, "status"))
         self.assertEqual(
@@ -225,6 +233,13 @@ class TestPublishedSchemas(unittest.TestCase):
         self.assertEqual(
             fields.TERMINATION_REASONS, enum_of(self.report, "termination_reason")
         )
+
+    def test_counts_fields(self):
+        # The snapshot's attempt refers to the report's definition.
+        self.assertEqual(
+            fields.COUNTS_FIELDS, properties(self.report["$defs"]["counts"])
+        )
+        self.assertEqual(fields.COUNTS_FIELDS, values(StepOutcome) | {fields.UNREACHED})
 
 
 class TestEmittedEvents(SpoolTestCase):
