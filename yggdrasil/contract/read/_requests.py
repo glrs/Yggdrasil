@@ -81,14 +81,14 @@ def finishes_request(
     Returns:
         bool: True if the request is finished.
     """
-    if _is_word(outcome, SUCCEEDED):
-        return _is_word(termination_reason, COMPLETED)
+    if _values.is_word(outcome, SUCCEEDED):
+        return _values.is_word(termination_reason, COMPLETED)
     return (
-        _is_word(outcome, FAILED)
-        and _is_word(failure_policy, CONTINUE_INDEPENDENT)
+        _values.is_word(outcome, FAILED)
+        and _values.is_word(failure_policy, CONTINUE_INDEPENDENT)
         and (
-            _is_word(termination_reason, COMPLETED)
-            or _is_word(termination_reason, PREFLIGHT_REJECTED)
+            _values.is_word(termination_reason, COMPLETED)
+            or _values.is_word(termination_reason, PREFLIGHT_REJECTED)
         )
     )
 
@@ -332,8 +332,3 @@ def _unreadable(record: object) -> FinalizedRecord:
         disagreeing=(),
         recorded=record,
     )
-
-
-def _is_word(value: object, word: str) -> bool:
-    """Return whether value is exactly the text word."""
-    return isinstance(value, str) and value == word

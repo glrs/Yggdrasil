@@ -8,10 +8,11 @@ can always show what was stored.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from yggdrasil.contract import problems as _problems
 from yggdrasil.contract.controls import FailurePolicyCheck, TokenPair
@@ -70,6 +71,97 @@ ELIGIBILITY_CODES = frozenset(
         ALREADY_EXECUTED,
         ELIGIBLE,
         IDENTITY_MISMATCH,
+    }
+)
+
+# Verdicts of a correlation, one closed set per question it answers. Each
+# question can also be undecided.
+UNKNOWN = "unknown"
+SAME_GENERATION = "same_generation"
+DIFFERENT_GENERATION = "different_generation"
+SAME_EXECUTION = "same_execution"
+DIFFERENT_EXECUTION = "different_execution"
+CURRENT = "current"
+OTHER = "other"
+
+PLAN_OBSERVATION_VERDICTS = frozenset({SAME_GENERATION, DIFFERENT_GENERATION, UNKNOWN})
+FINALIZED_OBSERVATION_VERDICTS = frozenset(
+    {SAME_EXECUTION, DIFFERENT_EXECUTION, UNKNOWN}
+)
+REQUEST_OBSERVATION_VERDICTS = frozenset({CURRENT, OTHER, UNKNOWN})
+
+# Why there is no observed attempt to compare, in the order they are judged:
+# the plan, then whether and how the snapshot was read. Every question shares
+# them. The reason for a snapshot that could not be looked up is the word of
+# the NoDocument the caller passed for it.
+PLAN_NOT_USABLE = "plan_not_usable"
+NO_LOOKUP = LOOKUP_IMPOSSIBLE.value
+NO_OBSERVATION = "no_observation"
+OBSERVATION_UNAVAILABLE = "observation_unavailable"
+OBSERVATION_INSPECT_ONLY = "observation_inspect_only"
+OBSERVATION_INVALID = "observation_invalid"
+LEGACY_PROJECTION = "legacy_projection"
+OBSERVATION_REASONS = (
+    PLAN_NOT_USABLE,
+    NO_LOOKUP,
+    NO_OBSERVATION,
+    OBSERVATION_UNAVAILABLE,
+    OBSERVATION_INSPECT_ONLY,
+    OBSERVATION_INVALID,
+    LEGACY_PROJECTION,
+)
+
+# What decides whether the plan and the observation are of one generation.
+PLAN_GENERATION_MISSING = "plan_generation_missing"
+ATTEMPT_GENERATION_MISSING = "attempt_generation_missing"
+GENERATIONS_EQUAL = "generations_equal"
+GENERATIONS_DIFFER = "generations_differ"
+
+# What decides whether the finalized record and the observation are of one
+# execution.
+NOTHING_FINALIZED = "nothing_finalized"
+FINALIZED_UNUSABLE = "finalized_unusable"
+EXECUTION_ID_MISSING = "execution_id_missing"
+EXECUTION_IDS_DIFFER = "execution_ids_differ"
+IDENTITY_CONFLICT = _problems.IDENTITY_CONFLICT
+EXECUTION_IDS_EQUAL = "execution_ids_equal"
+
+# What decides whether the observed attempt belongs to the current request.
+RUN_TOKENS_DIFFER = "run_tokens_differ"
+PLAN_RUN_TOKEN_MISSING = "plan_run_token_missing"
+ATTEMPT_RUN_TOKEN_MISSING = "attempt_run_token_missing"
+GENERATION_AND_RUN_TOKEN_EQUAL = "generation_and_run_token_equal"
+
+PLAN_OBSERVATION_REASONS = frozenset(
+    {
+        *OBSERVATION_REASONS,
+        PLAN_GENERATION_MISSING,
+        ATTEMPT_GENERATION_MISSING,
+        GENERATIONS_EQUAL,
+        GENERATIONS_DIFFER,
+    }
+)
+FINALIZED_OBSERVATION_REASONS = frozenset(
+    {
+        *OBSERVATION_REASONS,
+        NOTHING_FINALIZED,
+        FINALIZED_UNUSABLE,
+        EXECUTION_ID_MISSING,
+        EXECUTION_IDS_DIFFER,
+        IDENTITY_CONFLICT,
+        EXECUTION_IDS_EQUAL,
+    }
+)
+REQUEST_OBSERVATION_REASONS = frozenset(
+    {
+        *OBSERVATION_REASONS,
+        GENERATIONS_DIFFER,
+        RUN_TOKENS_DIFFER,
+        PLAN_GENERATION_MISSING,
+        ATTEMPT_GENERATION_MISSING,
+        PLAN_RUN_TOKEN_MISSING,
+        ATTEMPT_RUN_TOKEN_MISSING,
+        GENERATION_AND_RUN_TOKEN_EQUAL,
     }
 )
 
@@ -332,3 +424,295 @@ class PlanRead:
     finalized: FinalizedRecord | None
     steps: tuple[PlannedStep, ...] | None
     snapshot_id: str | None
+
+
+@dataclass(frozen=True)
+class StepStatus:
+    """What a step entry's ``state`` and ``outcome`` say about the step.
+
+    Attributes:
+        status: One of STEP_STATUSES: the recorded outcome, the state of an
+            entry with none, ``started`` for a step whose latest event is not
+            terminal, or ``unknown``.
+        contradiction: Why the record contradicts itself, naming both
+            recorded values: an outcome beside a state that does not record
+            it, or a terminal state without an outcome. None when it does
+            not. A contradictory record's status is always ``unknown``.
+    """
+
+    status: str
+    contradiction: str | None
+
+
+@dataclass(frozen=True)
+class StepError:
+    """How a step failed, read the same way from either of its stored shapes.
+
+    While the attempt runs, a step entry's ``error`` is the step's
+    ``step.failed`` event's; once the attempt has ended, it is the report's
+    failure record, which also names the error's type. Each field is read as
+    text or unknown, as the error carried it.
+
+    Attributes:
+        message: The error's message, from its ``error`` field.
+        kind: ``permanent`` or ``transient``, recognised beside the recorded
+            value.
+        code: The error's code, as the step gave it.
+        advice: What to do about it, as the step gave it.
+        error_type: The type of the exception that ended the step; recorded
+            only once the attempt has ended.
+    """
+
+    message: str | None
+    kind: Recorded[str]
+    code: str | None
+    advice: str | None
+    error_type: str | None
+
+
+@dataclass(frozen=True)
+class ObservedStep:
+    """One step of a snapshot's observed inventory.
+
+    Attributes:
+        step_id: The step's ID: its key in the snapshot's ``steps``.
+        name: The step's ``step_name``; None when it is not non-empty text.
+        status: The step's status, one of STEP_STATUSES (see
+            :func:`~yggdrasil.contract.read.step_status`). ``started`` is
+            recorded past activity, not proof of present activity.
+        contradiction: Why the entry contradicts itself; None when it does
+            not.
+        recorded_state: The entry's ``state``, as stored; None when absent
+            or ``null``.
+        recorded_outcome: The entry's ``outcome``, as stored; None when absent
+            or ``null``.
+        recorded_at: The instant of the step's latest event, in UTC: the time
+            the events carry, which a realm may supply. Not necessarily when
+            the step reached its outcome. None when the entry records no
+            usable time.
+        progress_percent: The reported progress, a number from 0 to 100,
+            unconverted; given only for a step whose state is
+            ``step.progress``, the one event that reports progress.
+        error: How the step failed; None when it records no failure, or
+            records one that is not an object.
+        direct_blockers: For a blocked step, the failed or blocked steps it
+            waited on, each marked with whether it is in this snapshot's
+            inventory; None for any other step.
+        failed_upstream: For a blocked step of a settled attempt, the failed
+            steps upstream of it, marked the same way; None for any other
+            step, and until the attempt is settled, because only the report
+            records them in full.
+        recorded: The entry exactly as stored, for the fields the reader does
+            not interpret, such as ``run_id``, ``fingerprint`` or ``metrics``.
+    """
+
+    step_id: str
+    name: str | None
+    status: str
+    contradiction: str | None
+    recorded_state: object
+    recorded_outcome: object
+    recorded_at: datetime | None
+    progress_percent: float | None
+    error: StepError | None
+    direct_blockers: tuple[StepRef, ...] | None
+    failed_upstream: tuple[StepRef, ...] | None
+    recorded: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class AttemptDiagnostic:
+    """Why an attempt ended without a step to blame, such as a preflight rejection.
+
+    Attributes:
+        message: The diagnostic's message; None when it is not non-empty
+            text, as for a bare interrupt.
+        error_type: The type of the error that ended the attempt.
+        details: Structured context, such as the step that was running; None
+            when it is not an object.
+    """
+
+    message: str | None
+    error_type: str | None
+    details: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class Attempt:
+    """The attempt a snapshot projects: the latest one observed for the plan.
+
+    It may belong to another request or another generation than the plan's
+    current one, and a recorded ``running`` is what was observed, not proof
+    that anything runs now. Each field is None in ``value`` where the attempt's
+    records lack it: the fields copied from the report are ``null`` while the
+    attempt runs, and its authority is ``null`` when its start record is
+    missing.
+
+    Attributes:
+        execution_id: The attempt's ID.
+        plan_generation: The generation the attempt ran, a non-empty string.
+        run_token: The request's run token, an integer from 0 to 2**53 - 1
+            that is not a boolean.
+        failure_policy: The policy the attempt ran under, recognised as a word
+            of FAILURE_POLICIES; recorded as the plan gave it.
+        execution_authority: Who executed it, recognised as a word of
+            EXECUTION_AUTHORITIES.
+        execution_owner: Which run-once process owned it, recognised when it
+            is non-empty text, as on the plan document.
+        state: ``running`` or ``finished``, recognised as a word of
+            ATTEMPT_STATES.
+        started_at: When the attempt started.
+        ended_at: When it ended.
+        termination_reason: Why it ended, recognised as a word of
+            TERMINATION_REASONS.
+        outcome: How it ended, recognised as a word of EXECUTION_OUTCOMES.
+        is_drained: Whether every runnable step ran before it ended.
+        counts: The report's step counts; None while the attempt runs, or
+            unless all five are readable.
+        diagnostic: Why it ended without a step to blame; None for none.
+        settled: Whether the attempt's results are final: True when its
+            state is ``finished``, False when ``running``, None otherwise. An
+            outcome alone does not settle an attempt.
+        recorded: The attempt exactly as stored.
+    """
+
+    execution_id: str
+    plan_generation: Recorded[str]
+    run_token: Recorded[int]
+    failure_policy: Recorded[str]
+    execution_authority: Recorded[str]
+    execution_owner: Recorded[str]
+    state: Recorded[str]
+    started_at: Recorded[datetime]
+    ended_at: Recorded[datetime]
+    termination_reason: Recorded[str]
+    outcome: Recorded[str]
+    is_drained: Recorded[bool]
+    counts: StepCounts | None
+    diagnostic: AttemptDiagnostic | None
+    settled: bool | None
+    recorded: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class SnapshotRead:
+    """What one ``plan_status`` snapshot establishes on its own.
+
+    When ``usable`` is False (no body, not an object, not of a supported
+    family, of another plan or realm, or not structured as a snapshot), only
+    ``plan_id``, ``realm``, ``presence``, ``version``, ``document`` and
+    ``problems`` are set, and every other answer is None: a partly readable
+    step inventory is never returned.
+
+    Attributes:
+        plan_id: The plan the snapshot was read for.
+        realm: The realm it was read for.
+        presence: ``present`` for a body; ``missing`` or ``unavailable`` for
+            the NoDocument the caller passed.
+        version: What the body's ``schema_version`` says; None without a
+            body.
+        usable: Whether the answers below were derived.
+        document: The body exactly as given, for display; None without one.
+        problems: Every problem found.
+        projection: ``attempt`` for one attempt's status; ``legacy`` for each
+            step's latest run from before attempts were recorded, which need
+            not belong to one attempt.
+        written_at: The snapshot's ``updated_at``: when it was last written,
+            not when anything last ran.
+        attempt: The projected attempt; None for a legacy projection.
+        steps: The observed steps, in stored order.
+    """
+
+    plan_id: str
+    realm: str
+    presence: str
+    version: VersionInfo | None
+    usable: bool
+    document: object
+    problems: tuple[ContractProblem, ...]
+    projection: str | None
+    written_at: Recorded[datetime] | None
+    attempt: Attempt | None
+    steps: tuple[ObservedStep, ...] | None
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One answer of a correlation, and the reason for it.
+
+    Attributes:
+        verdict: The answer, from its question's closed set.
+        reason: Why, from its question's closed set of reasons.
+    """
+
+    verdict: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Ending:
+    """How one record says an execution ended.
+
+    Attributes:
+        outcome: The recorded outcome, if recognised.
+        termination_reason: The recorded termination reason, if recognised.
+    """
+
+    outcome: str | None
+    termination_reason: str | None
+
+
+@dataclass(frozen=True)
+class ConflictingEndings:
+    """Two usable terminal claims about one execution that disagree.
+
+    Neither is picked as the true one.
+
+    Attributes:
+        finalized: How the plan's finalized record says it ended.
+        observed: How the snapshot's finished attempt says it ended.
+        fields: The fields, ``outcome`` or ``termination_reason``, whose
+            recognised values differ, sorted.
+    """
+
+    finalized: Ending
+    observed: Ending
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Correlation:
+    """What a plan document and its snapshot establish together.
+
+    The two are read at different moments, so disagreement from lag is
+    normal. Neither read is changed: a qualification of a plan-local answer
+    is stated here, beside it.
+
+    Attributes:
+        plan: The plan's read.
+        snapshot: The snapshot's read, or the NoDocument the caller passed.
+        plan_and_observation: Whether the observed attempt ran the plan's
+            current generation: ``same_generation``,
+            ``different_generation`` or ``unknown``.
+        finalized_and_observation: Whether the finalized record and the
+            observed attempt are one execution: ``same_execution``,
+            ``different_execution`` or ``unknown``.
+        request_and_observation: Whether the observed attempt belongs to the
+            plan's current request, from recorded identity only (generation
+            and run token): ``current``, ``other`` or ``unknown``. Never a
+            statement about the request's validity, completion or
+            eligibility.
+        conflicting_endings: The two endings when the finalized record and
+            the finished attempt of the same execution disagree on how it
+            ended; None otherwise.
+        problems: What the pair contradicts: an identity conflict, or
+            conflicting endings.
+    """
+
+    plan: PlanRead
+    snapshot: SnapshotRead | NoDocument
+    plan_and_observation: Verdict
+    finalized_and_observation: Verdict
+    request_and_observation: Verdict
+    conflicting_endings: ConflictingEndings | None
+    problems: tuple[ContractProblem, ...]

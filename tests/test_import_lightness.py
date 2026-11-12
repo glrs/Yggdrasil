@@ -67,6 +67,16 @@ import yggdrasil.contract.controls
 import yggdrasil.contract.diagnostics
 import yggdrasil.contract.fields
 import yggdrasil.contract.problems
+import yggdrasil.contract.read
+import yggdrasil.contract.read._correlate
+import yggdrasil.contract.read._eligibility
+import yggdrasil.contract.read._ids
+import yggdrasil.contract.read._plan
+import yggdrasil.contract.read._requests
+import yggdrasil.contract.read._results
+import yggdrasil.contract.read._snapshot
+import yggdrasil.contract.read._steps
+import yggdrasil.contract.read._values
 import yggdrasil.contract.schema
 import yggdrasil.contract.timestamps
 import yggdrasil.contract.versions
@@ -156,8 +166,9 @@ class TestLoggingUtilsImport(unittest.TestCase):
 class TestContractImport(unittest.TestCase):
     """``yggdrasil.contract`` sits in the bottom layer: standard library only.
 
-    That includes its schemas: importing them, or reading one, loads no
-    validation library.
+    That includes its schemas, whose reading loads no validation library, and
+    its reader of plan documents and snapshots, which a program outside
+    Yggdrasil imports without the daemon or the CouchDB client.
     """
 
     @classmethod
@@ -170,6 +181,20 @@ class TestContractImport(unittest.TestCase):
         self.assertIn("yggdrasil.contract.schema", self.state["loaded"])
         self.assertIn("yggdrasil.contract.fields", self.state["loaded"])
         self.assertIn("yggdrasil.contract.problems", self.state["loaded"])
+        for module in (
+            "read",
+            "read._correlate",
+            "read._eligibility",
+            "read._ids",
+            "read._plan",
+            "read._requests",
+            "read._results",
+            "read._snapshot",
+            "read._steps",
+            "read._values",
+        ):
+            with self.subTest(module=module):
+                self.assertIn(f"yggdrasil.contract.{module}", self.state["loaded"])
 
     def test_only_standard_library_modules_are_loaded(self):
         self.assertEqual(self.state["foreign"], [])

@@ -23,8 +23,8 @@ contract's runtime core:
 - :mod:`yggdrasil.contract.diagnostics`: showing a recorded value in a
   diagnostic, bounded and never raising;
 - :mod:`yggdrasil.contract.read`: the shared reader, one interpretation of
-  what a stored plan document says, for Yggdrasil's own decisions and for
-  any other program that reads the documents.
+  what a stored plan document and its snapshot say, for Yggdrasil's own
+  decisions and for any other program that reads the documents.
 
 It also publishes the contract itself: one handwritten JSON Schema per kind
 and family, in ``schemas/``, which :mod:`yggdrasil.contract.schema` loads and

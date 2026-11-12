@@ -33,13 +33,7 @@ from yggdrasil.contract.fields import (
     SCHEMA_VERSION_FIELD,
     STATUS_FIELD,
 )
-from yggdrasil.contract.problems import (
-    INVALID_VERSION,
-    UNSUPPORTED_VERSION,
-    UNVERSIONED,
-    WRONG_TYPE,
-    ContractProblem,
-)
+from yggdrasil.contract.problems import WRONG_TYPE, ContractProblem
 from yggdrasil.contract.read import _values
 from yggdrasil.contract.read._results import (
     ALREADY_EXECUTED,
@@ -52,13 +46,6 @@ from yggdrasil.contract.read._results import (
     Eligibility,
     NoDocument,
 )
-
-# The problem code of each version state that makes a document inspect-only.
-_INSPECT_ONLY_CODES = {
-    versions.UNVERSIONED: UNVERSIONED,
-    versions.INVALID: INVALID_VERSION,
-    versions.UNSUPPORTED: UNSUPPORTED_VERSION,
-}
 
 
 def eligibility(document: object) -> Eligibility:
@@ -192,7 +179,7 @@ def inspect_only(version: versions.VersionInfo) -> ContractProblem:
         ``unversioned``, ``invalid_version`` or ``unsupported_version``.
     """
     return _values.problem(
-        _INSPECT_ONLY_CODES[version.state],
+        _values.INSPECT_ONLY_CODES[version.state],
         (SCHEMA_VERSION_FIELD,),
         "the plan document is inspect-only: "
         + versions.version_sentence(PLAN_DOCUMENT, version),
