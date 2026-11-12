@@ -91,8 +91,10 @@ class TokenPair:
 
     The pair is valid when both tokens are present JSON integers that are not
     booleans, ``0 <= run <= MAX_TOKEN``, ``-1 <= executed <= MAX_TOKEN``, and
-    ``executed <= run``. Callers use ``run`` and ``executed`` only when
-    ``valid``.
+    ``executed <= run``. A decision about the request, such as whether it
+    finished or whether the plan is eligible, uses ``run`` and ``executed``
+    only when ``valid``. Comparing identity and showing a value may use a
+    token that is valid on its own while the pair is not.
 
     Attributes:
         valid: Whether the pair is valid.

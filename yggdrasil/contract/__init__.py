@@ -21,7 +21,10 @@ contract's runtime core:
 - :mod:`yggdrasil.contract.timestamps`: the canonical timestamp spelling that
   writers produce, and the reading and formatting of instants;
 - :mod:`yggdrasil.contract.diagnostics`: showing a recorded value in a
-  diagnostic, bounded and never raising.
+  diagnostic, bounded and never raising;
+- :mod:`yggdrasil.contract.read`: the shared reader, one interpretation of
+  what a stored plan document says, for Yggdrasil's own decisions and for
+  any other program that reads the documents.
 
 It also publishes the contract itself: one handwritten JSON Schema per kind
 and family, in ``schemas/``, which :mod:`yggdrasil.contract.schema` loads and
