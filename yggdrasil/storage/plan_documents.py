@@ -6,9 +6,6 @@ delegates here). The document's field names and words are spelled in
 ``yggdrasil.contract.fields``, and its generation is read by
 ``yggdrasil.contract.read.generation_of``.
 
-``plan_generation_of`` is kept for one release for code outside this
-repository; use ``yggdrasil.contract.read.generation_of``.
-
 Plan generation:
     Every document written by ``save_plan`` carries a fresh opaque
     ``plan_generation`` ID. It identifies one planned version of the plan:
@@ -35,7 +32,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from yggdrasil.contract import CURRENT_FAMILIES, PLAN_DOCUMENT, SUPPORTED_FAMILIES
+from yggdrasil.contract import CURRENT_FAMILIES, PLAN_DOCUMENT, SUPPORTED_FAMILIES, read
 from yggdrasil.contract.fields import (
     APPROVED,
     CREATED_AT_FIELD,
@@ -60,7 +57,6 @@ from yggdrasil.contract.fields import (
     STATUS_FIELD,
     UPDATED_AT_FIELD,
 )
-from yggdrasil.contract.read import generation_of
 from yggdrasil.contract.timestamps import (
     canonical_from_legacy,
     is_canonical,
@@ -82,10 +78,6 @@ from yggdrasil.storage.errors import UnsupportedDocumentError
 # Valid values for the execution_authority field, built from the contract's
 # words for them.
 VALID_EXECUTION_AUTHORITIES = frozenset({DAEMON, RUN_ONCE})
-
-# The old name of yggdrasil.contract.read.generation_of, for one release (see
-# the module docstring).
-plan_generation_of = generation_of
 
 
 def json_safe(value: Any) -> Any:
@@ -327,7 +319,7 @@ def plan_summary_from_document(doc: dict[str, Any]) -> dict[str, Any]:
         "realm": doc.get("realm", "unknown"),
         "run_token": doc.get("run_token", 0),
         "executed_run_token": doc.get("executed_run_token", -1),
-        "plan_generation": generation_of(doc),
+        "plan_generation": read.generation_of(doc),
         "last_finalized_outcome": (
             last_execution.get("outcome") if isinstance(last_execution, dict) else None
         ),

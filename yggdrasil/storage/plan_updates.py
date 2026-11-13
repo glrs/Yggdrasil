@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from yggdrasil.contract import PLAN_DOCUMENT, read
+from yggdrasil.contract import PLAN_DOCUMENT, read, versions
 from yggdrasil.contract.controls import token_pair
 from yggdrasil.contract.diagnostics import describe_recorded
 from yggdrasil.contract.fields import (
@@ -62,11 +62,7 @@ from yggdrasil.contract.fields import (
     TERMINATION_REASON_FIELD,
     UPDATED_AT_FIELD,
 )
-from yggdrasil.contract.versions import (
-    SUPPORTED,
-    describe_schema_version,
-    version_of,
-)
+from yggdrasil.contract.versions import SUPPORTED, version_of
 from yggdrasil.flow.attempt import AttemptContext
 from yggdrasil.flow.outcomes import ExecutionOutcome, TerminationReason
 from yggdrasil.flow.utils.ygg_time import utcnow_iso
@@ -513,9 +509,9 @@ def check_finalization(
         return _superseded(
             request,
             SupersessionReason.UNSUPPORTED_DOCUMENT,
-            f"the plan's schema_version is now {describe_schema_version(version)} "
-            f"({version.state}), and the request was captured under family "
-            f"{request.schema_version}",
+            "the plan's schema_version is now "
+            f"{versions.describe_schema_version(version)} ({version.state}), "
+            f"and the request was captured under family {request.schema_version}",
         )
 
     generation = read.generation_of(doc)
