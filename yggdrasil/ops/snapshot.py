@@ -61,9 +61,11 @@ from typing import Any
 
 from yggdrasil.contract import CURRENT_FAMILIES, PLAN_STATUS
 from yggdrasil.contract.fields import (
+    ADVICE_FIELD,
     ARTIFACTS_FIELD,
     ATTEMPT,
     ATTEMPT_FIELD,
+    CODE_FIELD,
     COUNTS_FIELD,
     DIAGNOSTIC_FIELD,
     DIRECT_BLOCKERS_FIELD,
@@ -83,6 +85,7 @@ from yggdrasil.contract.fields import (
     INTERRUPTED,
     IS_DRAINED_FIELD,
     JOB_FIELD,
+    KIND_FIELD,
     LEGACY,
     METRICS_FIELD,
     OUTCOME_FIELD,
@@ -453,8 +456,10 @@ def _entry(
     status.artifacts = event.get("artifacts", [])
     status.metrics = event.get("metrics", {})
     if outcome is StepOutcome.FAILED:
+        # The step.failed event carries each under the step error's name for it.
         status.error = {
-            key: event.get(key) for key in ("error", "kind", "code", "advice")
+            key: event.get(key)
+            for key in (ERROR_FIELD, KIND_FIELD, CODE_FIELD, ADVICE_FIELD)
         }
     return status
 
