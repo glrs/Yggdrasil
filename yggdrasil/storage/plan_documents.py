@@ -2,7 +2,12 @@
 
 Single source of truth for the plan document shape so the CouchDB and SQLite
 plan stores cannot drift. Extracted from ``PlanDBManager`` (which now
-delegates here).
+delegates here). The document's field names and words are spelled in
+``yggdrasil.contract.fields``, and its generation is read by
+``yggdrasil.contract.read.generation_of``.
+
+``plan_generation_of`` is kept for one release for code outside this
+repository; use ``yggdrasil.contract.read.generation_of``.
 
 Plan generation:
     Every document written by ``save_plan`` carries a fresh opaque
@@ -31,6 +36,31 @@ from pathlib import Path
 from typing import Any
 
 from yggdrasil.contract import CURRENT_FAMILIES, PLAN_DOCUMENT, SUPPORTED_FAMILIES
+from yggdrasil.contract.fields import (
+    APPROVED,
+    CREATED_AT_FIELD,
+    DAEMON,
+    DRAFT,
+    EXECUTED_RUN_TOKEN_FIELD,
+    EXECUTION_AUTHORITY_FIELD,
+    EXECUTION_OWNER_FIELD,
+    ID_FIELD,
+    LAST_FINALIZED_EXECUTION_FIELD,
+    NOTES_FIELD,
+    PLAN_FIELD,
+    PLAN_GENERATION_FIELD,
+    PREVIEW_FIELD,
+    REALM_FIELD,
+    RUN_ONCE,
+    RUN_TOKEN_FIELD,
+    SCHEMA_VERSION_FIELD,
+    SCOPE_FIELD,
+    SOURCE_DOC_ID_FIELD,
+    SOURCE_DOC_REV_FIELD,
+    STATUS_FIELD,
+    UPDATED_AT_FIELD,
+)
+from yggdrasil.contract.read import generation_of
 from yggdrasil.contract.timestamps import (
     canonical_from_legacy,
     is_canonical,
@@ -38,7 +68,6 @@ from yggdrasil.contract.timestamps import (
 )
 from yggdrasil.contract.versions import (
     INVALID,
-    SCHEMA_VERSION_FIELD,
     UNSUPPORTED,
     UNVERSIONED,
     version_of,
@@ -47,19 +76,16 @@ from yggdrasil.flow.model import Plan
 from yggdrasil.flow.utils.ygg_time import utcnow_iso
 from yggdrasil.storage.errors import UnsupportedDocumentError
 
-# Valid values for the execution_authority field
-VALID_EXECUTION_AUTHORITIES = frozenset({"daemon", "run_once"})
+# CREATED_AT_FIELD, LAST_FINALIZED_EXECUTION_FIELD and PLAN_GENERATION_FIELD
+# stay importable from this module, as the yggdrasil.contract.fields spellings.
 
-# Document field holding the generation ID of the stored plan version.
-PLAN_GENERATION_FIELD = "plan_generation"
+# Valid values for the execution_authority field, built from the contract's
+# words for them.
+VALID_EXECUTION_AUTHORITIES = frozenset({DAEMON, RUN_ONCE})
 
-# Document field holding the result recorded when an execution request was
-# finalized; see ExecutionFinalization in yggdrasil/storage/plan_updates.py.
-LAST_FINALIZED_EXECUTION_FIELD = "last_finalized_execution"
-
-# Document field holding the document's creation time, which regeneration
-# keeps.
-CREATED_AT_FIELD = "created_at"
+# The old name of yggdrasil.contract.read.generation_of, for one release (see
+# the module docstring).
+plan_generation_of = generation_of
 
 
 def json_safe(value: Any) -> Any:
@@ -97,25 +123,6 @@ def new_plan_generation() -> str:
         they carry no order.
     """
     return uuid.uuid4().hex
-
-
-def plan_generation_of(doc: dict[str, Any]) -> str | None:
-    """Return a plan document's generation ID, if it has a usable one.
-
-    Anything other than a non-empty string counts as no generation, so a
-    missing, empty, or mistyped value can never be matched against a
-    generation an execution captured.
-
-    Args:
-        doc: A persisted plan document.
-
-    Returns:
-        str | None: The generation ID, or None if the document has none.
-    """
-    generation = doc.get(PLAN_GENERATION_FIELD)
-    if isinstance(generation, str) and generation:
-        return generation
-    return None
 
 
 def check_replaceable(doc_id: str, existing: Mapping[str, Any]) -> str:
@@ -188,7 +195,7 @@ def build_plan_document(
     scope: dict[str, Any],
     *,
     auto_run: bool = False,
-    execution_authority: str = "daemon",
+    execution_authority: str = DAEMON,
     execution_owner: str | None = None,
     preview: dict[str, Any] | None = None,
     source_doc_id: str | None = None,
@@ -249,28 +256,28 @@ def build_plan_document(
     created_at = timestamp if existing is None else check_replaceable(doc_id, existing)
 
     plan_doc: dict[str, Any] = {
-        "_id": doc_id,
+        ID_FIELD: doc_id,
         SCHEMA_VERSION_FIELD: CURRENT_FAMILIES[PLAN_DOCUMENT],
-        "realm": realm,
-        "scope": scope,
-        "status": "approved" if auto_run else "draft",
-        "plan": plan.to_dict(),
-        "preview": preview or {},
+        REALM_FIELD: realm,
+        SCOPE_FIELD: scope,
+        STATUS_FIELD: APPROVED if auto_run else DRAFT,
+        PLAN_FIELD: plan.to_dict(),
+        PREVIEW_FIELD: preview or {},
         PLAN_GENERATION_FIELD: plan_generation or new_plan_generation(),
-        "run_token": 0,
-        "executed_run_token": -1,
-        "execution_authority": execution_authority,
-        "execution_owner": execution_owner,
+        RUN_TOKEN_FIELD: 0,
+        EXECUTED_RUN_TOKEN_FIELD: -1,
+        EXECUTION_AUTHORITY_FIELD: execution_authority,
+        EXECUTION_OWNER_FIELD: execution_owner,
         CREATED_AT_FIELD: created_at,
-        "updated_at": timestamp,
+        UPDATED_AT_FIELD: timestamp,
     }
 
     if source_doc_id:
-        plan_doc["source_doc_id"] = source_doc_id
+        plan_doc[SOURCE_DOC_ID_FIELD] = source_doc_id
     if source_doc_rev:
-        plan_doc["source_doc_rev"] = source_doc_rev
+        plan_doc[SOURCE_DOC_REV_FIELD] = source_doc_rev
     if notes:
-        plan_doc["notes"] = notes
+        plan_doc[NOTES_FIELD] = notes
 
     return json_safe(plan_doc)
 
@@ -288,8 +295,8 @@ def plan_model_from_document(
     Returns:
         Plan or None if the document has no plan field or fails to parse.
     """
-    doc_id = doc.get("_id", "<unknown>")
-    plan_data = doc.get("plan")
+    doc_id = doc.get(ID_FIELD, "<unknown>")
+    plan_data = doc.get(PLAN_FIELD)
     if not plan_data:
         logger.warning("Plan document '%s' has no 'plan' field", doc_id)
         return None
@@ -320,7 +327,7 @@ def plan_summary_from_document(doc: dict[str, Any]) -> dict[str, Any]:
         "realm": doc.get("realm", "unknown"),
         "run_token": doc.get("run_token", 0),
         "executed_run_token": doc.get("executed_run_token", -1),
-        "plan_generation": plan_generation_of(doc),
+        "plan_generation": generation_of(doc),
         "last_finalized_outcome": (
             last_execution.get("outcome") if isinstance(last_execution, dict) else None
         ),

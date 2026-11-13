@@ -7,11 +7,15 @@ change the same document.
 
 A backend supplies only two primitives: fetch the current document, and
 replace it on condition that its revision has not moved, raising
-:class:`~yggdrasil.storage.errors.RevisionConflictError` otherwise. Everything that
-depends on what a plan document means (families, generations, tokens,
-authority) is decided here, once, so the CouchDB and SQLite stores cannot
+:class:`~yggdrasil.storage.errors.RevisionConflictError` otherwise. Every
+judgment finalization makes from a plan document (family, generation, tokens,
+authority) is made here, once, so the CouchDB and SQLite stores cannot
 interpret the same race differently. So is what counts as a stored document
 at all (:func:`require_storage_envelope`), which both stores' fetch applies.
+Each value is read by the contract's own rule (``yggdrasil.contract``): the
+family by ``versions.version_of``, the generation by ``read.generation_of``,
+the tokens by ``controls.token_pair``. Field names and words are spelled in
+``yggdrasil.contract.fields``.
 
 A revision check answers only "has this document changed since I read it". It
 cannot answer "is this still the request that was executed": a worker that
@@ -35,20 +39,39 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from yggdrasil.contract import PLAN_DOCUMENT
-from yggdrasil.contract.controls import EXECUTED_RUN_TOKEN_FIELD, token_pair
+from yggdrasil.contract import PLAN_DOCUMENT, read
+from yggdrasil.contract.controls import token_pair
 from yggdrasil.contract.diagnostics import describe_recorded
-from yggdrasil.contract.versions import SUPPORTED, UNVERSIONED, VersionInfo, version_of
+from yggdrasil.contract.fields import (
+    CONTINUE_INDEPENDENT,
+    EXECUTED_RUN_TOKEN_FIELD,
+    EXECUTION_AUTHORITY_FIELD,
+    EXECUTION_ID_FIELD,
+    EXECUTION_OWNER_FIELD,
+    FAILURE_POLICY_FIELD,
+    FINALIZED_AT_FIELD,
+    ID_FIELD,
+    LAST_EXECUTED_AT_FIELD,
+    LAST_FINALIZED_EXECUTION_FIELD,
+    OUTCOME_FIELD,
+    PLAN_GENERATION_FIELD,
+    PLAN_ID_FIELD,
+    REPORT_FIELD,
+    REV_FIELD,
+    RUN_TOKEN_FIELD,
+    TERMINATION_REASON_FIELD,
+    UPDATED_AT_FIELD,
+)
+from yggdrasil.contract.versions import (
+    SUPPORTED,
+    describe_schema_version,
+    version_of,
+)
 from yggdrasil.flow.attempt import AttemptContext
-from yggdrasil.flow.model import CONTINUE_INDEPENDENT_POLICY
 from yggdrasil.flow.outcomes import ExecutionOutcome, TerminationReason
 from yggdrasil.flow.utils.ygg_time import utcnow_iso
 from yggdrasil.storage.errors import PlanStoreError, RevisionConflictError
-from yggdrasil.storage.plan_documents import (
-    LAST_FINALIZED_EXECUTION_FIELD,
-    plan_generation_of,
-    validate_execution_authority,
-)
+from yggdrasil.storage.plan_documents import validate_execution_authority
 
 # Backend primitive: fetch(doc_id) returns the plan document as stored, with
 # its ``_rev``, or None only when the backend confirms there is none. A body
@@ -85,15 +108,15 @@ def require_storage_envelope(doc_id: str, body: object) -> dict[str, Any]:
     """
     if not isinstance(body, dict):
         problem = f"a value of type {type(body).__name__} instead of a JSON object"
-    elif "_id" not in body:
+    elif ID_FIELD not in body:
         problem = "an object without an _id"
-    elif body["_id"] != doc_id:
-        problem = f"an object whose _id is {describe_recorded(body['_id'])}"
-    elif "_rev" not in body:
+    elif body[ID_FIELD] != doc_id:
+        problem = f"an object whose _id is {describe_recorded(body[ID_FIELD])}"
+    elif REV_FIELD not in body:
         problem = "an object without a _rev"
-    elif not isinstance(body["_rev"], str) or not body["_rev"]:
+    elif not isinstance(body[REV_FIELD], str) or not body[REV_FIELD]:
         problem = (
-            f"an object whose _rev is {describe_recorded(body['_rev'])}, not a "
+            f"an object whose _rev is {describe_recorded(body[REV_FIELD])}, not a "
             "non-empty string"
         )
     else:
@@ -102,22 +125,6 @@ def require_storage_envelope(doc_id: str, body: object) -> dict[str, Any]:
         f"The read of plan '{doc_id}' returned {problem}, which is not the "
         "plan's stored document; the plan's stored state is unknown"
     )
-
-
-def describe_schema_version(version: VersionInfo) -> str:
-    """Show a plan document's recorded ``schema_version`` in a diagnostic.
-
-    Args:
-        version: What the document's ``schema_version`` says.
-
-    Returns:
-        str: ``absent`` for an unversioned document; otherwise the recorded
-        value, bounded and never raising (see
-        :func:`~yggdrasil.contract.diagnostics.describe_recorded`).
-    """
-    if version.state == UNVERSIONED:
-        return "absent"
-    return describe_recorded(version.recorded)
 
 
 class FinalizationStatus(str, Enum):
@@ -227,19 +234,14 @@ def finishes_request(
 ) -> bool:
     """Whether an attempt that ended this way finished its execution request.
 
-    A finished request is consumed: its token is recorded as executed, so the
-    plan is not eligible again until a newer request raises ``run_token``.
-    Three endings finish a request:
-
-    - A successful completion, under either failure policy.
-    - A ``continue_independent`` attempt that drained with failures. Its
-      failures and blocked steps are the request's result.
-    - A ``continue_independent`` plan rejected by preflight. Retrying an
-      unchanged plan would be rejected the same way.
-
-    Every other ending leaves the request eligible for another attempt: a
-    fail-fast failure keeps its established retry behavior, and a cancelled
-    or orchestration-failed attempt never finished.
+    The adapter for callers that hold the ``flow`` enums, such as
+    :class:`ExecutionFinalization` and the execution coordinator. It passes
+    the words the enums stand for to
+    :func:`yggdrasil.contract.read.finishes_request`, which owns the rule:
+    a successful completion finishes a request under any failure policy, and
+    a ``continue_independent`` attempt finishes one when it drained with
+    failures or was rejected by preflight. Every other ending leaves the
+    request eligible for another attempt.
 
     Args:
         outcome: The attempt's overall outcome.
@@ -249,11 +251,8 @@ def finishes_request(
     Returns:
         bool: True if the request is finished and should be finalized.
     """
-    if outcome is ExecutionOutcome.SUCCEEDED:
-        return termination_reason is TerminationReason.COMPLETED
-    return failure_policy == CONTINUE_INDEPENDENT_POLICY and termination_reason in (
-        TerminationReason.COMPLETED,
-        TerminationReason.PREFLIGHT_REJECTED,
+    return read.finishes_request(
+        outcome.value, termination_reason.value, failure_policy
     )
 
 
@@ -338,7 +337,7 @@ class ExecutionFinalization:
                 f"termination_reason={self.termination_reason.value}, "
                 f"failure_policy={self.failure_policy!r}); only a successful "
                 "completion, or a drained or preflight-rejected "
-                f"{CONTINUE_INDEPENDENT_POLICY} attempt, is finalized"
+                f"{CONTINUE_INDEPENDENT} attempt, is finalized"
             )
         mismatched = sorted(
             key
@@ -408,13 +407,13 @@ class ExecutionFinalization:
             outcome and termination reason, as plain JSON values.
         """
         return {
-            "execution_id": self.execution_id,
-            "plan_id": self.plan_id,
-            "plan_generation": self.plan_generation,
-            "run_token": self.run_token,
-            "failure_policy": self.failure_policy,
-            "outcome": self.outcome.value,
-            "termination_reason": self.termination_reason.value,
+            EXECUTION_ID_FIELD: self.execution_id,
+            PLAN_ID_FIELD: self.plan_id,
+            PLAN_GENERATION_FIELD: self.plan_generation,
+            RUN_TOKEN_FIELD: self.run_token,
+            FAILURE_POLICY_FIELD: self.failure_policy,
+            OUTCOME_FIELD: self.outcome.value,
+            TERMINATION_REASON_FIELD: self.termination_reason.value,
         }
 
     def execution_record(self, *, finalized_at: str) -> dict[str, Any]:
@@ -427,7 +426,11 @@ class ExecutionFinalization:
             dict: The completion's identity, the finalization time, and the
             attempt's report.
         """
-        return {**self.identity(), "finalized_at": finalized_at, "report": self.report}
+        return {
+            **self.identity(),
+            FINALIZED_AT_FIELD: finalized_at,
+            REPORT_FIELD: self.report,
+        }
 
 
 def _describe(request: ExecutionFinalization) -> str:
@@ -515,7 +518,7 @@ def check_finalization(
             f"{request.schema_version}",
         )
 
-    generation = plan_generation_of(doc)
+    generation = read.generation_of(doc)
     if generation != request.plan_generation:
         return _superseded(
             request,
@@ -542,8 +545,8 @@ def check_finalization(
             status=FinalizationStatus.ALREADY_COMMITTED,
             message=f"{_describe(request)} is already finalized",
         )
-    authority = doc.get("execution_authority")
-    owner = doc.get("execution_owner")
+    authority = doc.get(EXECUTION_AUTHORITY_FIELD)
+    owner = doc.get(EXECUTION_OWNER_FIELD)
     if (authority, owner) != (request.execution_authority, request.execution_owner):
         return _superseded(
             request,
@@ -554,7 +557,7 @@ def check_finalization(
             f"{describe_recorded(request.execution_owner)}",
         )
     if executed >= request.run_token:
-        recorder = record.get("execution_id") if isinstance(record, dict) else None
+        recorder = record.get(EXECUTION_ID_FIELD) if isinstance(record, dict) else None
         return _superseded(
             request,
             SupersessionReason.REQUEST_ALREADY_FINALIZED,
@@ -595,12 +598,12 @@ def build_finalized_document(
         dict: The document to write, still carrying the ``_rev`` it was read at.
     """
     finalized = dict(doc)
-    finalized["executed_run_token"] = request.run_token
+    finalized[EXECUTED_RUN_TOKEN_FIELD] = request.run_token
     finalized[LAST_FINALIZED_EXECUTION_FIELD] = request.execution_record(
         finalized_at=now
     )
-    finalized["last_executed_at"] = now
-    finalized["updated_at"] = now
+    finalized[LAST_EXECUTED_AT_FIELD] = now
+    finalized[UPDATED_AT_FIELD] = now
     return finalized
 
 
@@ -674,7 +677,7 @@ def finalize_execution(
 
     finalized = build_finalized_document(doc, request, now=now or utcnow_iso())
     try:
-        replace(request.plan_id, finalized, str(doc["_rev"]))
+        replace(request.plan_id, finalized, str(doc[REV_FIELD]))
     except RevisionConflictError:
         current = fetch(request.plan_id)
         if current is None:

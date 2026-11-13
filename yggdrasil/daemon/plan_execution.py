@@ -24,12 +24,14 @@ recorded":
    not going to run, such as a duplicate, gets no execution ID and leaves no
    trace in reporting.
 3. **Interpretation.** The report's termination reason decides whether the
-   request finished (see ``finishes_request`` in
-   ``yggdrasil/storage/plan_updates.py``); the type of any exception does not, since
-   a step body can raise any exception type itself. A request is consumed when
-   an attempt succeeds, when a ``continue_independent`` attempt drains with
-   failures, and when preflight rejects a ``continue_independent`` plan. Any
-   other ending leaves the token untouched, so the plan stays eligible.
+   request finished, by the rule of ``finishes_request`` in
+   ``yggdrasil.contract.read``, applied through its adapter for the ``flow``
+   enums in ``yggdrasil/storage/plan_updates.py``; the type of any exception
+   does not, since a step body can raise any exception type itself. A
+   request is consumed when an attempt succeeds, when a
+   ``continue_independent`` attempt drains with failures, and when preflight
+   rejects a ``continue_independent`` plan. Any other ending leaves the token
+   untouched, so the plan stays eligible.
 4. **Finalization.** A finished request is recorded through the plan store's
    generation-safe finalizer, with a bounded number of attempts.
 
@@ -116,7 +118,14 @@ from yggdrasil.contract.controls import (
     token_pair,
 )
 from yggdrasil.contract.diagnostics import describe_recorded
-from yggdrasil.contract.versions import SUPPORTED, version_of
+from yggdrasil.contract.fields import EXECUTION_AUTHORITY_FIELD, EXECUTION_OWNER_FIELD
+from yggdrasil.contract.read import generation_of
+from yggdrasil.contract.versions import (
+    SUPPORTED,
+    describe_schema_version,
+    version_of,
+    version_sentence,
+)
 from yggdrasil.core.engine import Engine
 from yggdrasil.daemon.worker_futures import outlast_cancellation
 from yggdrasil.flow.attempt import AttemptContext
@@ -125,7 +134,6 @@ from yggdrasil.flow.outcomes import AttemptReport, ExecutionOutcome, Termination
 from yggdrasil.logging_utils import custom_logger
 from yggdrasil.storage.errors import PlanStoreError
 from yggdrasil.storage.plan_documents import (
-    plan_generation_of,
     plan_model_from_document,
     validate_execution_authority,
 )
@@ -135,7 +143,6 @@ from yggdrasil.storage.plan_updates import (
     FinalizationResult,
     FinalizationStatus,
     check_finalization,
-    describe_schema_version,
     finishes_request,
 )
 from yggdrasil.storage.protocols import PlanStore
@@ -185,13 +192,13 @@ class ExecutionClaim:
             str | None: The reason the plan is not the caller's to execute, or
             None if it is. Never raises on stored content.
         """
-        authority = doc.get("execution_authority")
+        authority = doc.get(EXECUTION_AUTHORITY_FIELD)
         if authority != self.authority:
             return (
                 f"its execution authority is {describe_recorded(authority)}, "
                 f"not {self.authority!r}"
             )
-        owner = doc.get("execution_owner")
+        owner = doc.get(EXECUTION_OWNER_FIELD)
         if self.owner is not None and owner != self.owner:
             return (
                 f"its execution owner is {describe_recorded(owner)}, "
@@ -874,8 +881,6 @@ class PlanExecutionCoordinator:
         version = version_of(PLAN_DOCUMENT, doc)
         if version.state == SUPPORTED:
             return
-        recorded = describe_schema_version(version)
-        supported = sorted(SUPPORTED_FAMILIES[PLAN_DOCUMENT])
         pending = self._pending.pop(plan_doc_id, None)
         if pending is not None:
             self._logger.warning(
@@ -885,17 +890,17 @@ class PlanExecutionCoordinator:
                 "not retried; its report remains in the event spool",
                 pending.request.execution_id,
                 plan_doc_id,
-                recorded,
+                describe_schema_version(version),
                 version.state,
-                supported,
+                sorted(SUPPORTED_FAMILIES[PLAN_DOCUMENT]),
             )
         raise _CycleStopped(
             ExecutionResult(
                 plan_doc_id,
                 ExecutionStatus.UNSUPPORTED_DOCUMENT,
-                f"Plan '{plan_doc_id}' is not executed: its schema_version is "
-                f"{recorded}, so it is {version.state} (supported plan-document "
-                f"families: {supported}); nothing ran and nothing was written",
+                f"Plan '{plan_doc_id}' is not executed: "
+                f"{version_sentence(PLAN_DOCUMENT, version)}; nothing ran and "
+                "nothing was written",
             )
         )
 
@@ -1026,7 +1031,7 @@ class PlanExecutionCoordinator:
                 f"{describe_recorded(plan.plan_id)}; cannot execute a plan stored "
                 "under another ID",
             )
-        generation = plan_generation_of(doc)
+        generation = generation_of(doc)
         if generation is None:
             raise stop(
                 ExecutionStatus.INVALID_DOCUMENT,
@@ -1042,8 +1047,8 @@ class PlanExecutionCoordinator:
             schema_version=family,
             plan_generation=generation,
             run_token=run_token,
-            execution_authority=str(doc["execution_authority"]),
-            execution_owner=doc.get("execution_owner"),
+            execution_authority=str(doc[EXECUTION_AUTHORITY_FIELD]),
+            execution_owner=doc.get(EXECUTION_OWNER_FIELD),
         )
 
     async def _execute(

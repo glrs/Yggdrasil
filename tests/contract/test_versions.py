@@ -20,7 +20,6 @@ from yggdrasil.contract.versions import (
     version_of,
     version_sentence,
 )
-from yggdrasil.storage import plan_updates
 
 KINDS = (PLAN_DOCUMENT, PLAN_STATUS)
 
@@ -141,20 +140,6 @@ class TestDescribingAVersion(unittest.TestCase):
     def test_a_long_recorded_value_is_bounded(self):
         version = version_of(PLAN_DOCUMENT, {"schema_version": "x" * 10_000})
         self.assertLessEqual(len(describe_schema_version(version)), 200)
-
-    def test_the_finalizer_describes_a_version_the_same_way(self):
-        for value in (2, "1", None, [1], True, 10**5000):
-            with self.subTest(type=type(value).__name__):
-                version = version_of(PLAN_DOCUMENT, {"schema_version": value})
-                self.assertEqual(
-                    describe_schema_version(version),
-                    plan_updates.describe_schema_version(version),
-                )
-        version = version_of(PLAN_DOCUMENT, {})
-        self.assertEqual(
-            describe_schema_version(version),
-            plan_updates.describe_schema_version(version),
-        )
 
     def test_the_sentence_names_the_value_the_state_and_the_families(self):
         cases = (

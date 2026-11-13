@@ -66,12 +66,9 @@ class TestGenerationOf(ReaderTestCase):
         document = plan_document("pre_contract")
         self.assertEqual(generation_of(document), document["plan_generation"])
 
-    def test_it_agrees_with_the_store_s_reading(self):
-        values = [("absent", ABSENT), ("text", "g"), *HOSTILE]
-        for name, value in values:
-            with self.subTest(name):
-                document = changed(plan_document("draft"), "plan_generation", value)
-                self.assertEqual(generation_of(document), plan_generation_of(document))
+    def test_the_store_s_old_name_is_this_function(self):
+        """The plan store's name for this function is kept for one release."""
+        self.assertIs(plan_generation_of, generation_of)
 
 
 class TestPartitionName(unittest.TestCase):
