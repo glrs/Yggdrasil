@@ -60,45 +60,96 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from yggdrasil.contract import CURRENT_FAMILIES, PLAN_STATUS
-from yggdrasil.contract.versions import SCHEMA_VERSION_FIELD
+from yggdrasil.contract.fields import (
+    ARTIFACTS_FIELD,
+    ATTEMPT,
+    ATTEMPT_FIELD,
+    COUNTS_FIELD,
+    DIAGNOSTIC_FIELD,
+    DIRECT_BLOCKERS_FIELD,
+    ENDED_AT_FIELD,
+    ERROR_FIELD,
+    EVENT_STEP_BLOCKED,
+    EVENT_STEP_FAILED,
+    EVENT_STEP_SKIPPED,
+    EVENT_STEP_SUCCEEDED,
+    EXECUTION_AUTHORITY_FIELD,
+    EXECUTION_ID_FIELD,
+    EXECUTION_OWNER_FIELD,
+    FAILED_ANCESTORS_FIELD,
+    FAILURE_POLICY_FIELD,
+    FINGERPRINT_FIELD,
+    FINISHED,
+    INTERRUPTED,
+    IS_DRAINED_FIELD,
+    JOB_FIELD,
+    LEGACY,
+    METRICS_FIELD,
+    OUTCOME_FIELD,
+    PENDING,
+    PLAN_GENERATION_FIELD,
+    PLAN_ID_FIELD,
+    PROGRESS_FIELD,
+    PROJECTION_FIELD,
+    REALM_FIELD,
+    RUN_ID_FIELD,
+    RUN_TOKEN_FIELD,
+    RUNNING,
+    SCHEMA_VERSION_FIELD,
+    SCOPE_FIELD,
+    STARTED_AT_FIELD,
+    STATE_FIELD,
+    STEP_NAME_FIELD,
+    STEPS_FIELD,
+    TERMINATION_REASON_FIELD,
+    TS_FIELD,
+    TYPE_FIELD,
+    UNKNOWN,
+    UNREACHED,
+    UPDATED_AT_FIELD,
+)
 from yggdrasil.core.execution_ids import execution_order_key
-from yggdrasil.flow.events.attempt_records import STEP_BLOCKED_EVENT
 from yggdrasil.flow.outcomes import StepOutcome
 
+# The words below, and every key of the snapshot written here, are the
+# contract's spellings (yggdrasil.contract.fields). The events, start records
+# and reports read from the spool are read by the keys they are written with.
+
 # What a snapshot projects.
-PROJECTION_ATTEMPT = "attempt"
-PROJECTION_LEGACY = "legacy"
+PROJECTION_ATTEMPT = ATTEMPT
+PROJECTION_LEGACY = LEGACY
 
 # How far the projected attempt has got.
-ATTEMPT_RUNNING = "running"
-ATTEMPT_FINISHED = "finished"
+ATTEMPT_RUNNING = RUNNING
+ATTEMPT_FINISHED = FINISHED
 
 # The state of a step with no outcome in the projected attempt: still to come
 # while the attempt runs; once it has ended, cut short if it had started, and
 # never reached if it had not.
-STATE_PENDING = "pending"
-STATE_INTERRUPTED = "interrupted"
-STATE_UNREACHED = "unreached"
+STATE_PENDING = PENDING
+STATE_INTERRUPTED = INTERRUPTED
+STATE_UNREACHED = UNREACHED
 
 # The state of a legacy step run with no step lifecycle event at all.
-STATE_UNKNOWN = "unknown"
+STATE_UNKNOWN = UNKNOWN
 
 # Terminal step events within one run, and the outcome each records.
 _TERMINAL_OUTCOMES: dict[str, StepOutcome] = {
-    "step.succeeded": StepOutcome.SUCCEEDED,
-    "step.skipped": StepOutcome.REUSED,
-    "step.failed": StepOutcome.FAILED,
+    EVENT_STEP_SUCCEEDED: StepOutcome.SUCCEEDED,
+    EVENT_STEP_SKIPPED: StepOutcome.REUSED,
+    EVENT_STEP_FAILED: StepOutcome.FAILED,
 }
-_FAILED_EVENT = "step.failed"
+_FAILED_EVENT = EVENT_STEP_FAILED
 
 # The state each outcome is shown with: the event type that records it.
 _OUTCOME_STATES: dict[StepOutcome, str] = {
     **{outcome: event_type for event_type, outcome in _TERMINAL_OUTCOMES.items()},
-    StepOutcome.BLOCKED: STEP_BLOCKED_EVENT,
+    StepOutcome.BLOCKED: EVENT_STEP_BLOCKED,
 }
 
-# Fields that identify a step's run rather than describe its outcome.
-_IDENTITY_FIELDS = ("step_name", "fingerprint", "job", "ts")
+# Fields that identify a step's run rather than describe its outcome. The
+# run's events carry each under the step entry's name for it.
+_IDENTITY_FIELDS = (STEP_NAME_FIELD, FINGERPRINT_FIELD, JOB_FIELD, TS_FIELD)
 
 
 @dataclass(frozen=True)
@@ -196,19 +247,19 @@ class StepStatus:
             dict[str, Any]: The entry's fields as plain JSON types.
         """
         return {
-            "step_name": self.step_name,
-            "state": self.state,
-            "outcome": self.outcome,
-            "run_id": self.run_id,
-            "fingerprint": self.fingerprint,
-            "progress": self.progress,
-            "artifacts": self.artifacts,
-            "metrics": self.metrics,
-            "job": self.job,
-            "ts": self.ts,
-            "error": self.error,
-            "direct_blockers": list(self.direct_blockers),
-            "failed_ancestors": list(self.failed_ancestors),
+            STEP_NAME_FIELD: self.step_name,
+            STATE_FIELD: self.state,
+            OUTCOME_FIELD: self.outcome,
+            RUN_ID_FIELD: self.run_id,
+            FINGERPRINT_FIELD: self.fingerprint,
+            PROGRESS_FIELD: self.progress,
+            ARTIFACTS_FIELD: self.artifacts,
+            METRICS_FIELD: self.metrics,
+            JOB_FIELD: self.job,
+            TS_FIELD: self.ts,
+            ERROR_FIELD: self.error,
+            DIRECT_BLOCKERS_FIELD: list(self.direct_blockers),
+            FAILED_ANCESTORS_FIELD: list(self.failed_ancestors),
         }
 
 
@@ -370,10 +421,10 @@ def _identity(run_id: str | None, events: Sequence[Mapping[str, Any]]) -> StepSt
             if event.get(key) not in (None, ""):
                 known[key] = event[key]
     status = StepStatus(run_id=run_id)
-    status.step_name = str(known.get("step_name", ""))
-    status.fingerprint = known.get("fingerprint")
-    status.job = known.get("job")
-    status.ts = known.get("ts")
+    status.step_name = str(known.get(STEP_NAME_FIELD, ""))
+    status.fingerprint = known.get(FINGERPRINT_FIELD)
+    status.job = known.get(JOB_FIELD)
+    status.ts = known.get(TS_FIELD)
     return status
 
 
@@ -526,7 +577,7 @@ def _live_status(
         return _entry(run_id, events, position)
     if blocked is not None:
         status = _identity(None, [blocked])
-        status.state = STEP_BLOCKED_EVENT
+        status.state = EVENT_STEP_BLOCKED
         status.outcome = StepOutcome.BLOCKED.value
         status.direct_blockers = _string_list(blocked.get("direct_blockers"))
         status.failed_ancestors = _string_list(blocked.get("failed_ancestors"))
@@ -637,29 +688,32 @@ def project_attempt(
         started if started is not None else (report if report is not None else {})
     )
     summary: dict[str, Any] = {
-        "execution_id": attempt.execution_id,
-        "plan_generation": identity.get("plan_generation"),
-        "run_token": identity.get("run_token"),
-        "failure_policy": identity.get("failure_policy"),
-        "execution_authority": started.get("execution_authority") if started else None,
-        "execution_owner": started.get("execution_owner") if started else None,
-        "started_at": identity.get("started_at"),
-        "state": ATTEMPT_FINISHED if report is not None else ATTEMPT_RUNNING,
-        "ended_at": None,
-        "termination_reason": None,
-        "outcome": None,
-        "is_drained": None,
-        "counts": None,
-        "diagnostic": None,
+        EXECUTION_ID_FIELD: attempt.execution_id,
+        PLAN_GENERATION_FIELD: identity.get("plan_generation"),
+        RUN_TOKEN_FIELD: identity.get("run_token"),
+        FAILURE_POLICY_FIELD: identity.get("failure_policy"),
+        EXECUTION_AUTHORITY_FIELD: (
+            started.get("execution_authority") if started else None
+        ),
+        EXECUTION_OWNER_FIELD: started.get("execution_owner") if started else None,
+        STARTED_AT_FIELD: identity.get("started_at"),
+        STATE_FIELD: ATTEMPT_FINISHED if report is not None else ATTEMPT_RUNNING,
+        ENDED_AT_FIELD: None,
+        TERMINATION_REASON_FIELD: None,
+        OUTCOME_FIELD: None,
+        IS_DRAINED_FIELD: None,
+        COUNTS_FIELD: None,
+        DIAGNOSTIC_FIELD: None,
     }
     if report is not None:
+        # The report records each of these under the snapshot's name for it.
         for key in (
-            "ended_at",
-            "termination_reason",
-            "outcome",
-            "is_drained",
-            "counts",
-            "diagnostic",
+            ENDED_AT_FIELD,
+            TERMINATION_REASON_FIELD,
+            OUTCOME_FIELD,
+            IS_DRAINED_FIELD,
+            COUNTS_FIELD,
+            DIAGNOSTIC_FIELD,
         ):
             summary[key] = report.get(key)
     return summary, steps
@@ -719,12 +773,12 @@ def snapshot_document(
     """
     return {
         SCHEMA_VERSION_FIELD: CURRENT_FAMILIES[PLAN_STATUS],
-        "type": PLAN_STATUS,
-        "realm": realm,
-        "plan_id": plan_id,
-        "scope": scope,
-        "projection": projection,
-        "attempt": attempt,
-        "steps": steps,
-        "updated_at": updated_at,
+        TYPE_FIELD: PLAN_STATUS,
+        REALM_FIELD: realm,
+        PLAN_ID_FIELD: plan_id,
+        SCOPE_FIELD: scope,
+        PROJECTION_FIELD: projection,
+        ATTEMPT_FIELD: attempt,
+        STEPS_FIELD: steps,
+        UPDATED_AT_FIELD: updated_at,
     }
