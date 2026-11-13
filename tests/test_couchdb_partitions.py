@@ -5,8 +5,64 @@ Tests the partition_key function for CouchDB partition key generation.
 """
 
 import unittest
+from typing import Any
 
 from yggdrasil.storage.partitions import partition_key
+
+
+def partition_key_as_written_before(scope: dict) -> str:
+    """Return the partition the writers have always stored a scope's snapshots under.
+
+    A copy of the function's code from before it formatted through the shared
+    partition name, so the comparison stays meaningful whatever
+    ``partition_key`` delegates to.
+    """
+    kind = scope.get("kind")
+    sid = scope.get("id")
+    if not kind or not sid:
+        raise ValueError(f"Bad scope: {scope}")
+    if kind == "project":
+        return f"proj-{sid}"
+    if kind == "flowcell":
+        return f"fc-{sid}"
+    return f"{kind}-{sid}"
+
+
+# Scopes the writers accept: any truthy kind and ID, of any type.
+ACCEPTED: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("project", {"kind": "project", "id": "P12345"}),
+    ("flowcell", {"kind": "flowcell", "id": "A22FN2"}),
+    ("bundle", {"kind": "bundle", "id": "B12345"}),
+    ("another kind", {"kind": "sample", "id": "S1"}),
+    ("a capitalised kind", {"kind": "Project", "id": "P1"}),
+    ("extra keys", {"kind": "project", "id": "P1", "name": "n", "status": "s"}),
+    ("an integer ID", {"kind": "project", "id": 5}),
+    ("a float ID", {"kind": "flowcell", "id": 1.5}),
+    ("a true ID", {"kind": "project", "id": True}),
+    ("a list ID", {"kind": "project", "id": ["P1"]}),
+    ("an object ID", {"kind": "flowcell", "id": {"id": 1}}),
+    ("an integer kind", {"kind": 5, "id": "P1"}),
+    ("a true kind", {"kind": True, "id": True}),
+    ("a list kind", {"kind": ["project"], "id": "P1"}),
+    ("an object kind", {"kind": {"kind": "project"}, "id": "P1"}),
+)
+
+# Scopes the writers refuse: a kind or an ID that is absent or falsy.
+REFUSED: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("empty scope", {}),
+    ("kind absent", {"id": "P1"}),
+    ("id absent", {"kind": "project"}),
+    ("both absent", {"other": "data"}),
+    ("kind empty", {"kind": "", "id": "P1"}),
+    ("id empty", {"kind": "project", "id": ""}),
+    ("kind null", {"kind": None, "id": "P1"}),
+    ("id null", {"kind": "project", "id": None}),
+    ("kind zero", {"kind": 0, "id": "P1"}),
+    ("id zero", {"kind": "project", "id": 0}),
+    ("id false", {"kind": "project", "id": False}),
+    ("id an empty list", {"kind": "project", "id": []}),
+    ("kind an empty object", {"kind": {}, "id": "P1"}),
+)
 
 
 class TestPartitionKey(unittest.TestCase):
@@ -219,6 +275,26 @@ class TestPartitionKey(unittest.TestCase):
         result1 = partition_key(scope1)
         result2 = partition_key(scope2)
         self.assertNotEqual(result1, result2)
+
+
+class TestPartitionKeyIsUnchanged(unittest.TestCase):
+    """The writers accept, format and refuse exactly the scopes they always have."""
+
+    def test_every_accepted_scope_gives_the_same_partition(self):
+        for name, scope in ACCEPTED:
+            with self.subTest(name):
+                self.assertEqual(
+                    partition_key(scope), partition_key_as_written_before(scope)
+                )
+
+    def test_every_refused_scope_raises_the_same_error(self):
+        for name, scope in REFUSED:
+            with self.subTest(name):
+                with self.assertRaises(ValueError) as expected:
+                    partition_key_as_written_before(scope)
+                with self.assertRaises(ValueError) as raised:
+                    partition_key(scope)
+                self.assertEqual(str(raised.exception), str(expected.exception))
 
 
 if __name__ == "__main__":
