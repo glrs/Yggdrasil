@@ -11,8 +11,9 @@ they contradict each other. :func:`observed_steps` reads every entry of a
 snapshot whose structure has been checked: the status, the time of the
 latest event, the reported progress, the error, and the blockers. Both keys
 are required on every entry, and an absent one is not ``null``: the entry
-records nothing to derive a status from, so its status is ``unknown``, the
-absent key is its one problem, and nothing is contradicted.
+records nothing to derive a status from, so its status is ``unknown`` and
+nothing is contradicted. Each absent key is reported as missing on its own,
+and the entry's other fields are still read, each with its own problems.
 """
 
 from __future__ import annotations
@@ -160,9 +161,9 @@ def observed_step(
     """Read one step entry, each answer from the fields it depends on.
 
     - status and contradiction from ``state`` and ``outcome``
-      (:func:`step_status`); an entry without either key is ``unknown``,
-      the absent key its one problem (``missing_field``), and contradicts
-      nothing;
+      (:func:`step_status`); an entry without either key is ``unknown`` and
+      contradicts nothing, each absent key reported as ``missing_field`` on
+      its own;
     - the time of the latest event from ``ts``, read tolerantly; ``null`` is
       no time and no problem;
     - progress from ``progress``, only in state ``step.progress``: the
