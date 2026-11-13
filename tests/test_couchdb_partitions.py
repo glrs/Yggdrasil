@@ -9,25 +9,6 @@ from typing import Any
 
 from yggdrasil.storage.partitions import partition_key
 
-
-def partition_key_as_written_before(scope: dict) -> str:
-    """Return the partition the writers have always stored a scope's snapshots under.
-
-    A copy of the function's code from before it formatted through the shared
-    partition name, so the comparison stays meaningful whatever
-    ``partition_key`` delegates to.
-    """
-    kind = scope.get("kind")
-    sid = scope.get("id")
-    if not kind or not sid:
-        raise ValueError(f"Bad scope: {scope}")
-    if kind == "project":
-        return f"proj-{sid}"
-    if kind == "flowcell":
-        return f"fc-{sid}"
-    return f"{kind}-{sid}"
-
-
 # Scopes the writers accept: any truthy kind and ID, of any type.
 ACCEPTED: tuple[tuple[str, dict[str, Any]], ...] = (
     ("project", {"kind": "project", "id": "P12345"}),
@@ -80,13 +61,13 @@ class TestPartitionKey(unittest.TestCase):
         """Test partition key for project scope."""
         scope = {"kind": "project", "id": "P12345"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P12345")
+        self.assertEqual(result, "project-P12345")
 
     def test_flowcell_scope(self):
         """Test partition key for flowcell scope."""
         scope = {"kind": "flowcell", "id": "A22FN2"}
         result = partition_key(scope)
-        self.assertEqual(result, "fc-A22FN2")
+        self.assertEqual(result, "flowcell-A22FN2")
 
     def test_bundle_scope(self):
         """Test partition key for bundle scope."""
@@ -114,25 +95,25 @@ class TestPartitionKey(unittest.TestCase):
         """Test project ID with underscores."""
         scope = {"kind": "project", "id": "P_12345_001"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P_12345_001")
+        self.assertEqual(result, "project-P_12345_001")
 
     def test_project_with_dashes(self):
         """Test project ID with dashes."""
         scope = {"kind": "project", "id": "P-12345-001"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P-12345-001")
+        self.assertEqual(result, "project-P-12345-001")
 
     def test_project_with_alphanumeric(self):
         """Test project ID with mixed alphanumeric."""
         scope = {"kind": "project", "id": "ABC123XYZ"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-ABC123XYZ")
+        self.assertEqual(result, "project-ABC123XYZ")
 
     def test_flowcell_with_complex_id(self):
         """Test flowcell with complex ID."""
         scope = {"kind": "flowcell", "id": "H7VJKDRXX_S1"}
         result = partition_key(scope)
-        self.assertEqual(result, "fc-H7VJKDRXX_S1")
+        self.assertEqual(result, "flowcell-H7VJKDRXX_S1")
 
     # =====================================================
     # ERROR HANDLING TESTS
@@ -207,38 +188,38 @@ class TestPartitionKey(unittest.TestCase):
             "status": "active",
         }
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P12345")
+        self.assertEqual(result, "project-P12345")
 
     def test_single_character_id(self):
         """Test partition key with single character ID."""
         scope = {"kind": "project", "id": "P"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P")
+        self.assertEqual(result, "project-P")
 
     def test_numeric_only_id(self):
         """Test partition key with numeric-only ID."""
         scope = {"kind": "project", "id": "12345"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-12345")
+        self.assertEqual(result, "project-12345")
 
     def test_long_id(self):
         """Test partition key with very long ID."""
         long_id = "P" + "1" * 1000
         scope = {"kind": "project", "id": long_id}
         result = partition_key(scope)
-        self.assertEqual(result, f"proj-{long_id}")
+        self.assertEqual(result, f"project-{long_id}")
 
     def test_special_characters_in_id(self):
         """Test partition key with special characters."""
         scope = {"kind": "project", "id": "P@12345!"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P@12345!")
+        self.assertEqual(result, "project-P@12345!")
 
     def test_unicode_in_id(self):
         """Test partition key with unicode characters."""
         scope = {"kind": "project", "id": "P12345_测试"}
         result = partition_key(scope)
-        self.assertEqual(result, "proj-P12345_测试")
+        self.assertEqual(result, "project-P12345_测试")
 
     # =====================================================
     # CONSISTENCY TESTS
@@ -277,24 +258,23 @@ class TestPartitionKey(unittest.TestCase):
         self.assertNotEqual(result1, result2)
 
 
-class TestPartitionKeyIsUnchanged(unittest.TestCase):
-    """The writers accept, format and refuse exactly the scopes they always have."""
+class TestPartitionKeyAcceptance(unittest.TestCase):
+    """The writers accept and refuse exactly the scopes they always have.
 
-    def test_every_accepted_scope_gives_the_same_partition(self):
+    Every accepted scope is stored under its kind, as recorded, and its ID.
+    """
+
+    def test_every_accepted_scope_is_named_by_its_kind_and_id(self):
         for name, scope in ACCEPTED:
             with self.subTest(name):
-                self.assertEqual(
-                    partition_key(scope), partition_key_as_written_before(scope)
-                )
+                self.assertEqual(partition_key(scope), f"{scope['kind']}-{scope['id']}")
 
-    def test_every_refused_scope_raises_the_same_error(self):
+    def test_every_refused_scope_raises_bad_scope(self):
         for name, scope in REFUSED:
             with self.subTest(name):
-                with self.assertRaises(ValueError) as expected:
-                    partition_key_as_written_before(scope)
                 with self.assertRaises(ValueError) as raised:
                     partition_key(scope)
-                self.assertEqual(str(raised.exception), str(expected.exception))
+                self.assertEqual(str(raised.exception), f"Bad scope: {scope}")
 
 
 if __name__ == "__main__":

@@ -354,7 +354,7 @@ class TestSQLiteOpsSnapshotSink(SQLiteStoreTestBase):
         snapshot2["steps"] = {"s1": {"state": "step.succeeded"}}
         self.sink.write(Path("/unused"), snapshot2)
 
-        doc_id = "proj-P1:plan_status:test_realm:pln_x"
+        doc_id = "project-P1:plan_status:test_realm:pln_x"
         doc = self.store.get_document("operations_snapshots", doc_id)
         self.assertEqual(doc["steps"]["s1"]["state"], "step.succeeded")
         self.assertEqual(doc["_rev"], "2")

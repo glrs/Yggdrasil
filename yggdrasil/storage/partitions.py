@@ -19,10 +19,11 @@ def partition_key(scope: dict[str, Any]) -> str:
     """Return the partition a scope's snapshots are stored under.
 
     Any truthy ``kind`` and ``id`` are accepted, and formatted by
-    :func:`~yggdrasil.contract.read.partition_name`::
+    :func:`~yggdrasil.contract.read.partition_name`, which names every kind
+    as recorded::
 
-        {"kind": "project", "id": "P12345"}   -> "proj-P12345"
-        {"kind": "flowcell", "id": "A22FN2"}  -> "fc-A22FN2"
+        {"kind": "project", "id": "P12345"}   -> "project-P12345"
+        {"kind": "flowcell", "id": "A22FN2"}  -> "flowcell-A22FN2"
         {"kind": "bundle", "id": "B12345"}    -> "bundle-B12345"
 
     Args:

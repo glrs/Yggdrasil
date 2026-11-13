@@ -23,10 +23,6 @@ from yggdrasil.contract.fields import (
 )
 from yggdrasil.contract.read import _values
 
-# The partition prefix of a scope kind that has its own; any other kind is its
-# own prefix.
-_PARTITION_PREFIXES = {"project": "proj", "flowcell": "fc"}
-
 
 def generation_of(document: object) -> str | None:
     """Return a plan document's ``plan_generation``, if it has a usable one.
@@ -50,8 +46,9 @@ def generation_of(document: object) -> str | None:
 def partition_name(kind: object, scope_id: object) -> str:
     """Format the partition of a scope, validating nothing.
 
-    ``proj-<id>`` for the kind ``project``, ``fc-<id>`` for ``flowcell``,
-    ``<kind>-<id>`` for any other. The callers decide what they accept.
+    The partition is ``<kind>-<id>``, with the scope's kind as recorded, for
+    every kind: ``project-P1``, ``flowcell-FC1``, ``test_scenario-S1``. The
+    callers decide what they accept.
 
     Args:
         kind: The scope's kind.
@@ -60,8 +57,7 @@ def partition_name(kind: object, scope_id: object) -> str:
     Returns:
         str: The partition name.
     """
-    prefix = _PARTITION_PREFIXES.get(kind) if isinstance(kind, str) else None
-    return f"{prefix if prefix is not None else kind}-{scope_id}"
+    return f"{kind}-{scope_id}"
 
 
 def snapshot_id(
