@@ -92,7 +92,7 @@ class TestOpsWriterDocIdStatus(unittest.TestCase):
 
         doc_id = self.writer._doc_id_status(snapshot)
 
-        self.assertEqual(doc_id, "proj-P12345:plan_status:tenx:plan_001")
+        self.assertEqual(doc_id, "project-P12345:plan_status:tenx:plan_001")
 
     def test_doc_id_status_flowcell(self):
         """Test document ID generation for flowcell scope."""
@@ -104,7 +104,7 @@ class TestOpsWriterDocIdStatus(unittest.TestCase):
 
         doc_id = self.writer._doc_id_status(snapshot)
 
-        self.assertEqual(doc_id, "fc-FC123:plan_status:smartseq3:plan_002")
+        self.assertEqual(doc_id, "flowcell-FC123:plan_status:smartseq3:plan_002")
 
     def test_doc_id_status_custom_kind(self):
         """Test document ID generation for custom kind."""
@@ -156,7 +156,7 @@ class TestOpsWriterWrite(unittest.TestCase):
             call_kwargs = self.writer.server.put_document.call_args[1]  # type: ignore
             self.assertEqual(call_kwargs["db"], "test_db")
             self.assertEqual(
-                call_kwargs["doc_id"], "proj-P123:plan_status:tenx:plan_001"
+                call_kwargs["doc_id"], "project-P123:plan_status:tenx:plan_001"
             )
 
     def test_write_updates_existing_document(self):
